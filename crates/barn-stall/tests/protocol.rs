@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use barn_stall::{
     DEFAULT_MAX_BODY_BYTES, DENIED_CODE, Job, MAX_LINE_BYTES, NetAuth, NetRequestParams,
-    NetResponse, PROTOCOL_VERSION, StallStartParams, StallStartResult, method,
+    NetResponse, PROTOCOL_VERSION, StallStartParams, StallStartResult, fits_line, method,
 };
 use serde_json::{Value, json};
 
@@ -152,4 +152,11 @@ fn every_method_keeps_its_name() {
     for (constant, wire) in names {
         assert_eq!(constant, wire);
     }
+}
+
+#[test]
+fn a_line_fits_up_to_the_limit() {
+    assert!(fits_line(0));
+    assert!(fits_line(MAX_LINE_BYTES));
+    assert!(!fits_line(1_048_577));
 }
