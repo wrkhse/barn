@@ -15,8 +15,11 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
   `3`. The stall's environment holds only `PATH`, `HOME`, `LANG` and barn's own
   variables.
 - One JSON-RPC 2.0 message per line, each terminated by `\n`.
-- A line is at most 1 MiB in bytes without its terminator, `MAX_LINE_BYTES` in
-  `barn-stall`. A longer line is a protocol error.
+- A line is at most 8 MiB in bytes, its terminating newline included,
+  `MAX_LINE_BYTES` in `barn-stall`. A longer line is answered with `-32600` and
+  the connection is closed, as Chauffeur v2's socket server does. _For B1 to
+  confirm: the error's message, which Chauffeur v2 words "the request line is
+  over 1 MiB"._
 - Calls in flight are bounded. _For B1 to confirm: the bound, and what a stall is
   sent when its answers would exceed it._
 - Bodies are inline. A grant caps them at `DEFAULT_MAX_BODY_BYTES`, 4 MiB by
@@ -57,12 +60,12 @@ A stall asks the broker:
 
 ```json
 {"jsonrpc":"2.0","id":7,"method":"net.request","params":{"plugin":"github-releases","method":"GET","url":"https://api.github.com/repos/wrkhse/rungs/releases","auth":{"secret":"github-token","as":"bearer"},"budget":"github"}}
-{"jsonrpc":"2.0","id":7,"result":{"status":200,"headers":{"etag":"…"},"body":"…"}}
+{"jsonrpc":"2.0","id":7,"result":{"status":200,"headers":[["etag","v1"]],"body":"hello","body_encoding":"utf8"}}
 {"jsonrpc":"2.0","id":8,"error":{"code":-32001,"message":"denied","data":{"reason":"host not granted","host":"evil.example"}}}
 ```
 
-These bodies are `barn-stall`'s types, and each one is checked against the plan's
-own text in that crate's tests:
+These bodies are `barn-stall`'s types, and each one is checked against the JSON
+on this page in that crate's tests, which read this file with `include_str!`:
 
 | Body                     | Type               |
 | ------------------------ | ------------------ |
@@ -74,17 +77,27 @@ own text in that crate's tests:
 | `net.request` result     | `NetResponse`      |
 | the `denied` error code  | `DENIED_CODE`      |
 
+The plan's sketch shows a response's headers as one JSON object and its body as
+one string. Some things in HTTP cannot be carried that way, so these types go
+past the sketch and B1 confirms them:
+
+- a response's headers are a list of name and value pairs, names lower-cased,
+  so a name that repeats, such as `set-cookie`, keeps every value;
+- a response's body is UTF-8 text, or base64 when `body_encoding` says
+  `base64`;
+- a request carries its headers the same way, lower-cased, and its body inline.
+
 _For B1 to confirm: whether a JSON-RPC id is an integer, a string or both, and
 whether `net.request`'s `auth.as` has values beyond `bearer`._
 
 ## Limits and constants
 
-| Constant                 | Value     | Meaning                                         |
-| ------------------------ | --------- | ----------------------------------------------- |
-| `PROTOCOL_VERSION`       | `1`       | the version barn speaks                         |
-| `MAX_LINE_BYTES`         | `1048576` | 1 MiB, the longest line, without its terminator |
-| `DEFAULT_MAX_BODY_BYTES` | `4194304` | 4 MiB, the default cap on a body a grant sets   |
-| `DENIED_CODE`            | `-32001`  | the error code for `denied`                     |
+| Constant                 | Value     | Meaning                                       |
+| ------------------------ | --------- | --------------------------------------------- |
+| `PROTOCOL_VERSION`       | `1`       | the version barn speaks                       |
+| `MAX_LINE_BYTES`         | `8388608` | 8 MiB, the longest line, its newline included |
+| `DEFAULT_MAX_BODY_BYTES` | `4194304` | 4 MiB, the default cap on a body a grant sets |
+| `DENIED_CODE`            | `-32001`  | the error code for `denied`                   |
 
 ## For B1 to confirm
 
@@ -107,3 +120,6 @@ is built for them until B1 settles them:
 - the error codes for `budget` and `unknown_outcome`, with what data they carry.
 - whether `Job.every` is a duration grammar, and which one.
 - whether `stall.start`'s `state` arrives expanded or as `~`.
+- how barn and a stall agree on a version: `stall.start` carries `protocol`, but
+  no result field answers with the version the stall speaks.
+- the value names a `body_encoding` may carry besides `utf8` and `base64`.

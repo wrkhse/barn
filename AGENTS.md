@@ -38,8 +38,9 @@ stall's own JavaScript, which `barn-plugin-host` runs when that crate exists.
 ## Build and gate
 
 Rust 1.100, edition 2024, `unsafe_code = "forbid"`, clippy pedantic with
-warnings denied. The toolchain is pinned in `rust-toolchain.toml` and the
-dependencies in `Cargo.lock`; every command passes `--locked`.
+warnings denied. The toolchain is pinned in `rust-toolchain.toml` at 1.100.0,
+the same version as `rust-version`, and the dependencies in `Cargo.lock`; every
+command passes `--locked`.
 
 ```sh
 cargo fmt --all
@@ -47,14 +48,15 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo nextest run --workspace --locked
 cargo test --doc --workspace --locked
 cargo deny check
-npx --yes prettier@3.9.10 --check "**/*.md"
-npx --yes markdownlint-cli2@0.24.1
+npm ci && npm run check
 ```
 
 `cargo nextest run` needs `cargo-nextest`; `cargo test --workspace` runs the
-same tests without it. Mutation testing runs on a pull request's changed lines
-only: `git diff origin/main...HEAD -- '*.rs' > pr.diff` then
-`cargo mutants --in-diff pr.diff`.
+same tests without it. `npm run check` is prettier and markdownlint over the
+markdown, from `package.json`. Mutation testing runs on a pull request's
+changed lines only, and only in CI: dispatch the Check workflow on your branch
+(`gh workflow run check.yml --ref <branch>`) and read its `mutants` job. Never
+run it here.
 
 | Gate    | What fails it                                                                                                | Job in `.github/workflows/check.yml` |
 | ------- | ------------------------------------------------------------------------------------------------------------ | ------------------------------------ |
@@ -66,16 +68,17 @@ only: `git diff origin/main...HEAD -- '*.rs' > pr.diff` then
 | mutants | a viable mutant in a pull request's changed lines that no test catches                                       | `mutants`                            |
 | docs    | markdown that prettier or markdownlint would change                                                          | `docs`                               |
 
-Every gate runs in CI, one job each, and a deliberate break must fail exactly
-the job it targets. Never weaken a gate to make a change pass: fix the change,
-or say why the gate is wrong.
+Every gate runs in CI, one job each, and a deliberate break fails the job it
+targets. Never weaken a gate to make a change pass: fix the change, or say why
+the gate is wrong.
 
 ## Tests that touch processes
 
 Tests that start, signal or kill a process, fuzzers and mutation runs execute
 code that can affect the machine they run on. They run in CI only, **never on
 the owner's Mac**. A test that needs one shows in the test itself that it is
-skipped outside CI.
+skipped outside CI: `crates/barn/tests/exit.rs` starts the binary, so it
+returns at once unless `CI` is set.
 
 ## Protocol changes
 

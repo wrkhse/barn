@@ -11,17 +11,24 @@ use serde::{Deserialize, Serialize};
 /// The protocol version barn speaks.
 ///
 /// barn speaks this version and the one before it, and fields are only added
-/// within a version. A stall answers `stall.start` with the version it speaks.
+/// within a version.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// The longest line the protocol allows, in bytes: 1 MiB.
-pub const MAX_LINE_BYTES: usize = 1_048_576;
+/// The longest line the protocol allows, in bytes, its newline included: 8 MiB.
+///
+/// A longer line is answered with `-32600` and the connection is closed, as
+/// Chauffeur v2's socket server does.
+pub const MAX_LINE_BYTES: usize = 8_388_608;
 
 /// The default cap on a body a stall carries inline: 4 MiB.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 4_194_304;
 
 /// The JSON-RPC error code for a request barn refused: `denied`.
 pub const DENIED_CODE: i32 = -32_001;
+
+/// Headers as the wire carries them: one entry per value, so a repeated name
+/// keeps every value. A response's names are lower-cased.
+pub type Headers = Vec<(String, String)>;
 
 /// The names of the protocol's methods.
 pub mod method {
@@ -76,7 +83,8 @@ pub struct StallStartResult {
     pub ready: bool,
     /// The stall's own version.
     pub version: String,
-    /// The jobs the stall declares, by name.
+    /// The jobs the stall declares, by name. A stall with no jobs sends none.
+    #[serde(default)]
     pub jobs: BTreeMap<String, Job>,
 }
 
@@ -93,18 +101,37 @@ pub struct NetAuth {
 /// The `net.request` parameters a stall sends the broker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetRequestParams {
-    /// The plugin's name. barn checks it against the plugin's grant.
-    pub plugin: String,
+    /// The plugin's name, when the request belongs to one of the stall's
+    /// plugins. barn checks it against the plugin's grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
     /// The HTTP method.
     pub method: String,
     /// The absolute URL.
     pub url: String,
+    /// The headers to send, with lower-cased names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Headers,
+    /// The request body, inline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
     /// The secret to add, if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<NetAuth>,
     /// The budget to charge, if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<String>,
+}
+
+/// How a `net.request` result's body is encoded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BodyEncoding {
+    /// The body is UTF-8 text.
+    #[default]
+    Utf8,
+    /// The body is base64.
+    Base64,
 }
 
 /// The `net.request` result the broker answers with.
@@ -112,8 +139,13 @@ pub struct NetRequestParams {
 pub struct NetResponse {
     /// The HTTP status.
     pub status: u16,
-    /// The response's headers.
-    pub headers: BTreeMap<String, String>,
-    /// The response's body.
+    /// The headers barn received, names lower-cased, one entry per value.
+    #[serde(default)]
+    pub headers: Headers,
+    /// The body: UTF-8 text, or base64 when `body_encoding` says so.
+    #[serde(default)]
     pub body: String,
+    /// How `body` is encoded.
+    #[serde(default)]
+    pub body_encoding: BodyEncoding,
 }
