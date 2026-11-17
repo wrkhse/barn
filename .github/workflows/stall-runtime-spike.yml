@@ -1,0 +1,895 @@
+name: Stall runtime spike
+
+on:
+  push:
+    branches:
+      - spike/stall-runtime
+    paths:
+      - 'spike/stall-runtime/**'
+      - '.github/workflows/stall-runtime-spike.yml'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'smoke measures one short run of every job; full measures the whole matrix'
+        type: choice
+        default: full
+        options:
+          - smoke
+          - full
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stall-runtime-spike-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build both candidates and publish the measurement inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: spike/stall-runtime
+    steps:
+      - name: Check out the spike branch
+        uses: actions/checkout@v4
+
+      - name: Set up Node 26 for the harness, the vendor build and candidate A
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+          cache: npm
+          cache-dependency-path: |
+            spike/stall-runtime/package-lock.json
+            spike/stall-runtime/package.json
+
+      - name: Set up the stable Rust toolchain for candidate B
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo output for candidate B
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: spike/stall-runtime/rust
+
+      - name: Install the native headers and tools rquickjs compiles against
+        # rquickjs builds QuickJS through bindgen (libclang) and cmake. If a future
+        # release also asks for clang, add it to this apt line.
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libclang-dev cmake
+
+      - name: Install the esbuild dev dependency that bundles the plugins
+        # package-lock.json is committed, so npm ci installs exactly the locked tree.
+        run: npm ci --no-audit --no-fund
+
+      - name: Vendor and build candidate A, then bundle the provider plugins
+        run: npm run build
+
+      - name: Compile candidate B in release mode
+        run: cargo build --release --manifest-path rust/Cargo.toml
+
+      - name: Record toolchain versions, bundle sizes and package provenance
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const os = require('node:os');
+          const path = require('node:path');
+          const { execFileSync } = require('node:child_process');
+
+          // The vendored build writes one bundle per package and provider rather than a single
+          // root dist directory, so the recorded footprint is every built dist it leaves behind.
+          const vendored = '.vendor/sourcefed';
+          const builtDirs = ['packages', 'providers'].flatMap((group) =>
+            fs.readdirSync(path.join(vendored, group), { withFileTypes: true })
+              .filter((entry) => entry.isDirectory())
+              .map((entry) => path.join(vendored, group, entry.name, 'dist'))
+              .filter((dir) => fs.existsSync(dir)),
+          );
+
+          function walk(dir) {
+            return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+              const entryPath = path.join(dir, entry.name);
+              return entry.isDirectory() ? walk(entryPath) : [entryPath];
+            });
+          }
+
+          const stallABytes = builtDirs
+            .flatMap((dir) => walk(dir))
+            .filter((file) => file.endsWith('.js'))
+            .reduce((total, file) => total + fs.statSync(file).size, 0);
+
+          const vendorDirBytes = Number(
+            execFileSync('du', ['-sbc', ...builtDirs], { encoding: 'utf8' })
+              .trim().split('\n').at(-1).split('\t')[0],
+          );
+
+          function npmPackageBytes() {
+            const destination = fs.mkdtempSync(path.join(os.tmpdir(), 'stall-pack-'));
+            try {
+              const output = execFileSync(
+                'npm',
+                ['pack', '--json', '--pack-destination', destination],
+                { cwd: '.vendor/sourcefed', encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] },
+              );
+              const packed = JSON.parse(output.slice(output.indexOf('[')))[0];
+              return fs.statSync(path.join(destination, packed.filename)).size;
+            } catch (error) {
+              console.error(`npm pack did not finish in a minute: ${error.message}`);
+              return null;
+            } finally {
+              fs.rmSync(destination, { recursive: true, force: true });
+            }
+          }
+
+          const build = {
+            node: process.version,
+            rustc: execFileSync('rustc', ['-V'], { encoding: 'utf8' }).trim(),
+            stallABytes,
+            vendorDirBytes,
+            npmPackageBytes: npmPackageBytes(),
+            rustBinaryBytes: fs.statSync('rust/target/release/stall-b').size,
+            pluginBundles: JSON.parse(fs.readFileSync('plugins-dist/manifest.json', 'utf8')),
+          };
+
+          fs.mkdirSync('results', { recursive: true });
+          fs.writeFileSync('results/build.json', `${JSON.stringify(build, null, 2)}\n`);
+          console.log(JSON.stringify(build, null, 2));
+          NODE
+
+      - name: Drop the vendored tree's dev dependencies before packing it
+        # The measurement jobs only need what candidate A loads at runtime. Pruning after the
+        # cargo build and the provenance record keeps the tarball close to its runtime size.
+        run: cd .vendor/sourcefed && npm prune --omit=dev
+
+      - name: Pack the vendored candidate A tree for the measurement jobs
+        run: |
+          if command -v zstd >/dev/null 2>&1; then
+            tar --use-compress-program='zstd -T0' -cf vendor-sourcefed.tar \
+              --exclude='.vendor/sourcefed/.git' .vendor/sourcefed
+          else
+            tar --use-compress-program='gzip -1' -cf vendor-sourcefed.tar \
+              --exclude='.vendor/sourcefed/.git' .vendor/sourcefed
+          fi
+
+      - name: Record the vendor tarball size and check the artifact ceiling
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          const CEILING_BYTES = 400 * 1024 * 1024;
+          const archive = 'vendor-sourcefed.tar';
+          const bytes = fs.statSync(archive).size;
+          const mib = (bytes / 1024 / 1024).toFixed(1);
+
+          // build.json is written by the provenance step above; the tarball only exists now,
+          // so its size joins the record here rather than in that step.
+          const buildPath = 'results/build.json';
+          const build = JSON.parse(fs.readFileSync(buildPath, 'utf8'));
+          build.vendorTarBytes = bytes;
+          fs.writeFileSync(buildPath, `${JSON.stringify(build, null, 2)}\n`);
+
+          console.log(`${archive}: ${bytes} bytes (${mib} MiB)`);
+          if (bytes > CEILING_BYTES) {
+            console.error(
+              `${archive} is ${mib} MiB, past the 400 MiB budget for an artifact (GitHub's ceiling is 500 MB): ` +
+                'the dev-dependency prune looks incomplete. Check that npm prune --omit=dev ran in .vendor/sourcefed.',
+            );
+            process.exit(1);
+          }
+          NODE
+
+      - name: Upload the build provenance record
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-meta
+          path: spike/stall-runtime/results/build.json
+          retention-days: 7
+
+      - name: Upload the vendored candidate A tree
+        uses: actions/upload-artifact@v4
+        with:
+          name: vendor
+          path: spike/stall-runtime/vendor-sourcefed.tar
+          retention-days: 7
+
+      - name: Upload the candidate B binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: stall-b
+          path: spike/stall-runtime/rust/target/release/stall-b
+          retention-days: 7
+
+      - name: Upload the built plugin bundles
+        # Candidate B reads these through STALL_PLUGIN_DIR, so the measurement jobs
+        # need them alongside the vendor tree and the binary.
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugins-dist
+          path: spike/stall-runtime/plugins-dist
+          retention-days: 7
+
+  steady:
+    name: Steady state at ${{ matrix.monitors }} monitors
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        monitors: ${{ fromJSON(inputs.mode == 'smoke' && '[10]' || '[10, 100, 500]') }}
+    defaults:
+      run:
+        working-directory: spike/stall-runtime
+    # The harness and the matrix driver use only Node built-ins, so this job
+    # installs nothing; the built inputs arrive as artifacts.
+    steps:
+      - name: Check out the harness and the matrix driver
+        uses: actions/checkout@v4
+
+      - name: Set up Node 26 for the harness and candidate A
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
+      - name: Download the vendored candidate A tree
+        uses: actions/download-artifact@v4
+        with:
+          name: vendor
+          path: spike/stall-runtime
+
+      - name: Download the candidate B binary
+        uses: actions/download-artifact@v4
+        with:
+          name: stall-b
+          path: spike/stall-runtime/rust/target/release
+
+      - name: Download the built plugin bundles
+        uses: actions/download-artifact@v4
+        with:
+          name: plugins-dist
+          path: spike/stall-runtime/plugins-dist
+
+      - name: Extract the vendored candidate A tree
+        run: tar -xf vendor-sourcefed.tar -C .
+
+      - name: Make the downloaded candidate B binary executable
+        run: chmod +x rust/target/release/stall-b
+
+      - name: Measure steady state at ${{ matrix.monitors }} monitors
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$MODE" = "smoke" ]; then
+            RUNS=1
+            INTERVAL=15
+            WINDOW=15
+          else
+            RUNS=10
+            INTERVAL=15
+            WINDOW=45
+          fi
+          node scripts/matrix.mjs \
+            --variants ts,rust-seq,rust-realm \
+            --scenario steady \
+            --monitors "${{ matrix.monitors }}" \
+            --runs "$RUNS" \
+            --interval "$INTERVAL" \
+            --window "$WINDOW" \
+            --out "results/steady-${{ matrix.monitors }}"
+
+      - name: Summarise the steady-state runs at ${{ matrix.monitors }} monitors
+        if: always()
+        run: |
+          if ls "results/steady-${{ matrix.monitors }}"/*.json >/dev/null 2>&1; then
+            node harness/aggregate.mjs --dir "results/steady-${{ matrix.monitors }}" --out "results/steady-${{ matrix.monitors }}/summary.md"
+          else
+            echo "No run files for results/steady-${{ matrix.monitors }}; nothing to aggregate."
+          fi
+
+      - name: Upload the steady-state results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: steady-${{ matrix.monitors }}
+          path: spike/stall-runtime/results/steady-${{ matrix.monitors }}
+          retention-days: 7
+          if-no-files-found: warn
+
+  idle:
+    name: Idle cost with zero monitors
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: spike/stall-runtime
+    steps:
+      - name: Check out the harness and the matrix driver
+        uses: actions/checkout@v4
+
+      - name: Set up Node 26 for the harness and candidate A
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
+      - name: Download the vendored candidate A tree
+        uses: actions/download-artifact@v4
+        with:
+          name: vendor
+          path: spike/stall-runtime
+
+      - name: Download the candidate B binary
+        uses: actions/download-artifact@v4
+        with:
+          name: stall-b
+          path: spike/stall-runtime/rust/target/release
+
+      - name: Download the built plugin bundles
+        uses: actions/download-artifact@v4
+        with:
+          name: plugins-dist
+          path: spike/stall-runtime/plugins-dist
+
+      - name: Extract the vendored candidate A tree
+        run: tar -xf vendor-sourcefed.tar -C .
+
+      - name: Make the downloaded candidate B binary executable
+        run: chmod +x rust/target/release/stall-b
+
+      - name: Measure idle cost with zero monitors
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$MODE" = "smoke" ]; then
+            RUNS=1
+            WINDOW=10
+          else
+            RUNS=10
+            WINDOW=20
+          fi
+          node scripts/matrix.mjs \
+            --variants ts,rust-seq,rust-realm \
+            --scenario idle \
+            --monitors 0 \
+            --runs "$RUNS" \
+            --window "$WINDOW" \
+            --out results/idle
+
+      - name: Summarise the idle-cost runs
+        if: always()
+        run: |
+          if ls results/idle/*.json >/dev/null 2>&1; then
+            node harness/aggregate.mjs --dir results/idle --out results/idle/summary.md
+          else
+            echo "No run files for results/idle; nothing to aggregate."
+          fi
+
+      - name: Upload the idle-cost results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: idle
+          path: spike/stall-runtime/results/idle
+          retention-days: 7
+          if-no-files-found: warn
+
+  quiet:
+    name: Quiet upstream with 100 monitors
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: spike/stall-runtime
+    steps:
+      - name: Check out the harness and the matrix driver
+        uses: actions/checkout@v4
+
+      - name: Set up Node 26 for the harness and candidate A
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
+      - name: Download the vendored candidate A tree
+        uses: actions/download-artifact@v4
+        with:
+          name: vendor
+          path: spike/stall-runtime
+
+      - name: Download the candidate B binary
+        uses: actions/download-artifact@v4
+        with:
+          name: stall-b
+          path: spike/stall-runtime/rust/target/release
+
+      - name: Download the built plugin bundles
+        uses: actions/download-artifact@v4
+        with:
+          name: plugins-dist
+          path: spike/stall-runtime/plugins-dist
+
+      - name: Extract the vendored candidate A tree
+        run: tar -xf vendor-sourcefed.tar -C .
+
+      - name: Make the downloaded candidate B binary executable
+        run: chmod +x rust/target/release/stall-b
+
+      - name: Measure 100 monitors against a stable upstream
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$MODE" = "smoke" ]; then
+            RUNS=1
+            WINDOW=10
+          else
+            RUNS=5
+            WINDOW=30
+          fi
+          node scripts/matrix.mjs \
+            --variants ts,rust-seq,rust-realm \
+            --scenario quiet \
+            --monitors 100 \
+            --runs "$RUNS" \
+            --window "$WINDOW" \
+            --out results/quiet
+
+      - name: Summarise the quiet-upstream runs
+        if: always()
+        run: |
+          if ls results/quiet/*.json >/dev/null 2>&1; then
+            node harness/aggregate.mjs --dir results/quiet --out results/quiet/summary.md
+          else
+            echo "No run files for results/quiet; nothing to aggregate."
+          fi
+
+      - name: Upload the quiet-upstream results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quiet
+          path: spike/stall-runtime/results/quiet
+          retention-days: 7
+          if-no-files-found: warn
+
+  faults:
+    name: Fault isolation when a plugin throws and when it loops
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: spike/stall-runtime
+    steps:
+      - name: Check out the harness and the matrix driver
+        uses: actions/checkout@v4
+
+      - name: Set up Node 26 for the harness and candidate A
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
+      - name: Download the vendored candidate A tree
+        uses: actions/download-artifact@v4
+        with:
+          name: vendor
+          path: spike/stall-runtime
+
+      - name: Download the candidate B binary
+        uses: actions/download-artifact@v4
+        with:
+          name: stall-b
+          path: spike/stall-runtime/rust/target/release
+
+      - name: Download the built plugin bundles
+        uses: actions/download-artifact@v4
+        with:
+          name: plugins-dist
+          path: spike/stall-runtime/plugins-dist
+
+      - name: Extract the vendored candidate A tree
+        run: tar -xf vendor-sourcefed.tar -C .
+
+      - name: Make the downloaded candidate B binary executable
+        run: chmod +x rust/target/release/stall-b
+
+      - name: Measure fault isolation with plugins that throw
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$MODE" = "smoke" ]; then
+            RUNS=1
+            WINDOW=15
+          else
+            RUNS=5
+            WINDOW=30
+          fi
+          node scripts/matrix.mjs \
+            --variants ts,rust-seq,rust-realm \
+            --scenario fault \
+            --monitors 20 \
+            --chaos throw \
+            --runs "$RUNS" \
+            --window "$WINDOW" \
+            --out results/fault-throw
+
+      - name: Measure fault isolation with plugins that loop forever
+        if: always()
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$MODE" = "smoke" ]; then
+            RUNS=1
+            WINDOW=15
+          else
+            RUNS=5
+            WINDOW=30
+          fi
+          node scripts/matrix.mjs \
+            --variants ts,rust-seq,rust-realm \
+            --scenario fault \
+            --monitors 20 \
+            --chaos loop \
+            --runs "$RUNS" \
+            --window "$WINDOW" \
+            --out results/fault-loop
+
+      - name: Summarise the fault-isolation runs
+        if: always()
+        run: |
+          for dir in results/fault-throw results/fault-loop; do
+            if ls "$dir"/*.json >/dev/null 2>&1; then
+              node harness/aggregate.mjs --dir "$dir" --out "$dir/summary.md"
+            else
+              echo "No run files for $dir; nothing to aggregate."
+            fi
+          done
+
+      - name: Upload the throwing-plugin results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fault-throw
+          path: spike/stall-runtime/results/fault-throw
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload the looping-plugin results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fault-loop
+          path: spike/stall-runtime/results/fault-loop
+          retention-days: 7
+          if-no-files-found: warn
+
+  storage:
+    name: In-memory storage with 100 monitors (storage-isolated variant)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: spike/stall-runtime
+    steps:
+      - name: Check out the harness and the matrix driver
+        uses: actions/checkout@v4
+
+      - name: Set up Node 26 for the harness and candidate A
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
+      - name: Download the vendored candidate A tree
+        uses: actions/download-artifact@v4
+        with:
+          name: vendor
+          path: spike/stall-runtime
+
+      - name: Download the candidate B binary
+        uses: actions/download-artifact@v4
+        with:
+          name: stall-b
+          path: spike/stall-runtime/rust/target/release
+
+      - name: Download the built plugin bundles
+        uses: actions/download-artifact@v4
+        with:
+          name: plugins-dist
+          path: spike/stall-runtime/plugins-dist
+
+      - name: Extract the vendored candidate A tree
+        run: tar -xf vendor-sourcefed.tar -C .
+
+      - name: Make the downloaded candidate B binary executable
+        run: chmod +x rust/target/release/stall-b
+
+      - name: Measure steady state with the in-memory store
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$MODE" = "smoke" ]; then
+            RUNS=1
+            WINDOW=10
+          else
+            RUNS=5
+            WINDOW=30
+          fi
+          node scripts/matrix.mjs \
+            --variants ts,rust-seq,rust-realm \
+            --scenario steady \
+            --monitors 100 \
+            --runs "$RUNS" \
+            --window "$WINDOW" \
+            --out results/steady-mem-100 \
+            --env STALL_STORE=memory
+
+      - name: Summarise the storage-isolated runs
+        if: always()
+        run: |
+          if ls results/steady-mem-100/*.json >/dev/null 2>&1; then
+            node harness/aggregate.mjs --dir results/steady-mem-100 --out results/steady-mem-100/summary.md
+          else
+            echo "No run files for results/steady-mem-100; nothing to aggregate."
+          fi
+
+      - name: Upload the storage-isolated results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: storage-steady-mem-100
+          path: spike/stall-runtime/results/steady-mem-100
+          retention-days: 7
+          if-no-files-found: warn
+
+  ramp:
+    # A threshold probe, not a like-for-like comparison: each size gets one 30 s window per
+    # variant, which finds the monitor count where a candidate's polls start falling behind.
+    name: Ramp to the monitor count where each candidate's polls fall behind
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: spike/stall-runtime
+    steps:
+      - name: Check out the harness and the matrix driver
+        uses: actions/checkout@v4
+
+      - name: Set up Node 26 for the harness and candidate A
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
+      - name: Download the vendored candidate A tree
+        uses: actions/download-artifact@v4
+        with:
+          name: vendor
+          path: spike/stall-runtime
+
+      - name: Download the candidate B binary
+        uses: actions/download-artifact@v4
+        with:
+          name: stall-b
+          path: spike/stall-runtime/rust/target/release
+
+      - name: Download the built plugin bundles
+        uses: actions/download-artifact@v4
+        with:
+          name: plugins-dist
+          path: spike/stall-runtime/plugins-dist
+
+      - name: Extract the vendored candidate A tree
+        run: tar -xf vendor-sourcefed.tar -C .
+
+      - name: Make the downloaded candidate B binary executable
+        run: chmod +x rust/target/release/stall-b
+
+      - name: Find the monitor count where each candidate's polls fall behind
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$MODE" = "smoke" ]; then
+            SIZES=100
+          else
+            SIZES="100 250 500 1000"
+          fi
+          # Every size runs even when an earlier one failed, so one collapsed size does not
+          # hide where the other candidates stopped keeping up.
+          failed=""
+          for monitors in $SIZES; do
+            node scripts/matrix.mjs \
+              --variants ts,rust-seq,rust-realm \
+              --scenario steady \
+              --monitors "$monitors" \
+              --runs 1 \
+              --interval 15 \
+              --window 30 \
+              --out "results/ramp-$monitors" || failed="$failed $monitors"
+          done
+          if [ -n "$failed" ]; then
+            echo "matrix runs failed at monitors:$failed"
+            exit 1
+          fi
+
+      - name: Summarise the ramp runs
+        if: always()
+        run: |
+          for monitors in 100 250 500 1000; do
+            dir="results/ramp-$monitors"
+            if ls "$dir"/*.json >/dev/null 2>&1; then
+              node harness/aggregate.mjs --dir "$dir" --out "$dir/summary.md"
+            else
+              echo "No run files for $dir; nothing to aggregate."
+            fi
+          done
+
+      - name: Upload the 100-monitor ramp results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ramp-100
+          path: spike/stall-runtime/results/ramp-100
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload the 250-monitor ramp results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ramp-250
+          path: spike/stall-runtime/results/ramp-250
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload the 500-monitor ramp results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ramp-500
+          path: spike/stall-runtime/results/ramp-500
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload the 1000-monitor ramp results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ramp-1000
+          path: spike/stall-runtime/results/ramp-1000
+          retention-days: 7
+          if-no-files-found: warn
+
+  report:
+    name: Aggregate every measured run into the spike summary
+    needs:
+      - build
+      - steady
+      - idle
+      - quiet
+      - faults
+      - storage
+      - ramp
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: spike/stall-runtime
+    steps:
+      - name: Check out the aggregator
+        uses: actions/checkout@v4
+
+      - name: Set up Node 26 for the aggregator
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+
+      - name: Start from an empty results tree
+        run: rm -rf results && mkdir -p results
+
+      - name: Download the build provenance record if it exists
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: build-meta
+          path: spike/stall-runtime/results/build-meta
+
+      - name: Download the steady-state results if they exist
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: steady-*
+          path: spike/stall-runtime/results
+
+      - name: Download the idle-cost results if they exist
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: idle
+          path: spike/stall-runtime/results/idle
+
+      - name: Download the quiet-upstream results if they exist
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: quiet
+          path: spike/stall-runtime/results/quiet
+
+      - name: Download the throwing-plugin results if they exist
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: fault-throw
+          path: spike/stall-runtime/results/fault-throw
+
+      - name: Download the looping-plugin results if they exist
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: fault-loop
+          path: spike/stall-runtime/results/fault-loop
+
+      - name: Download the storage-isolated results if they exist
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: storage-steady-mem-100
+          path: spike/stall-runtime/results/steady-mem-100
+
+      - name: Download the ramp results if they exist
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ramp-*
+          path: spike/stall-runtime/results
+
+      - name: Write one summary per measured directory
+        run: |
+          missing=""
+          for dir in results/steady-10 results/steady-100 results/steady-500 \
+                     results/idle results/quiet results/fault-throw results/fault-loop \
+                     results/steady-mem-100 \
+                     results/ramp-100 results/ramp-250 results/ramp-500 results/ramp-1000; do
+            if [ -d "$dir" ] && ls "$dir"/*.json >/dev/null 2>&1; then
+              node harness/aggregate.mjs --dir "$dir" --out "$dir/summary.md"
+            else
+              missing="$missing $dir"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            printf 'No run results for:%s\n' "$missing"
+            printf '\n### Missing measurement directories\n%s\n' "$missing" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Combine every measured run into results/summary.md
+        run: |
+          set -euo pipefail
+          combined="$RUNNER_TEMP/stall-spike-runs"
+          rm -rf "$combined"
+          mkdir -p "$combined"
+          find results -mindepth 2 -maxdepth 2 -name '*.json' ! -name 'summary.json' \
+            -not -path 'results/build-meta/*' -print0 |
+            while IFS= read -r -d '' file; do
+              cp "$file" "$combined/$(basename "$(dirname "$file")")-$(basename "$file")"
+            done
+          if ls "$combined"/*.json >/dev/null 2>&1; then
+            node harness/aggregate.mjs --dir "$combined" --out results/summary.md
+          else
+            printf '# Stall runtime spike\n\nNo measurement run files were produced in this workflow run.\n' > results/summary.md
+          fi
+          cat results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          printf '\nEvery table names the scenario, monitors, candidate, scheduler, chaos and store of its group.\n' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the aggregated results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stall-spike-results
+          path: spike/stall-runtime/results
+          retention-days: 7
+          if-no-files-found: warn

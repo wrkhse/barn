@@ -1,0 +1,13 @@
+{
+  "name": "stall-runtime",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "vendor": "node scripts/vendor.mjs",
+    "build:plugins": "node scripts/build-plugins.mjs",
+    "build": "npm run vendor && npm run build:plugins"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}
