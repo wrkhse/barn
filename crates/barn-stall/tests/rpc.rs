@@ -1,6 +1,6 @@
 //! The JSON-RPC 2.0 envelope: the rules a line keeps, one test each.
 
-use barn_stall::{Answer, ErrorObject, Message, Notification, Request, RpcError};
+use barn_stall::{Answer, ErrorObject, Message, Notification, Request, RpcError, StrictReason};
 use serde_json::json;
 
 #[test]
@@ -88,7 +88,7 @@ fn _meta_is_carried_and_ignored() {
 fn an_id_of_zero_is_refused() {
     assert_eq!(
         Message::parse(r#"{"jsonrpc":"2.0","id":0,"method":"stall.health"}"#),
-        Err(RpcError::Strict)
+        Err(RpcError::Strict(StrictReason::IdShape))
     );
 }
 
@@ -96,7 +96,7 @@ fn an_id_of_zero_is_refused() {
 fn a_string_id_is_refused() {
     assert_eq!(
         Message::parse(r#"{"jsonrpc":"2.0","id":"seven","method":"stall.health"}"#),
-        Err(RpcError::Strict)
+        Err(RpcError::Strict(StrictReason::IdShape))
     );
 }
 
@@ -104,7 +104,7 @@ fn a_string_id_is_refused() {
 fn a_negative_id_is_refused() {
     assert_eq!(
         Message::parse(r#"{"jsonrpc":"2.0","id":-1,"method":"stall.health"}"#),
-        Err(RpcError::Strict)
+        Err(RpcError::Strict(StrictReason::IdShape))
     );
 }
 
@@ -112,7 +112,7 @@ fn a_negative_id_is_refused() {
 fn a_null_id_beside_a_method_is_refused() {
     assert_eq!(
         Message::parse(r#"{"jsonrpc":"2.0","id":null,"method":"stall.health"}"#),
-        Err(RpcError::Strict)
+        Err(RpcError::Strict(StrictReason::IdShape))
     );
 }
 
@@ -120,7 +120,7 @@ fn a_null_id_beside_a_method_is_refused() {
 fn a_method_beside_a_result_is_refused() {
     assert_eq!(
         Message::parse(r#"{"jsonrpc":"2.0","id":1,"method":"log","result":true}"#),
-        Err(RpcError::Strict)
+        Err(RpcError::Strict(StrictReason::MethodWithAnswer))
     );
 }
 
@@ -130,7 +130,7 @@ fn a_method_beside_an_error_is_refused() {
         Message::parse(
             r#"{"jsonrpc":"2.0","id":1,"method":"log","error":{"code":-32600,"message":"no"}}"#
         ),
-        Err(RpcError::Strict)
+        Err(RpcError::Strict(StrictReason::MethodWithAnswer))
     );
 }
 
@@ -140,7 +140,11 @@ fn params_that_are_not_an_object_are_refused() {
         let line =
             json!({"jsonrpc": "2.0", "id": 1, "method": "log", "params": params}).to_string();
 
-        assert_eq!(Message::parse(&line), Err(RpcError::Strict), "{line}");
+        assert_eq!(
+            Message::parse(&line),
+            Err(RpcError::Strict(StrictReason::ParamsShape)),
+            "{line}"
+        );
     }
 }
 
@@ -148,7 +152,7 @@ fn params_that_are_not_an_object_are_refused() {
 fn an_answer_with_params_that_are_not_an_object_is_refused() {
     assert_eq!(
         Message::parse(r#"{"jsonrpc":"2.0","id":1,"result":true,"params":5}"#),
-        Err(RpcError::Strict)
+        Err(RpcError::Strict(StrictReason::ParamsShape))
     );
 }
 
@@ -156,7 +160,7 @@ fn an_answer_with_params_that_are_not_an_object_is_refused() {
 fn an_answer_without_an_id_is_refused() {
     assert_eq!(
         Message::parse(r#"{"jsonrpc":"2.0","result":true}"#),
-        Err(RpcError::Strict)
+        Err(RpcError::Strict(StrictReason::AnswerWithoutId))
     );
 }
 
@@ -164,7 +168,7 @@ fn an_answer_without_an_id_is_refused() {
 fn an_answer_with_neither_result_nor_error_is_refused() {
     assert_eq!(
         Message::parse(r#"{"jsonrpc":"2.0","id":1}"#),
-        Err(RpcError::Strict)
+        Err(RpcError::Strict(StrictReason::AnswerShape))
     );
 }
 
@@ -174,7 +178,7 @@ fn an_answer_with_both_result_and_error_is_refused() {
         Message::parse(
             r#"{"jsonrpc":"2.0","id":1,"result":true,"error":{"code":-32600,"message":"no"}}"#
         ),
-        Err(RpcError::Strict)
+        Err(RpcError::Strict(StrictReason::AnswerShape))
     );
 }
 
@@ -182,7 +186,7 @@ fn an_answer_with_both_result_and_error_is_refused() {
 fn a_missing_jsonrpc_is_refused() {
     assert_eq!(
         Message::parse(r#"{"id":1,"method":"stall.health"}"#),
-        Err(RpcError::Strict)
+        Err(RpcError::Strict(StrictReason::MissingVersion))
     );
 }
 
@@ -190,18 +194,24 @@ fn a_missing_jsonrpc_is_refused() {
 fn another_jsonrpc_version_is_refused() {
     assert_eq!(
         Message::parse(r#"{"jsonrpc":"1.0","id":1,"method":"stall.health"}"#),
-        Err(RpcError::Strict)
+        Err(RpcError::Strict(StrictReason::WrongVersion))
     );
 }
 
 #[test]
 fn a_message_that_is_not_an_object_is_refused() {
-    assert_eq!(Message::parse("[]"), Err(RpcError::Strict));
+    assert_eq!(
+        Message::parse("[]"),
+        Err(RpcError::Strict(StrictReason::NotAnObject))
+    );
 }
 
 #[test]
 fn a_line_that_is_not_json_is_refused() {
-    assert_eq!(Message::parse("not a line"), Err(RpcError::Strict));
+    assert_eq!(
+        Message::parse("not a line"),
+        Err(RpcError::Strict(StrictReason::NotAnObject))
+    );
 }
 
 #[test]
@@ -272,7 +282,6 @@ fn an_answer_writes_jsonrpc_id_then_error() {
 #[test]
 fn every_error_says_what_went_wrong() {
     let errors = [
-        (RpcError::Strict, "the message is not strict JSON-RPC 2.0"),
         (RpcError::OverLimit, "the line is over the cap"),
         (
             RpcError::PartialLine,
@@ -290,5 +299,29 @@ fn every_error_says_what_went_wrong() {
 
     for (error, text) in errors {
         assert_eq!(error.to_string(), text);
+    }
+
+    let reasons = [
+        StrictReason::NotAnObject,
+        StrictReason::MissingVersion,
+        StrictReason::WrongVersion,
+        StrictReason::IdShape,
+        StrictReason::MethodWithAnswer,
+        StrictReason::ParamsShape,
+        StrictReason::AnswerShape,
+        StrictReason::AnswerWithoutId,
+        StrictReason::NotUtf8,
+        StrictReason::CarriageReturn,
+        StrictReason::TooManyBlankLines,
+    ];
+
+    for reason in reasons {
+        let rendered = RpcError::Strict(reason).to_string();
+
+        assert!(rendered.contains(&reason.to_string()), "{rendered}");
+        assert!(
+            rendered.starts_with("the line is not acceptable: "),
+            "{rendered}"
+        );
     }
 }

@@ -23,4 +23,6 @@ pub use protocol::{
     MAX_LINE_BYTES, NO_SUCH_METHOD, NetAuth, NetRequestParams, NetResponse, PROTOCOL_VERSION,
     StallStartAnswer, StallStartParams, Token, VERSION_REFUSED, method, parse_duration,
 };
-pub use rpc::{Answer, ErrorObject, JsonRpc, Message, Notification, Request, RpcError};
+pub use rpc::{
+    Answer, ErrorObject, JsonRpc, Message, Notification, Request, RpcError, StrictReason,
+};

@@ -8,7 +8,7 @@
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::protocol::MAX_LINE_BYTES;
-use crate::rpc::{Message, RpcError};
+use crate::rpc::{Message, RpcError, StrictReason};
 
 /// The most one read asks for, so a line never needs a buffer the size of the
 /// cap. The cap itself is still the limit; this only bounds each read call.
@@ -16,8 +16,9 @@ const CHUNK: usize = 65_536;
 
 /// The most blank lines a peer may send in a row between two messages: 1024.
 ///
-/// One more is refused with [`RpcError::Strict`]: too many blank lines arrived,
-/// and a peer cannot be allowed to keep the reader busy on nothing.
+/// One more is refused with [`RpcError::Strict`] carrying
+/// [`StrictReason::TooManyBlankLines`], so a peer cannot keep the reader busy
+/// on nothing.
 pub const MAX_BLANK_LINES: usize = 1_024;
 
 /// A peer read and written as lines: the two halves of its socket.
@@ -61,11 +62,12 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Lines<R, W> {
     /// # Errors
     ///
     /// [`RpcError::OverLimit`] for a line over the cap, and
-    /// [`RpcError::Strict`] for `\r\n`, a line that is not UTF-8, too many
-    /// blank lines, or a message JSON-RPC 2.0 does not allow. Each of those
-    /// poisons the lines, so every later read returns [`RpcError::Poisoned`]:
-    /// the caller answers `-32600` once and closes. [`RpcError::PartialLine`]
-    /// when the stream ends inside a line, and [`RpcError::Io`] when it fails.
+    /// [`RpcError::Strict`] with the [`StrictReason`] that names the rule:
+    /// `\r\n`, a line that is not UTF-8, too many blank lines, or a message
+    /// JSON-RPC 2.0 does not allow. Each of those poisons the lines, so every
+    /// later read returns [`RpcError::Poisoned`]: the caller answers `-32600`
+    /// once and closes. [`RpcError::PartialLine`] when the stream ends inside
+    /// a line, and [`RpcError::Io`] when it fails.
     pub async fn read(&mut self) -> Result<Message, RpcError> {
         if self.poisoned {
             return Err(RpcError::Poisoned);
@@ -78,7 +80,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Lines<R, W> {
                     blank_lines = blank_lines.saturating_add(1);
 
                     if blank_lines > MAX_BLANK_LINES {
-                        break Err(RpcError::Strict);
+                        break Err(RpcError::Strict(StrictReason::TooManyBlankLines));
                     }
                 }
                 Ok(line) => break Message::parse(&line),
@@ -89,7 +91,7 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Lines<R, W> {
         match result {
             Ok(message) => Ok(message),
             Err(error) => {
-                if matches!(error, RpcError::Strict | RpcError::OverLimit) {
+                if matches!(error, RpcError::Strict(_) | RpcError::OverLimit) {
                     self.poisoned = true;
                 }
 
@@ -135,16 +137,16 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Lines<R, W> {
 
     /// Takes the line that ends at this newline, and checks it.
     fn take(&mut self, end: usize) -> Result<String, RpcError> {
-        let line: Vec<u8> = self.buffer.drain(..=end).collect();
-        let (_, content) = line.split_last().ok_or(RpcError::Strict)?;
+        // The drain's drop removes the newline the content stops before.
+        let content: Vec<u8> = self.buffer.drain(..=end).take(end).collect();
 
         if content.last() == Some(&b'\r') {
-            return Err(RpcError::Strict);
+            return Err(RpcError::Strict(StrictReason::CarriageReturn));
         }
 
-        std::str::from_utf8(content)
+        std::str::from_utf8(&content)
             .map(str::to_owned)
-            .map_err(|_| RpcError::Strict)
+            .map_err(|_| RpcError::Strict(StrictReason::NotUtf8))
     }
 
     /// Reads what the stream has, at most as far as the cap allows.

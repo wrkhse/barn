@@ -15,7 +15,7 @@ use std::thread;
 use std::time::Duration;
 
 use barn_stall::frame::MAX_BLANK_LINES;
-use barn_stall::{Answer, Lines, Message, Notification, Request, RpcError};
+use barn_stall::{Answer, Lines, Message, Notification, Request, RpcError, StrictReason};
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf, split};
 use tokio::net::UnixStream;
@@ -165,7 +165,10 @@ fn a_carriage_return_is_refused() {
             .await
             .expect("the peer writes a carriage return");
 
-        assert_eq!(lines.read().await, Err(RpcError::Strict));
+        assert_eq!(
+            lines.read().await,
+            Err(RpcError::Strict(StrictReason::CarriageReturn))
+        );
     })
     .unwrap_or_else(|message| panic!("{message}"));
 }
@@ -178,7 +181,10 @@ fn a_line_that_is_not_utf8_is_refused() {
             .await
             .expect("the peer writes");
 
-        assert_eq!(lines.read().await, Err(RpcError::Strict));
+        assert_eq!(
+            lines.read().await,
+            Err(RpcError::Strict(StrictReason::NotUtf8))
+        );
     })
     .unwrap_or_else(|message| panic!("{message}"));
 }
@@ -194,7 +200,10 @@ fn a_read_after_a_carriage_return_is_poisoned() {
             .await
             .expect("the peer writes a carriage return");
 
-        assert_eq!(lines.read().await, Err(RpcError::Strict));
+        assert_eq!(
+            lines.read().await,
+            Err(RpcError::Strict(StrictReason::CarriageReturn))
+        );
         assert_eq!(lines.read().await, Err(RpcError::Poisoned));
     })
     .unwrap_or_else(|message| panic!("{message}"));
@@ -208,7 +217,10 @@ fn a_read_after_a_message_that_is_not_strict_is_poisoned() {
             .await
             .expect("the peer writes");
 
-        assert_eq!(lines.read().await, Err(RpcError::Strict));
+        assert_eq!(
+            lines.read().await,
+            Err(RpcError::Strict(StrictReason::IdShape))
+        );
         assert_eq!(lines.read().await, Err(RpcError::Poisoned));
     })
     .unwrap_or_else(|message| panic!("{message}"));
@@ -451,7 +463,10 @@ fn a_read_past_the_blank_line_limit_is_refused() {
             .await
             .expect("the peer writes the blank lines");
 
-        assert_eq!(lines.read().await, Err(RpcError::Strict));
+        assert_eq!(
+            lines.read().await,
+            Err(RpcError::Strict(StrictReason::TooManyBlankLines))
+        );
         assert_eq!(lines.read().await, Err(RpcError::Poisoned));
     })
     .unwrap_or_else(|message| panic!("{message}"));

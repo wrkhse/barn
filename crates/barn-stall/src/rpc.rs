@@ -86,6 +86,60 @@ pub struct ErrorObject {
     pub data: Option<Value>,
 }
 
+/// Why a line was refused as not acceptable.
+///
+/// Each rule the reader enforces has one reason, so a refusal names the rule an
+/// operator has to look at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StrictReason {
+    /// The line is not a JSON object, or its `method` is not a string.
+    NotAnObject,
+    /// The `jsonrpc` member is missing.
+    MissingVersion,
+    /// The `jsonrpc` member is not `2.0`.
+    WrongVersion,
+    /// The `id` is not a positive integer.
+    IdShape,
+    /// A method sits beside a result or an error.
+    MethodWithAnswer,
+    /// The `params` member is not an object.
+    ParamsShape,
+    /// An answer carries both a result and an error, or neither.
+    AnswerShape,
+    /// An answer carries no `id`.
+    AnswerWithoutId,
+    /// The line is not UTF-8.
+    NotUtf8,
+    /// The line ended with a carriage return.
+    CarriageReturn,
+    /// More blank lines arrived in a row than the protocol allows.
+    TooManyBlankLines,
+}
+
+impl fmt::Display for StrictReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::NotAnObject => "the line is not a JSON-RPC object",
+            Self::MissingVersion => "jsonrpc is missing",
+            Self::WrongVersion => "jsonrpc is not 2.0",
+            Self::IdShape => "the id is not a positive integer",
+            Self::MethodWithAnswer => "a method cannot sit beside a result or an error",
+            Self::ParamsShape => "params is not an object",
+            Self::AnswerShape => {
+                "an answer carries a result or an error, never both and never neither"
+            }
+            Self::AnswerWithoutId => "an answer carries no id",
+            Self::NotUtf8 => "the line is not UTF-8",
+            Self::CarriageReturn => "a line ends with a newline, never a carriage return",
+            Self::TooManyBlankLines => "too many blank lines arrived in a row",
+        };
+
+        f.write_str(text)
+    }
+}
+
+impl Error for StrictReason {}
+
 /// Why a line could not be read, and why a message was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RpcError {
@@ -95,8 +149,8 @@ pub enum RpcError {
     PartialLine,
     /// A read after a line that was refused: the connection must close.
     Poisoned,
-    /// The message is not one JSON-RPC 2.0 allows.
-    Strict,
+    /// The message is not one JSON-RPC 2.0 allows, for this reason.
+    Strict(StrictReason),
     /// The stream itself failed, in its own words.
     Io(String),
 }
@@ -107,7 +161,7 @@ impl fmt::Display for RpcError {
             Self::OverLimit => "the line is over the cap",
             Self::PartialLine => "the stream ended in the middle of a line",
             Self::Poisoned => "the connection is closed after a refused line",
-            Self::Strict => "the message is not strict JSON-RPC 2.0",
+            Self::Strict(reason) => return write!(f, "the line is not acceptable: {reason}"),
             Self::Io(error) => error.as_str(),
         };
 
@@ -125,18 +179,19 @@ impl Message {
     ///
     /// # Errors
     ///
-    /// [`RpcError::Strict`] for a line that is not a JSON object, a `jsonrpc`
-    /// that is missing or not `2.0`, an `id` that is not a positive integer,
-    /// a `null` `id` beside a method, a method beside a result or an error,
-    /// params that are not an object, and an answer with both or neither of
-    /// result and error.
+    /// [`RpcError::Strict`] with the [`StrictReason`] that names the rule: a
+    /// line that is not a JSON object, a `jsonrpc` that is missing or not
+    /// `2.0`, an `id` that is not a positive integer, a `null` `id` beside
+    /// a method, a method beside a result or an error, params that are not an
+    /// object, and an answer with both or neither of result and error.
     pub fn parse(line: &str) -> Result<Self, RpcError> {
-        let value: Value = serde_json::from_str(line).map_err(|_| RpcError::Strict)?;
-        let object = value.as_object().ok_or(RpcError::Strict)?;
+        let value: Value =
+            serde_json::from_str(line).map_err(|_| RpcError::Strict(StrictReason::NotAnObject))?;
+        let object = value
+            .as_object()
+            .ok_or(RpcError::Strict(StrictReason::NotAnObject))?;
 
-        if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-            return Err(RpcError::Strict);
-        }
+        version(object)?;
 
         if object.contains_key("method") {
             return call(object);
@@ -208,14 +263,13 @@ impl Serialize for Answer {
 /// A message that carries a method: a request, or a notification.
 fn call(object: &Map<String, Value>) -> Result<Message, RpcError> {
     if object.contains_key("result") || object.contains_key("error") {
-        return Err(RpcError::Strict);
+        return Err(RpcError::Strict(StrictReason::MethodWithAnswer));
     }
 
-    let method = object
-        .get("method")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .ok_or(RpcError::Strict)?;
+    let method = match object.get("method") {
+        Some(Value::String(method)) => method.clone(),
+        _ => return Err(RpcError::Strict(StrictReason::NotAnObject)),
+    };
     let params = params(object)?;
 
     match id(object)? {
@@ -226,7 +280,7 @@ fn call(object: &Map<String, Value>) -> Result<Message, RpcError> {
 
 /// A message that carries no method: an answer.
 fn answer(object: &Map<String, Value>) -> Result<Message, RpcError> {
-    let id = id(object)?.ok_or(RpcError::Strict)?;
+    let id = id(object)?.ok_or(RpcError::Strict(StrictReason::AnswerWithoutId))?;
 
     // An answer carries no parameters; one that is an object is ignored.
     let _ = params(object)?;
@@ -237,12 +291,21 @@ fn answer(object: &Map<String, Value>) -> Result<Message, RpcError> {
             result: result.clone(),
         })),
         (None, Some(error)) => {
-            let error: ErrorObject =
-                serde_json::from_value(error.clone()).map_err(|_| RpcError::Strict)?;
+            let error: ErrorObject = serde_json::from_value(error.clone())
+                .map_err(|_| RpcError::Strict(StrictReason::AnswerShape))?;
 
             Ok(Message::Answer(Answer::Error { id, error }))
         }
-        _ => Err(RpcError::Strict),
+        _ => Err(RpcError::Strict(StrictReason::AnswerShape)),
+    }
+}
+
+/// The `jsonrpc` member every message carries: `2.0`, and nothing else.
+fn version(object: &Map<String, Value>) -> Result<(), RpcError> {
+    match object.get("jsonrpc") {
+        None => Err(RpcError::Strict(StrictReason::MissingVersion)),
+        Some(Value::String(version)) if version == "2.0" => Ok(()),
+        Some(_) => Err(RpcError::Strict(StrictReason::WrongVersion)),
     }
 }
 
@@ -256,7 +319,7 @@ fn id(object: &Map<String, Value>) -> Result<Option<u64>, RpcError> {
         .as_u64()
         .filter(|id| *id != 0)
         .map(Some)
-        .ok_or(RpcError::Strict)
+        .ok_or(RpcError::Strict(StrictReason::IdShape))
 }
 
 /// The `params` a message carries: an object, or none.
@@ -264,6 +327,6 @@ fn params(object: &Map<String, Value>) -> Result<Option<Map<String, Value>>, Rpc
     match object.get("params") {
         None => Ok(None),
         Some(Value::Object(params)) => Ok(Some(params.clone())),
-        Some(_) => Err(RpcError::Strict),
+        Some(_) => Err(RpcError::Strict(StrictReason::ParamsShape)),
     }
 }
