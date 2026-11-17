@@ -48,8 +48,14 @@ jobs:
             spike/stall-runtime/package-lock.json
             spike/stall-runtime/package.json
 
-      - name: Set up the stable Rust toolchain for candidate B
-        uses: dtolnay/rust-toolchain@stable
+      - name: Set up the Rust toolchain candidate B is built with
+        # Follows rust-toolchain.toml, which pins nightly-2026-10-12 with rustfmt and
+        # clippy; a "stable" action here would make rustup install a second toolchain
+        # and build everything twice.
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-12
+          components: rustfmt, clippy
 
       - name: Cache cargo output for candidate B
         uses: Swatinem/rust-cache@v2
@@ -568,7 +574,7 @@ jobs:
           if-no-files-found: warn
 
   storage:
-    name: In-memory storage with 100 monitors (storage-isolated variant)
+    name: In-memory storage at 100 and 500 monitors (storage-isolated variant)
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -608,7 +614,7 @@ jobs:
       - name: Make the downloaded candidate B binary executable
         run: chmod +x rust/target/release/stall-b
 
-      - name: Measure steady state with the in-memory store
+      - name: Measure steady state with the in-memory store at 100 monitors
         env:
           MODE: ${{ inputs.mode }}
         run: |
@@ -628,21 +634,47 @@ jobs:
             --out results/steady-mem-100 \
             --env STALL_STORE=memory
 
-      - name: Summarise the storage-isolated runs
+      # Candidate A at 500 monitors is dominated by sourcefed's JSON store, because the
+      # tick re-parses monitors.json three times per monitor, so the storage-isolated
+      # variant must cover the same size to separate the store's cost from the runtime's.
+      - name: Measure steady state with the in-memory store at 500 monitors
+        if: inputs.mode != 'smoke'
+        run: |
+          node scripts/matrix.mjs \
+            --variants ts,rust-seq,rust-realm \
+            --scenario steady \
+            --monitors 500 \
+            --runs 5 \
+            --window 30 \
+            --out results/steady-mem-500 \
+            --env STALL_STORE=memory
+
+      - name: Summarise the storage-isolated runs at 100 and 500 monitors
         if: always()
         run: |
-          if ls results/steady-mem-100/*.json >/dev/null 2>&1; then
-            node harness/aggregate.mjs --dir results/steady-mem-100 --out results/steady-mem-100/summary.md
-          else
-            echo "No run files for results/steady-mem-100; nothing to aggregate."
-          fi
+          for dir in results/steady-mem-100 results/steady-mem-500; do
+            if ls "$dir"/*.json >/dev/null 2>&1; then
+              node harness/aggregate.mjs --dir "$dir" --out "$dir/summary.md"
+            else
+              echo "No run files for $dir; nothing to aggregate."
+            fi
+          done
 
-      - name: Upload the storage-isolated results
+      - name: Upload the 100-monitor storage-isolated results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: storage-steady-mem-100
           path: spike/stall-runtime/results/steady-mem-100
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload the 500-monitor storage-isolated results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: steady-mem-500
+          path: spike/stall-runtime/results/steady-mem-500
           retention-days: 7
           if-no-files-found: warn
 
@@ -834,12 +866,21 @@ jobs:
           name: fault-loop
           path: spike/stall-runtime/results/fault-loop
 
-      - name: Download the storage-isolated results if they exist
+      - name: Download the 100-monitor storage-isolated results if they exist
         continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           name: storage-steady-mem-100
           path: spike/stall-runtime/results/steady-mem-100
+
+      # The steady-* pattern above also matches this artifact; naming it here keeps the
+      # report's dependency on the 500-monitor storage run explicit.
+      - name: Download the 500-monitor storage-isolated results if they exist
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: steady-mem-500
+          path: spike/stall-runtime/results/steady-mem-500
 
       - name: Download the ramp results if they exist
         continue-on-error: true
@@ -853,7 +894,7 @@ jobs:
           missing=""
           for dir in results/steady-10 results/steady-100 results/steady-500 \
                      results/idle results/quiet results/fault-throw results/fault-loop \
-                     results/steady-mem-100 \
+                     results/steady-mem-100 results/steady-mem-500 \
                      results/ramp-100 results/ramp-250 results/ramp-500 results/ramp-1000; do
             if [ -d "$dir" ] && ls "$dir"/*.json >/dev/null 2>&1; then
               node harness/aggregate.mjs --dir "$dir" --out "$dir/summary.md"

@@ -1,7 +1,7 @@
-//! Lane line framing and JSON-RPC classification. No sockets: the splitter is a
-//! pure byte-level state machine and classification works on `&str`.
+//! Stall protocol line framing and JSON-RPC classification. No sockets: the splitter
+//! is a pure byte-level state machine and classification works on `&str`.
 
-use stall_b::lane::{parse_inbound, Inbound, Line, LineSplitter};
+use stall_b::stall::{parse_inbound, Inbound, Line, LineSplitter};
 
 fn split(chunks: &[&[u8]], max: usize) -> Vec<(Line, String)> {
     let mut splitter = LineSplitter::new(max);
@@ -82,11 +82,11 @@ fn accepts_a_line_exactly_at_the_cap() {
 #[test]
 fn classifies_a_request() {
     let inbound =
-        parse_inbound(r#"{"jsonrpc":"2.0","id":1,"method":"lane.start","params":{"protocol":1}}"#);
+        parse_inbound(r#"{"jsonrpc":"2.0","id":1,"method":"stall.start","params":{"protocol":1}}"#);
     match inbound {
         Inbound::Request { id, method, params } => {
             assert_eq!(id, 1);
-            assert_eq!(method, "lane.start");
+            assert_eq!(method, "stall.start");
             assert_eq!(params["protocol"], 1);
         }
         other => panic!("expected a request, got {other:?}"),

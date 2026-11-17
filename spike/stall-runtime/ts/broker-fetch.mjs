@@ -100,7 +100,7 @@ function bodyText(body) {
 }
 
 // Aborting before the broker answers rejects the caller's fetch, as undici would; the
-// orphaned lane request finishes on its own 30-second timeout.
+// orphaned stall protocol request finishes on its own 30-second timeout.
 function untilAborted(brokerCall, signal) {
   if (!signal) return brokerCall
   if (signal.aborted) return Promise.reject(abortReason(signal))

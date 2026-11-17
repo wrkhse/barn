@@ -2,7 +2,7 @@
 //!
 //! Each plugin type's JavaScript runs in its own QuickJS realm on a dedicated
 //! OS thread, so the tokio runtime never executes plugin code and a runaway
-//! poll cannot stall the lane or the HTTP server. `STALL_SCHEDULER=realm` (the
+//! poll cannot stall the protocol or the HTTP server. `STALL_SCHEDULER=realm` (the
 //! default) gives every plugin type its own thread, so polls of different types
 //! run in parallel and polls of the same type serialise inside their realm;
 //! `STALL_SCHEDULER=seq` gives every realm to one thread that runs polls one at
@@ -25,8 +25,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc as async_mpsc, oneshot, Semaphore};
 
-use crate::lane::Lane;
 use crate::model::{self, Monitor, Source, SourceEvent, SourceType, Target};
+use crate::stall::Protocol;
 
 const PRELUDE: &str = include_str!("prelude.js");
 const MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
@@ -174,7 +174,10 @@ pub fn spawn_seq(config: WorkerConfig) -> Result<Workers, String> {
 }
 
 /// Forward every realm's host call to the broker, replying through its oneshot.
-pub async fn host_pump(lane: Arc<Lane>, mut calls: async_mpsc::UnboundedReceiver<HostCall>) {
+pub async fn host_pump(
+    protocol: Arc<Protocol>,
+    mut calls: async_mpsc::UnboundedReceiver<HostCall>,
+) {
     let permits = Arc::new(Semaphore::new(HOST_CALL_CONCURRENCY));
 
     while let Some(call) = calls.recv().await {
@@ -187,7 +190,7 @@ pub async fn host_pump(lane: Arc<Lane>, mut calls: async_mpsc::UnboundedReceiver
                 return;
             }
         };
-        let lane = lane.clone();
+        let protocol = protocol.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let params = NetRequestParams {
@@ -198,7 +201,10 @@ pub async fn host_pump(lane: Arc<Lane>, mut calls: async_mpsc::UnboundedReceiver
                 body: &call.body,
             };
             let outcome = match serde_json::to_value(&params) {
-                Ok(params) => match lane.request("net.request", params, BROKER_TIMEOUT).await {
+                Ok(params) => match protocol
+                    .request("net.request", params, BROKER_TIMEOUT)
+                    .await
+                {
                     Ok(value) => serde_json::from_value::<NetResponse>(value)
                         .map_err(|error| format!("net.request result is not a response: {error}")),
                     Err(error) => Err(error.to_string()),

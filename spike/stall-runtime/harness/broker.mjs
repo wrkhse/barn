@@ -1,16 +1,16 @@
 // The barn stand-in. It owns the stall's fd 3, routes JSON-RPC both ways, forwards the
 // stall's outbound HTTP to the mock upstream, and timestamps every request with the
-// harness's own monotonic clock. A lane line is one JSON object per \n and must fit under
-// 1 MiB; a larger upstream body would need base64 chunking, which is out of scope here, so
-// it becomes a -32001 error reply rather than a truncated frame.
+// harness's own monotonic clock. A stall protocol line is one JSON object per \n and must
+// fit under 1 MiB; a larger upstream body would need base64 chunking, which is out of scope
+// here, so it becomes a -32001 error reply rather than a truncated frame.
 import http from "node:http"
 
 export const MAX_LINE_BYTES = 1024 * 1024
 const UPSTREAM_TIMEOUT_MS = 10_000
 
 export function startBroker({ child, upstreamBase, faults = [] }) {
-  const lane = child.stdio[3]
-  if (!lane) throw new Error("stall-spike: child.stdio[3] is missing; spawn the stall with stdio ['ignore','pipe','pipe','pipe']")
+  const protocol = child.stdio[3]
+  if (!protocol) throw new Error("stall-spike: child.stdio[3] is missing; spawn the stall with stdio ['ignore','pipe','pipe','pipe']")
 
   const upstream = new URL(upstreamBase)
   const pending = new Map()
@@ -25,8 +25,8 @@ export function startBroker({ child, upstreamBase, faults = [] }) {
 
   const onExit = (code, signal) => failAll(new Error(`stall exited (code ${code}, signal ${signal}) before replying`))
   child.once("exit", onExit)
-  lane.on("data", onData)
-  lane.on("error", (error) => failAll(new Error(`lane socket failed: ${error.message}`)))
+  protocol.on("data", onData)
+  protocol.on("error", (error) => failAll(new Error(`stall protocol socket failed: ${error.message}`)))
 
   function failAll(error) {
     closed = true
@@ -124,7 +124,7 @@ export function startBroker({ child, upstreamBase, faults = [] }) {
       return
     }
     counters.denials += 1
-    sendError(message.id, -32601, `unknown lane method ${message.method}`, { method: message.method })
+    sendError(message.id, -32601, `unknown stall method ${message.method}`, { method: message.method })
   }
 
   async function forward(message) {
@@ -166,14 +166,14 @@ export function startBroker({ child, upstreamBase, faults = [] }) {
 
       if (bodyBytes + 512 > MAX_LINE_BYTES) {
         counters.denials += 1
-        sendError(message.id, -32001, `upstream body of ${bodyBytes} bytes exceeds the 1 MiB lane cap; base64 chunking is out of scope for the spike`, { bytes: bodyBytes })
+        sendError(message.id, -32001, `upstream body of ${bodyBytes} bytes exceeds the 1 MiB stall protocol cap; base64 chunking is out of scope for the spike`, { bytes: bodyBytes })
       } else {
         sendLine({ jsonrpc: "2.0", id: message.id, result: { status: response.status, headers, body } })
         entry.status = response.status
         entry.bytes = bodyBytes
       }
-      // tDone is when the reply was handed to the lane, the last instant the harness can
-      // observe; the stall's remaining work and its own delivery follow this stamp.
+      // tDone is when the reply was handed to the stall protocol, the last instant the
+      // harness can observe; the stall's remaining work and its own delivery follow this stamp.
       entry.tDoneNs = process.hrtime.bigint()
     } catch (error) {
       counters.denials += 1
@@ -187,21 +187,21 @@ export function startBroker({ child, upstreamBase, faults = [] }) {
   function sendLine(message) {
     const line = `${JSON.stringify(message)}\n`
     const bytes = Buffer.byteLength(line)
-    if (bytes > MAX_LINE_BYTES) throw new Error(`lane line of ${bytes} bytes exceeds the 1 MiB cap`)
-    if (closed) throw new Error("lane is closed")
-    lane.write(line)
+    if (bytes > MAX_LINE_BYTES) throw new Error(`stall protocol line of ${bytes} bytes exceeds the 1 MiB cap`)
+    if (closed) throw new Error("the stall protocol is closed")
+    protocol.write(line)
   }
 
   function sendError(id, code, message, data = {}) {
     try {
       sendLine({ jsonrpc: "2.0", id, error: { code, message, data } })
     } catch (error) {
-      process.stderr.write(`stall-spike: could not send lane error: ${error.message}\n`)
+      process.stderr.write(`stall-spike: could not send the stall protocol error: ${error.message}\n`)
     }
   }
 
   function request(method, params, timeoutMs) {
-    if (closed) return Promise.reject(new Error(`cannot send ${method}: lane is closed`))
+    if (closed) return Promise.reject(new Error(`cannot send ${method}: the stall protocol is closed`))
     const id = nextId
     nextId += 1
     return new Promise((resolve, reject) => {
@@ -221,29 +221,29 @@ export function startBroker({ child, upstreamBase, faults = [] }) {
     })
   }
 
-  async function startLane(options = {}, timeoutMs = 15_000) {
-    const params = { protocol: 1, lane: "sourcefed", http: { host: "127.0.0.1", port: 0 }, faults, ...options }
-    const result = await request("lane.start", params, timeoutMs)
-    if (!result || result.ready !== true) throw new Error(`lane.start did not report ready: ${JSON.stringify(result)}`)
+  async function startStall(options = {}, timeoutMs = 15_000) {
+    const params = { protocol: 1, stall: "sourcefed", http: { host: "127.0.0.1", port: 0 }, faults, ...options }
+    const result = await request("stall.start", params, timeoutMs)
+    if (!result || result.ready !== true) throw new Error(`stall.start did not report ready: ${JSON.stringify(result)}`)
     return result
   }
 
-  const health = (timeoutMs = 2000) => request("lane.health", {}, timeoutMs)
-  const drain = (timeoutMs = 5000) => request("lane.drain", {}, timeoutMs)
+  const health = (timeoutMs = 2000) => request("stall.health", {}, timeoutMs)
+  const drain = (timeoutMs = 5000) => request("stall.drain", {}, timeoutMs)
 
   function stop() {
-    lane.removeListener("data", onData)
+    protocol.removeListener("data", onData)
     child.removeListener("exit", onExit)
     failAll(new Error("broker stopped"))
     try {
-      lane.destroy()
+      protocol.destroy()
     } catch {
       // The socket may already be closed with the child; nothing left to release.
     }
   }
 
   return {
-    startLane,
+    startStall,
     health,
     drain,
     stats: () => ({ ...counters }),
@@ -259,8 +259,8 @@ export function startBroker({ child, upstreamBase, faults = [] }) {
 }
 
 /**
- * The monitor identity a lane request belongs to, from its URL. It is the key that pairs a
- * delivered event with the request that produced it.
+ * The monitor identity a stall protocol request belongs to, from its URL. It is the key
+ * that pairs a delivered event with the request that produced it.
  */
 export function keyForUrl(rawUrl) {
   let url

@@ -1,7 +1,8 @@
 // One measured run: mock upstream, one stall process, the barn stand-in, the fake host, a
 // fixed workload, and a window in which every number in the run JSON is collected. The
 // harness never times its own work as the stall's: request and frame stamps come from the
-// same host hrtime clock, and only work that crossed a lane or HTTP boundary is counted.
+// same host hrtime clock, and only work that crossed the stall protocol or an HTTP boundary
+// is counted.
 import { spawn } from "node:child_process"
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import http from "node:http"
@@ -16,14 +17,15 @@ import { buildMonitors, duePolls, faultsFor } from "./workload.mjs"
 
 const TARGET = { kind: "program", id: "spike" }
 const BYTES_PER_MB = 1024 * 1024
-const LANE_START_TIMEOUT_MS = 15_000
+const STALL_START_TIMEOUT_MS = 15_000
 const FIRST_REQUEST_TIMEOUT_MS = 15_000
+const PRIMING_TIMEOUT_MS = 45_000
 const CREATE_TIMEOUT_MS = 5000
 const WARMUP_MS = 2000
 const HEALTH_TIMEOUT_MS = 2000
 const DRAIN_TIMEOUT_MS = 5000
 const KILL_TIMEOUT_MS = 2000
-const STALL_START_TIMEOUT_MS = 10_000
+const SPAWN_TIMEOUT_MS = 10_000
 
 async function main() {
   const options = parseArgs(process.argv.slice(2))
@@ -54,26 +56,26 @@ async function measuredRun(options) {
     upstream = await spawnUpstream({ mode, seed: options.seed })
     const tSpawn = nowNs()
     const monitors = options.scenario === "idle" ? [] : buildMonitors({ count: options.monitors, chaos: options.chaos, intervalSec: options.interval })
-    child = await startStall(options, stateDir)
+    child = await spawnStall(options, stateDir)
     stderr = stderrCollector(child.stderr)
     child.stdout.resume()
 
     broker = startBroker({ child, upstreamBase: `http://127.0.0.1:${upstream.port}`, faults })
     agent = new http.Agent({ keepAlive: true, maxSockets: 32 })
 
-    const laneStarted = nowNs()
-    let lane
+    const stallStarted = nowNs()
+    let stall
     try {
-      lane = await broker.startLane({ state: stateDir, faults }, LANE_START_TIMEOUT_MS)
+      stall = await broker.startStall({ state: stateDir, faults }, STALL_START_TIMEOUT_MS)
     } catch (error) {
       throw new Error(describe(error, stderr))
     }
-    const laneStartMs = msSince(laneStarted)
-    if (!lane.http || !Number.isInteger(lane.http.port)) throw new Error(`lane.start returned no HTTP port: ${JSON.stringify(lane)}`)
+    const stallStartMs = msSince(stallStarted)
+    if (!stall.http || !Number.isInteger(stall.http.port)) throw new Error(`stall.start returned no HTTP port: ${JSON.stringify(stall)}`)
 
     const sseStarted = nowNs()
     const frames = []
-    sse = startSseHost({ port: lane.http.port, target: TARGET, onFrame: (frame) => { if (frame.type === "event") frames.push(frame) } })
+    sse = startSseHost({ port: stall.http.port, target: TARGET, onFrame: (frame) => { if (frame.type === "event") frames.push(frame) } })
     try {
       await sse.ready
     } catch (error) {
@@ -82,26 +84,46 @@ async function measuredRun(options) {
     const sseReadyMs = msSince(sseStarted)
 
     let firstRequestNs = null
-    broker.onNetRequest(({ tNs }) => {
+    const primedKeys = new Set()
+    broker.onNetRequest(({ tNs, monitorKey }) => {
       if (firstRequestNs === null) firstRequestNs = tNs
+      if (monitorKey !== null) primedKeys.add(monitorKey)
     })
 
     const createdStarted = nowNs()
     if (options.scenario !== "idle") {
       for (const monitor of monitors) {
         try {
-          await rpcCall({ port: lane.http.port, method: "monitor.create", params: createParams(monitor), timeoutMs: CREATE_TIMEOUT_MS, agent })
+          await rpcCall({ port: stall.http.port, method: "monitor.create", params: createParams(monitor), timeoutMs: CREATE_TIMEOUT_MS, agent })
         } catch (error) {
           throw new Error(describe(new Error(`monitor.create ${monitor.name} failed: ${error.message}`), stderr))
         }
       }
     }
     const monitorsCreatedMs = msSince(createdStarted)
+    const primedStarted = nowNs()
 
     let startupMs = null
     if (options.scenario !== "idle") {
       await waitFor(() => firstRequestNs !== null, FIRST_REQUEST_TIMEOUT_MS)
       if (firstRequestNs !== null) startupMs = Number(firstRequestNs - tSpawn) / 1e6
+    }
+
+    // Priming ends when every monitor that can reach the broker has sent at least one
+    // request, not when the reply arrives: a request that never finishes still counts,
+    // because its tick fired. The chaos monitor is excluded because both candidates inject
+    // the fault before any broker call, so it never appears in primedKeys. The cap keeps a
+    // stalled first round from holding the run open; primedTarget, primedMonitors and
+    // primingTimedOut record what happened.
+    const primedTarget = primingTargetCount(monitors.length, options.chaos)
+    let primingMs = null
+    let primedMonitors = 0
+    let primingTimedOut = false
+    if (options.scenario !== "idle") {
+      const remainingMs = Math.max(0, PRIMING_TIMEOUT_MS - msSince(primedStarted))
+      primingTimedOut = !(await waitFor(() => primedKeys.size >= primedTarget, remainingMs))
+      primingMs = msSince(primedStarted)
+      primedMonitors = primedKeys.size
     }
 
     health = startHealthProbes(broker, tSpawn)
@@ -117,14 +139,20 @@ async function measuredRun(options) {
     await sse.stop()
 
     const due = duePolls({ count: monitors.length, windowSec: options.windowSec, intervalSec: options.interval })
-    const metrics = computeMetrics({ samples, requestLog: broker.requestLog(), frames, windowStarted, windowEnded, windowSec: options.windowSec, idleRssMb: null, due })
+    const requestLog = broker.requestLog()
+    const metrics = computeMetrics({
+      samples, requestLog, frames, windowStarted, windowEnded,
+      windowSec: options.windowSec, intervalSec: options.interval, monitorCount: monitors.length,
+      idleRssMb: null, due,
+    })
     if (options.scenario === "idle") metrics.idleRssMb = metrics.rssMb.median
+    const timeline = buildTimeline({ requestLog, frames, windowStarted, windowEnded, tSpawn })
 
     const drainStarted = nowNs()
     let drainFailure = null
     try {
       const reply = await broker.drain(DRAIN_TIMEOUT_MS)
-      if (!reply || reply.ok !== true) drainFailure = `lane.drain returned ${JSON.stringify(reply)}`
+      if (!reply || reply.ok !== true) drainFailure = `stall.drain returned ${JSON.stringify(reply)}`
     } catch (error) {
       drainFailure = error.message
     }
@@ -139,7 +167,7 @@ async function measuredRun(options) {
       }
     }
     const drainMs = msSince(drainStarted)
-    if (drainFailure) process.stderr.write(`stall-spike: lane.drain failed: ${drainFailure}\n`)
+    if (drainFailure) process.stderr.write(`stall-spike: stall.drain failed: ${drainFailure}\n`)
 
     const counters = broker.stats()
     return {
@@ -156,11 +184,16 @@ async function measuredRun(options) {
       run: options.runIndex,
       startedAt,
       machine: machineInfo(),
-      laneStartMs,
+      stallStartMs,
       sseReadyMs,
       monitorsCreatedMs,
       startupMs,
+      primingMs,
+      primedTarget,
+      primedMonitors,
+      primingTimedOut,
       ...metrics,
+      timeline,
       health: healthSummary(health.state),
       stderrLines: stderr.lines,
       stderrTail: stderr.tail(),
@@ -180,7 +213,7 @@ async function measuredRun(options) {
   }
 }
 
-function computeMetrics({ samples, requestLog, frames, windowStarted, windowEnded, windowSec, idleRssMb, due }) {
+export function computeMetrics({ samples, requestLog, frames, windowStarted, windowEnded, windowSec, intervalSec, monitorCount, idleRssMb, due }) {
   const completed = requestLog.filter((entry) => entry.status !== null && entry.tDoneNs !== null && entry.tDoneNs >= windowStarted && entry.tDoneNs <= windowEnded)
   const rss = samples.map((sample) => sample.rssBytes / BYTES_PER_MB)
   const first = samples[0]
@@ -189,6 +222,14 @@ function computeMetrics({ samples, requestLog, frames, windowStarted, windowEnde
   const polls = completed.length
   const delivered = frames.filter((frame) => frame.tNs >= windowStarted && frame.tNs <= windowEnded)
   const events = delivered.reduce((total, frame) => total + frame.events.length, 0)
+  // Priming is outside the window, so a candidate that kept up polls each monitor
+  // floor(windowSec / intervalSec) - 1 to floor(windowSec / intervalSec) times; the low end
+  // is a round that can fall just past the window edge, not a stalled scheduler. Below that
+  // floor is a candidate that fell behind.
+  const rounds = Math.floor(windowSec / intervalSec)
+  const pollRatioFloor = due > 0 ? ((rounds - 1) * monitorCount) / due : null
+  const pollsPerMonitor = monitorCount > 0 ? polls / monitorCount : null
+  const behind = due > 0 ? polls < pollRatioFloor * due : null
 
   return {
     idleRssMb,
@@ -197,8 +238,11 @@ function computeMetrics({ samples, requestLog, frames, windowStarted, windowEnde
     cpuMsPerPoll: cpuMs === null ? null : cpuMs / Math.max(polls, 1),
     cpuPctOfOneCore: cpuMs === null ? null : (cpuMs / (windowSec * 1000)) * 100,
     polls,
+    pollsPerMonitor,
     duePolls: due,
     pollRatio: due > 0 ? polls / due : null,
+    pollRatioFloor,
+    behind,
     requests: polls,
     bytesIn: completed.reduce((total, entry) => total + entry.bytes, 0),
     events,
@@ -207,19 +251,69 @@ function computeMetrics({ samples, requestLog, frames, windowStarted, windowEnde
   }
 }
 
-function latencyStats(frames, requestLog) {
+export function latencyStats(frames, requestLog) {
   const latency = []
   const e2e = []
+  let unattributed = 0
   for (const frame of frames) {
-    for (const event of frame.events) {
-      const key = keyForSource(event && event.source)
+    for (const queued of frame.events) {
+      // A QueuedMonitorEvent nests the source under `event`; reading it at the top level
+      // made every lookup miss and left both latency summaries with no samples.
+      const key = keyForSource(queued?.event?.source)
       const request = key ? latestRequest(requestLog, key, frame.tNs) : null
-      if (!request) continue
+      if (!request) {
+        unattributed += 1
+        continue
+      }
       latency.push(Number(frame.tNs - request.tDoneNs) / 1e6)
       e2e.push(Number(frame.tNs - request.tSentNs) / 1e6)
     }
   }
-  return { latencyMs: percentileSummary(latency), e2eMs: percentileSummary(e2e) }
+  return { latencyMs: percentileSummary(latency), e2eMs: percentileSummary(e2e), latencyUnattributed: unattributed }
+}
+
+export function buildTimeline({ requestLog, frames, windowStarted, windowEnded, tSpawn }) {
+  // beforeWindow and afterWindow count by send time; completedInWindow counts by completion
+  // time, so a request sent before the window and answered inside it appears in both. A
+  // request with no reply status (still in flight, aborted or failed) is incomplete.
+  const counts = { total: requestLog.length, completedInWindow: 0, beforeWindow: 0, afterWindow: 0, incomplete: 0 }
+  // The fixed 180 buckets cover seconds 0-179; anything past the last bucket is clipped
+  // rather than misbucketed.
+  const seconds = new Array(180).fill(0)
+  for (const entry of requestLog) {
+    if (entry.status !== null && entry.tDoneNs !== null && entry.tDoneNs >= windowStarted && entry.tDoneNs <= windowEnded) counts.completedInWindow += 1
+    if (entry.tSentNs < windowStarted) counts.beforeWindow += 1
+    if (entry.tSentNs > windowEnded) counts.afterWindow += 1
+    if (entry.status === null) counts.incomplete += 1
+    const second = Math.floor(Number(entry.tSentNs - tSpawn) / 1e9)
+    if (second >= 0 && second < seconds.length) seconds[second] += 1
+  }
+
+  const eventsByKey = new Map()
+  let eventsUnattributed = 0
+  for (const frame of frames) {
+    if (frame.tNs < windowStarted || frame.tNs > windowEnded) continue
+    for (const queued of frame.events) {
+      const key = keyForSource(queued?.event?.source)
+      if (key === null) eventsUnattributed += 1
+      else eventsByKey.set(key, (eventsByKey.get(key) ?? 0) + 1)
+    }
+  }
+
+  return {
+    windowStartedOffsetMs: Number(windowStarted - tSpawn) / 1e6,
+    windowEndedOffsetMs: Number(windowEnded - tSpawn) / 1e6,
+    requestCounts: counts,
+    requestSeconds: seconds,
+    firstRequests: requestLog.slice(0, 3).map((entry) => requestSample(entry, tSpawn)),
+    lastRequests: requestLog.slice(-3).map((entry) => requestSample(entry, tSpawn)),
+    eventsByKey: Object.fromEntries([...eventsByKey.entries()].sort(([left], [right]) => left.localeCompare(right))),
+    eventsUnattributed,
+  }
+}
+
+function requestSample(entry, tSpawn) {
+  return { offsetMs: Number(entry.tSentNs - tSpawn) / 1e6, monitorKey: entry.monitorKey, status: entry.status, bytes: entry.bytes }
 }
 
 function latestRequest(requestLog, key, tNs) {
@@ -241,7 +335,7 @@ function startHealthProbes(broker, tSpawn) {
     const started = nowNs()
     try {
       const reply = await broker.health(HEALTH_TIMEOUT_MS)
-      if (!reply || reply.ok !== true) throw new Error(`lane.health returned ${JSON.stringify(reply)}`)
+      if (!reply || reply.ok !== true) throw new Error(`stall.health returned ${JSON.stringify(reply)}`)
       if (stopped) return
       const now = nowNs()
       state.samples.push({ tMs: elapsed(now, tSpawn), rttMs: elapsed(now, started) })
@@ -290,6 +384,12 @@ function createParams(monitor) {
   return { target: TARGET, name: monitor.name, sourceType: monitor.sourceType, ...monitor.params, pollIntervalSec: monitor.pollIntervalSec }
 }
 
+// The chaos monitor cannot prime: its injected fault runs inside the stall, before the
+// broker call, so it never reaches net.request. Every other monitor must.
+export function primingTargetCount(monitorCount, chaos) {
+  return monitorCount - (chaos === "none" ? 0 : 1)
+}
+
 function stallEnv(options, stateDir) {
   const env = {
     PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
@@ -298,7 +398,8 @@ function stallEnv(options, stateDir) {
     SOURCEFED_JIRA_BASE_URL: "https://example.atlassian.net",
     GH_TOKEN: "spike-token",
     // The mock upstream ignores auth, but sourcefed's Jira provider refuses to poll without
-    // these; they only ever reach the loopback mock because every request goes over the lane.
+    // these; they only ever reach the loopback mock because every request goes over the
+    // stall protocol.
     ATLASSIAN_EMAIL: "spike@example.com",
     ATLASSIAN_API_KEY: "spike-token",
   }
@@ -310,12 +411,12 @@ function stallEnv(options, stateDir) {
   return { ...env, ...options.env }
 }
 
-function startStall(options, stateDir) {
+function spawnStall(options, stateDir) {
   const command = options.node ? process.execPath : options.stallCmd
   const args = options.node ? [options.stallCmd] : []
   const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe", "pipe"], env: stallEnv(options, stateDir) })
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`stall did not start within 10 s: ${command}`)), STALL_START_TIMEOUT_MS)
+    const timer = setTimeout(() => reject(new Error(`stall did not start within 10 s: ${command}`)), SPAWN_TIMEOUT_MS)
     child.once("spawn", () => {
       clearTimeout(timer)
       resolve(child)

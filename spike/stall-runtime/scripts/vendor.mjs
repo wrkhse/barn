@@ -29,7 +29,7 @@ const LIFT = [
   },
 ]
 
-const SPIKE_FILES = ["stall-a.mjs", "broker-fetch.mjs", "lane.mjs"]
+const SPIKE_FILES = ["stall-a.mjs", "broker-fetch.mjs", "stall-protocol.mjs"]
 const BUILT = [
   "packages/core/dist/index.js",
   "packages/daemon/dist/index.js",

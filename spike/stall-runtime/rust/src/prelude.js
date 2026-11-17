@@ -1,6 +1,6 @@
 // Stall realm prelude: the Node-flavoured globals the pinned sourcefed providers
-// use, plus globalThis.__stall.http(url, headers) — synchronous, because it blocks
-// the realm thread on the broker, and returning a Response-like the providers read.
+// use, plus globalThis.__stall.http(url, headers). http is synchronous — it blocks
+// the realm thread on the broker — and returns the Response-like providers read.
 "use strict";
 
 (function () {
@@ -77,7 +77,8 @@
     this.searchParams = new URLSearchParams(this.search);
   }
   URL.prototype.toString = function () { return this.href; };
-  URL.parse = function (input) { try { return new URL(input); } catch (error) { return null; } }; globalThis.URL = URL;
+  URL.parse = function (input) { try { return new URL(input); } catch (error) { return null; } };
+  globalThis.URL = URL;
 
   function plainSignal() { return { aborted: false, reason: undefined, addEventListener: function () {}, removeEventListener: function () {} }; }
   globalThis.AbortSignal = { timeout: plainSignal, aborted: false };
@@ -129,6 +130,7 @@
     }
     return output;
   };
+
   function headerBag(raw) {
     var values = {}, headers = raw || {}, names = Object.keys(headers);
     for (var index = 0; index < names.length; index += 1) {

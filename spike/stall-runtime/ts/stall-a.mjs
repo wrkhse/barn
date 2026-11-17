@@ -1,7 +1,7 @@
 import { InMemoryMonitorEventQueue, InMemoryMonitorStore } from "@sourcefed/core"
 import { SourcefedDaemon, daemonHealth, handleDaemonHttpRequest, serveHttp } from "@sourcefed/daemon"
 import { installBrokerFetch } from "./broker-fetch.mjs"
-import { openLane } from "./lane.mjs"
+import { openStallProtocol } from "./stall-protocol.mjs"
 
 // Candidate A is the real v0.5.2 daemon. Only three things differ from a stock install:
 // global fetch is replaced by the broker client, the vendored copy's GitHub limiter is
@@ -29,27 +29,27 @@ let brokerInflight = () => 0
 let started = false
 const enabledMonitors = new Set()
 
-const lane = openLane({
+const protocol = openStallProtocol({
   handlers: {
-    "lane.start": start,
-    "lane.health": health,
-    "lane.drain": drain,
+    "stall.start": start,
+    "stall.health": health,
+    "stall.drain": drain,
     "net.request": refuseNetRequest,
   },
   onClose,
 })
 
 async function start(params) {
-  if (started) throw new Error("lane.start was already handled")
-  if (params.protocol !== 1) throw new Error(`unsupported lane protocol ${params.protocol}`)
+  if (started) throw new Error("stall.start was already handled")
+  if (params.protocol !== 1) throw new Error(`unsupported stall protocol ${params.protocol}`)
 
   const stateDir = typeof params.state === "string" && params.state !== "" ? params.state : process.env.STALL_STATE_DIR
-  if (!stateDir) throw new Error("lane.start needs state, or STALL_STATE_DIR")
+  if (!stateDir) throw new Error("stall.start needs state, or STALL_STATE_DIR")
 
   brokerInflight = installBrokerFetch({
-    request: (method, requestParams) => lane.request(method, requestParams),
+    request: (method, requestParams) => protocol.request(method, requestParams),
     faults: params.faults ?? [],
-    sendLog: (level, message) => lane.sendLog(level, message),
+    sendLog: (level, message) => protocol.sendLog(level, message),
   }).inflight
 
   daemon = openDaemon(stateDir)
@@ -72,13 +72,13 @@ async function start(params) {
 }
 
 async function health() {
-  if (!started) throw new Error("lane.health arrived before lane.start")
+  if (!started) throw new Error("stall.health arrived before stall.start")
   return { ok: true, monitors: enabledMonitors.size, inflight: brokerInflight() }
 }
 
 async function drain() {
   if (daemon) {
-    // The daemon's own stop waits up to 30 s for in-flight ticks; the lane gives it three.
+    // The daemon's own stop waits up to 30 s for in-flight ticks; the stall protocol gives it three.
     await Promise.race([daemon.stop().catch(() => undefined), delay(3_000)])
   }
   return { ok: true }
@@ -134,15 +134,15 @@ function trackMonitors(sourcefed) {
   }
 }
 
-// net.request is the stall's direction of the lane. A harness asking the stall for one is a
-// protocol mistake, and saying so is clearer than an unknown-method error.
+// net.request is the stall's direction of the stall protocol. A harness asking the stall
+// for one is a protocol mistake, and saying so is clearer than an unknown-method error.
 async function refuseNetRequest() {
   throw new Error("net.request arrives from the stall, not the harness")
 }
 
 function onClose(info) {
-  if (info.error) console.error(`[stall-a] lane closed: ${info.error.message}`)
-  // A clean end of the lane is the harness letting go; a protocol failure is a crash.
+  if (info.error) console.error(`[stall-a] stall protocol closed: ${info.error.message}`)
+  // A clean end of the protocol is the harness letting go; a protocol failure is a crash.
   process.exit(info.fatal ? 1 : 0)
 }
 

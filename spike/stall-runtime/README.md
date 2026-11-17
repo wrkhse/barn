@@ -13,8 +13,8 @@ meant to produce comparable numbers on a laptop.
 
 ## Build
 
-Node 26 runs the harness and candidate A. Rust stable compiles candidate B; rquickjs needs
-`libclang-dev` and `cmake` on Debian/Ubuntu. `npm install` installs the only dev dependency,
+Node 26 runs the harness and candidate A. The toolchain that `rust-toolchain.toml` pins compiles
+candidate B; rquickjs needs `libclang-dev` and `cmake` on Debian/Ubuntu. `npm install` installs the only dev dependency,
 esbuild, which bundles the provider plugins.
 
 ```sh
@@ -26,7 +26,10 @@ cargo build --release --manifest-path rust/Cargo.toml
 ```
 
 The harness reads candidate A from `.vendor/sourcefed/.spike/stall-a.mjs`, candidate B from
-`rust/target/release/stall-b`, and the plugin bundles from `plugins-dist/`.
+`rust/target/release/stall-b`, and the plugin bundles from `plugins-dist/`. The spike's
+`stall.start` adds fields `docs/stall-protocol.md` does not fix — an `http` object in its
+parameters and result, and a `faults` array in its parameters — because the spike stall binds its
+own loopback listener and injects upstream faults; they are spike-only and settle nothing for B1.
 
 ## One measured run
 
@@ -66,10 +69,9 @@ node harness/aggregate.mjs --dir results/steady-100 --out results/steady-100/sum
 
 `.github/workflows/stall-runtime-spike.yml` runs on pushes to `spike/stall-runtime` and by manual
 dispatch (`mode: smoke` for one short run of every scenario plus the 100-monitor ramp, `mode: full`
-for everything). The `build` job
-records tool versions and bundle sizes in `results/build.json`; its bundle figures cover the
-vendored tree's per-package `dist` directories, because sourcefed builds one bundle per package and
-provider. The measurement jobs upload their run JSON; the `report` job writes `results/summary.md`
-into the workflow step summary and uploads the whole tree as the `stall-spike-results` artifact
-(seven-day retention). `results/` is ignored in git, apart from its note, because the numbers belong
-to the CI artifacts.
+for everything). The `build` job records tool versions and bundle sizes in `results/build.json`;
+its bundle figures cover the vendored tree's per-package `dist` directories, because sourcefed
+builds one bundle per package and provider. The measurement jobs upload their run JSON; the
+`report` job writes `results/summary.md` into the workflow step summary and uploads the whole tree
+as the `stall-spike-results` artifact (seven-day retention). `results/` is ignored in git, apart
+from its note, because the numbers belong to the CI artifacts.

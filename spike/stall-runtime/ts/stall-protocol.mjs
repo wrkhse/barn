@@ -2,18 +2,18 @@ import { Socket } from "node:net"
 
 const MAX_LINE_BYTES = 1024 * 1024
 const REQUEST_TIMEOUT_MS = 30_000
-// The contract allows five seconds from lane.drain to exit; this bounds the wait for the
+// The contract allows five seconds from stall.drain to exit; this bounds the wait for the
 // kernel to take the reply if the peer stops reading.
 const FLUSH_TIMEOUT_MS = 1_000
 
 /**
- * The fd 3 lane: newline-delimited JSON-RPC 2.0 over the inherited socket. Methods in
- * `handlers` answer the harness, `net.request` arrives through the same map, and a reply
- * for `lane.drain` ends the lane once it is flushed.
+ * The fd 3 stall protocol: newline-delimited JSON-RPC 2.0 over the inherited socket. Methods
+ * in `handlers` answer the harness, `net.request` arrives through the same map, and a
+ * reply for `stall.drain` ends the protocol once it is flushed.
  */
-export function openLane({ handlers = {}, onClose } = {}) {
-  const fd = Number(process.env.STALL_LANE_FD ?? 3)
-  if (!Number.isInteger(fd) || fd < 3) throw new Error(`STALL_LANE_FD must be a file descriptor of 3 or more, got ${process.env.STALL_LANE_FD ?? fd}`)
+export function openStallProtocol({ handlers = {}, onClose } = {}) {
+  const fd = Number(process.env.STALL_FD ?? 3)
+  if (!Number.isInteger(fd) || fd < 3) throw new Error(`STALL_FD must be a file descriptor of 3 or more, got ${process.env.STALL_FD ?? fd}`)
 
   const socket = new Socket({ fd, readable: true, writable: true })
   socket.setNoDelay(true)
@@ -33,12 +33,12 @@ export function openLane({ handlers = {}, onClose } = {}) {
   return { request, sendLog }
 
   function request(method, params = {}) {
-    if (closed) return Promise.reject(new Error("the lane is closed"))
+    if (closed) return Promise.reject(new Error("the stall protocol is closed"))
     const id = nextID++
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         pending.delete(id)
-        reject(new Error(`lane request ${method} timed out after ${REQUEST_TIMEOUT_MS} ms`))
+        reject(new Error(`stall protocol request ${method} timed out after ${REQUEST_TIMEOUT_MS} ms`))
       }, REQUEST_TIMEOUT_MS)
       // A pending reply must not keep the process alive after drain.
       timer.unref?.()
@@ -72,7 +72,7 @@ export function openLane({ handlers = {}, onClose } = {}) {
       newline = tail.indexOf(0x0a)
     }
 
-    if (tail.length > MAX_LINE_BYTES) fatal(new Error(`a lane line passed ${MAX_LINE_BYTES} bytes without a newline`))
+    if (tail.length > MAX_LINE_BYTES) fatal(new Error(`a stall protocol line passed ${MAX_LINE_BYTES} bytes without a newline`))
   }
 
   function accept(line) {
@@ -80,11 +80,11 @@ export function openLane({ handlers = {}, onClose } = {}) {
     try {
       message = JSON.parse(line)
     } catch {
-      fatal(new Error("the lane received a line that is not JSON"))
+      fatal(new Error("the stall protocol received a line that is not JSON"))
       return
     }
     if (!message || typeof message !== "object" || Array.isArray(message)) {
-      fatal(new Error("the lane received a message that is not an object"))
+      fatal(new Error("the stall protocol received a message that is not an object"))
       return
     }
 
@@ -94,7 +94,7 @@ export function openLane({ handlers = {}, onClose } = {}) {
     }
     if (message.id === undefined) {
       if (message.method === "log") announce(message.params)
-      else process.stderr.write(`[stall] ignored lane notification ${message.method}\n`)
+      else process.stderr.write(`[stall] ignored stall notification ${message.method}\n`)
       return
     }
     void dispatch(message).catch((error) => fatal(error))
@@ -106,7 +106,7 @@ export function openLane({ handlers = {}, onClose } = {}) {
     pending.delete(message.id)
     clearTimeout(entry.timer)
     if (message.error) {
-      const error = new Error(`lane error ${message.error.code}: ${message.error.message}`)
+      const error = new Error(`stall protocol error ${message.error.code}: ${message.error.message}`)
       error.code = message.error.code
       entry.reject(error)
       return
@@ -117,24 +117,24 @@ export function openLane({ handlers = {}, onClose } = {}) {
   async function dispatch(message) {
     const handler = handlers[message.method]
     try {
-      if (!handler) throw new Error(`unknown lane method ${message.method}`)
+      if (!handler) throw new Error(`unknown stall method ${message.method}`)
       const result = await handler(message.params ?? {})
       send({ jsonrpc: "2.0", id: message.id, result: result ?? null })
     } catch (error) {
       send({ jsonrpc: "2.0", id: message.id, error: { code: -32001, message: messageOf(error) } })
     } finally {
-      if (message.method === "lane.drain") endLane()
+      if (message.method === "stall.drain") endProtocol()
     }
   }
 
   function send(message) {
-    if (closed || ending) throw new Error("the lane is closed")
+    if (closed || ending) throw new Error("the stall protocol is closed")
     const json = JSON.stringify(message)
-    if (Buffer.byteLength(json) > MAX_LINE_BYTES) throw new Error("a lane message exceeds 1 MiB")
+    if (Buffer.byteLength(json) > MAX_LINE_BYTES) throw new Error("a stall protocol message exceeds 1 MiB")
     socket.write(`${json}\n`)
   }
 
-  function endLane() {
+  function endProtocol() {
     if (ending || closed) return
     ending = true
     exitTimer = setTimeout(() => shutdown({ drained: true }), FLUSH_TIMEOUT_MS)
@@ -145,7 +145,7 @@ export function openLane({ handlers = {}, onClose } = {}) {
     if (closed) return
     closed = true
     if (exitTimer) clearTimeout(exitTimer)
-    const error = info.error ?? new Error("the lane closed")
+    const error = info.error ?? new Error("the stall protocol closed")
     for (const entry of pending.values()) {
       clearTimeout(entry.timer)
       entry.reject(error)
@@ -156,7 +156,7 @@ export function openLane({ handlers = {}, onClose } = {}) {
   }
 
   function fatal(error) {
-    process.stderr.write(`[stall] lane protocol error: ${messageOf(error)}\n`)
+    process.stderr.write(`[stall] stall protocol error: ${messageOf(error)}\n`)
     shutdown({ drained: false, error, fatal: true })
   }
 

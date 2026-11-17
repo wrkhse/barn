@@ -13,6 +13,8 @@ const METRICS = [
   { key: "cpuMsPerPoll", label: "CPU ms/poll", digits: 2 },
   { key: "cpuPctOfOneCore", label: "CPU % core", digits: 1 },
   { key: "pollRatio", label: "poll ratio", digits: 2 },
+  { key: "pollsPerMonitor", label: "polls/monitor", digits: 2 },
+  { key: "behind", label: "behind", digits: 0, kind: "boolean" },
   { key: "eventsPerSec", label: "events/s", digits: 2 },
   { key: "latencyMs.p95", label: "p95 latency ms", digits: 1 },
   { key: "latencyMs.p99", label: "p99 latency ms", digits: 1 },
@@ -28,7 +30,7 @@ const CAVEATS = [
   "The mock upstream is a stand-in: changing mode returns 100 issues and a fresh ETag per poll, stable mode answers 304 after priming.",
   "cpuPctOfOneCore can exceed 100% when the tree uses several cores; a run ended early by the health probe still divides by the configured window.",
   "idleRssMb is null for steady, quiet and fault runs; the idle scenario reports the window median. startupMs is spawn to first net.request, with no settle.",
-  "Health probes are lane RPCs every second; their CPU is part of the sampled process tree.",
+  "Health probes are stall protocol RPCs every second; their CPU is part of the sampled process tree.",
   "A metric with no sample in a run is null and is left out of its cell; if no run has a sample the cell is —.",
   "The fault scenario adds a chaos monitor, so its monitor count is one higher than steady or quiet at the same setting.",
   "Run JSONs are the only record: state dirs and upstream ports are ephemeral.",
@@ -90,7 +92,7 @@ function summariseGroup(list) {
   const first = list[0]
   const metrics = {}
   for (const metric of METRICS) {
-    const values = list.map((run) => numeric(read(run, metric.key))).filter((value) => value !== null)
+    const values = list.map((run) => metricValue(run, metric)).filter((value) => value !== null)
     metrics[metric.key] = { median: median(values), min: minimum(values), max: maximum(values), n: values.length }
   }
   return {
@@ -118,6 +120,7 @@ function compareGroups(left, right) {
 function widestSpread(metrics) {
   let best = null
   for (const metric of METRICS) {
+    if (metric.kind === "boolean") continue
     const entry = metrics[metric.key]
     if (!entry || entry.n < 2 || entry.median === null || entry.median === 0) continue
     const pct = ((entry.max - entry.min) / Math.abs(entry.median)) * 100
@@ -141,7 +144,7 @@ function groupHeading(group) {
 }
 
 function methodParagraph(runs) {
-  return `Every run spawns one stall, drives the same workload through its lane and HTTP API, and samples the process tree once a second. Values are medians of the runs found (the planned 10 per cell; n says how many), with [min–max] across those runs. Request and SSE frame times come only from the harness's own hrtime clock, so the latency columns measure host-side processing and delivery after the mock upstream answered, never a clock inside either candidate. Each table heading names the scenario, monitor count, candidate, scheduler, chaos and store it covers. ${runs.length} runs in this table.`
+  return `Every run spawns one stall, drives the same workload through its stall protocol and HTTP API, and samples the process tree once a second. Values are medians of the runs found (the planned 10 per cell; n says how many), with [min–max] across those runs. Request and SSE frame times come only from the harness's own hrtime clock, so the latency columns measure host-side processing and delivery after the mock upstream answered, never a clock inside either candidate. Each table heading names the scenario, monitor count, candidate, scheduler, chaos and store it covers. With priming outside the window, a candidate that kept up polls each monitor floor(windowSec/intervalSec) - 1 to floor(windowSec/intervalSec) times, so its poll ratio sits between pollRatioFloor and 1; polls/monitor is the mean across monitors, and behind is 1 for a run below that floor (a group's behind cell is the median of those 0/1 values, so 0 [0–1] means some runs fell below and some did not). ${runs.length} runs in this table.`
 }
 
 function machineParagraph(runs) {
@@ -170,6 +173,12 @@ function tableRow(group) {
 function formatCell(metric, entry) {
   if (!entry || entry.n === 0 || entry.median === null) return "—"
   return `${entry.median.toFixed(metric.digits)} [${entry.min.toFixed(metric.digits)}–${entry.max.toFixed(metric.digits)}]`
+}
+
+function metricValue(run, metric) {
+  const value = read(run, metric.key)
+  if (metric.kind === "boolean") return typeof value === "boolean" ? (value ? 1 : 0) : null
+  return numeric(value)
 }
 
 function read(value, key) {

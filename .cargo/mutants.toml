@@ -2,3 +2,7 @@
 # crate's: the binary's tests exercise the SDK through the library.
 test_workspace = true
 test_tool = "nextest"
+
+# The spike is throwaway code outside the workspace, so its mutants are not a
+# gate.
+exclude_globs = ["spike/**"]

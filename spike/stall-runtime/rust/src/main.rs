@@ -9,10 +9,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
-use stall_b::lane::{self, Inbound, Lane};
 use stall_b::model::VERSION;
 use stall_b::plugin::{self, Workers};
 use stall_b::sse::Hub;
+use stall_b::stall::{self, Inbound, Protocol};
 use stall_b::store::{self, Store};
 use stall_b::{http, log_line, schedule};
 
@@ -154,53 +154,57 @@ fn main() {
 }
 
 async fn run(env: Env) -> Result<(), String> {
-    let (lane, read_half) = lane::open_fd3()?;
-    let lane = Arc::new(lane);
+    let (protocol, read_half) = stall::open_fd3()?;
+    let protocol = Arc::new(protocol);
     let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel();
-    tokio::spawn(lane::read_loop(read_half, inbound_tx));
+    tokio::spawn(stall::read_loop(read_half, inbound_tx));
 
     let (host_tx, host_rx) = mpsc::unbounded_channel();
-    tokio::spawn(plugin::host_pump(lane.clone(), host_rx));
+    tokio::spawn(plugin::host_pump(protocol.clone(), host_rx));
 
     let mut system: Option<Arc<System>> = None;
 
     loop {
         let Some(inbound) = inbound_rx.recv().await else {
-            log_line("warn", "lane closed; exiting");
+            log_line("warn", "stall protocol closed; exiting");
             return Ok(());
         };
 
         match inbound {
             Inbound::Response { id, result } => {
-                if !lane.deliver(id, result) {
+                if !protocol.deliver(id, result) {
                     log_line(
                         "warn",
-                        &format!("lane response for unknown request id {id}"),
+                        &format!("stall protocol response for unknown request id {id}"),
                     );
                 }
             }
             Inbound::Request { id, method, params } => {
-                handle_lane_request(&env, &lane, &host_tx, &mut system, id, method, params).await;
+                handle_stall_request(&env, &protocol, &host_tx, &mut system, id, method, params)
+                    .await;
             }
             Inbound::Notification { method, params } => {
                 log_line(
                     "info",
                     &format!(
-                        "lane notification {method}: {}",
+                        "stall protocol notification {method}: {}",
                         truncate(&params.to_string(), 512)
                     ),
                 );
             }
             Inbound::Malformed(message) => {
-                log_line("error", &format!("lane message dropped: {message}"));
+                log_line(
+                    "error",
+                    &format!("stall protocol message dropped: {message}"),
+                );
             }
         }
     }
 }
 
-async fn handle_lane_request(
+async fn handle_stall_request(
     env: &Env,
-    lane: &Arc<Lane>,
+    protocol: &Arc<Protocol>,
     host_tx: &mpsc::UnboundedSender<plugin::HostCall>,
     system: &mut Option<Arc<System>>,
     id: Value,
@@ -208,52 +212,57 @@ async fn handle_lane_request(
     params: Value,
 ) {
     match method.as_str() {
-        "lane.start" => {
+        "stall.start" => {
             if system.is_some() {
-                lane.respond_error(id, -32600, "lane.start was already handled")
+                protocol
+                    .respond_error(id, -32600, "stall.start was already handled")
                     .await;
                 return;
             }
             match start_system(env, host_tx, params).await {
                 Ok((ready, new_system)) => {
                     *system = Some(new_system);
-                    lane.respond(id, ready).await;
+                    protocol.respond(id, ready).await;
                 }
                 Err(error) => {
-                    log_line("error", &format!("lane.start: {error}"));
-                    lane.respond_error(id, -32600, &error).await;
+                    log_line("error", &format!("stall.start: {error}"));
+                    protocol.respond_error(id, -32600, &error).await;
                 }
             }
         }
-        "lane.health" => match system {
+        "stall.health" => match system {
             Some(system) => {
                 let scoped = system.store.clone();
                 let monitors = tokio::task::spawn_blocking(move || scoped.monitor_count()).await;
                 let inflight = system.inflight.load(Ordering::Relaxed);
                 match monitors {
                     Ok(Ok(monitors)) => {
-                        lane.respond(
-                            id,
-                            json!({ "ok": true, "monitors": monitors, "inflight": inflight }),
-                        )
-                        .await;
+                        protocol
+                            .respond(
+                                id,
+                                json!({ "ok": true, "monitors": monitors, "inflight": inflight }),
+                            )
+                            .await;
                     }
                     Ok(Err(error)) => {
-                        lane.respond_error(id, -32603, &format!("health: {error}"))
+                        protocol
+                            .respond_error(id, -32603, &format!("health: {error}"))
                             .await;
                     }
                     Err(error) => {
-                        lane.respond_error(id, -32603, &format!("health task: {error}"))
+                        protocol
+                            .respond_error(id, -32603, &format!("health task: {error}"))
                             .await;
                     }
                 }
             }
             None => {
-                lane.respond_error(id, -32600, "lane.start has not run")
+                protocol
+                    .respond_error(id, -32600, "stall.start has not run")
                     .await;
             }
         },
-        "lane.drain" => {
+        "stall.drain" => {
             if let Some(system) = system {
                 log_line(
                     "info",
@@ -265,12 +274,13 @@ async fn handle_lane_request(
                     ),
                 );
             }
-            lane.respond(id, json!({ "ok": true })).await;
+            protocol.respond(id, json!({ "ok": true })).await;
             std::process::exit(0);
         }
         other => {
-            log_line("error", &format!("unknown lane method {other}"));
-            lane.respond_error(id, -32601, &format!("unknown lane method {other}"))
+            log_line("error", &format!("unknown stall method {other}"));
+            protocol
+                .respond_error(id, -32601, &format!("unknown stall method {other}"))
                 .await;
         }
     }
@@ -282,21 +292,21 @@ async fn start_system(
     params: Value,
 ) -> Result<(Value, Arc<System>), String> {
     let params: StartParams =
-        serde_json::from_value(params).map_err(|error| format!("lane.start params: {error}"))?;
+        serde_json::from_value(params).map_err(|error| format!("stall.start params: {error}"))?;
     if params.protocol != 1 {
         return Err(format!(
-            "unsupported lane protocol {} (this stall speaks 1)",
+            "unsupported stall protocol {} (this stall speaks 1)",
             params.protocol
         ));
     }
-    if params.lane != "sourcefed" {
-        return Err(format!("unknown lane {:?}", params.lane));
+    if params.stall != "sourcefed" {
+        return Err(format!("unknown stall {:?}", params.stall));
     }
     let state_dir = params
         .state
         .or_else(|| env.state_dir.clone())
         .ok_or_else(|| {
-            "lane.start gives no state directory and STALL_STATE_DIR is unset".to_string()
+            "stall.start gives no state directory and STALL_STATE_DIR is unset".to_string()
         })?;
 
     let store = match env.store {
@@ -379,7 +389,7 @@ async fn start_system(
 #[derive(Deserialize)]
 struct StartParams {
     protocol: u32,
-    lane: String,
+    stall: String,
     #[serde(default)]
     state: Option<PathBuf>,
     http: HttpListen,

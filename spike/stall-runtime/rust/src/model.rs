@@ -1,4 +1,4 @@
-//! Domain model shared by the lane, the store, the scheduler and the plugins.
+//! Domain model shared by the stall protocol, the store, the scheduler and the plugins.
 //!
 //! Field names mirror sourcefed's on-disk records: a monitor is stored with
 //! `sourceType` and its source parameters at the top level, plus the metadata

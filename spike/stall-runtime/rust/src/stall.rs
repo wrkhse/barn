@@ -1,4 +1,4 @@
-//! The harness lane on fd 3: JSON-RPC 2.0, one JSON object per line, <= 1 MiB.
+//! The stall protocol on fd 3: JSON-RPC 2.0, one JSON object per line, <= 1 MiB.
 //!
 //! Reading is framed by a bounded splitter so an over-long line is discarded
 //! with an error instead of growing the buffer or panicking. Requests we send
@@ -166,7 +166,7 @@ pub fn parse_inbound(text: &str) -> Inbound {
 }
 
 #[derive(Debug)]
-pub enum LaneError {
+pub enum ProtocolError {
     Io(String),
     Closed,
     Timeout,
@@ -174,26 +174,28 @@ pub enum LaneError {
     Rpc(RpcFailure),
 }
 
-impl std::fmt::Display for LaneError {
+impl std::fmt::Display for ProtocolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LaneError::Io(message) => write!(f, "lane io: {message}"),
-            LaneError::Closed => write!(f, "lane closed"),
-            LaneError::Timeout => write!(f, "lane request timed out"),
-            LaneError::TooLarge(size) => write!(f, "lane line of {size} bytes exceeds {MAX_LINE}"),
-            LaneError::Rpc(failure) => write!(f, "broker error: {failure}"),
+            ProtocolError::Io(message) => write!(f, "stall protocol io: {message}"),
+            ProtocolError::Closed => write!(f, "stall protocol closed"),
+            ProtocolError::Timeout => write!(f, "stall protocol request timed out"),
+            ProtocolError::TooLarge(size) => {
+                write!(f, "stall protocol line of {size} bytes exceeds {MAX_LINE}")
+            }
+            ProtocolError::Rpc(failure) => write!(f, "broker error: {failure}"),
         }
     }
 }
 
-pub struct Lane {
+pub struct Protocol {
     writer: AsyncMutex<OwnedWriteHalf>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value, RpcFailure>>>>,
     next_id: AtomicU64,
 }
 
-/// Take ownership of fd 3. The harness passes it as the lane socket's stall end.
-pub fn open_fd3() -> Result<(Lane, OwnedReadHalf), String> {
+/// Take ownership of fd 3, the stall's end of the protocol socket.
+pub fn open_fd3() -> Result<(Protocol, OwnedReadHalf), String> {
     // SAFETY: the harness spawns this process with fd 3 as one end of a Unix
     // socketpair, and this process takes ownership of that descriptor for the
     // rest of its life. Production barn passes a duplicated descriptor instead;
@@ -208,12 +210,12 @@ pub fn open_fd3() -> Result<(Lane, OwnedReadHalf), String> {
     let stream = tokio::net::UnixStream::from_std(std_stream)
         .map_err(|error| format!("fd 3 into tokio: {error}"))?;
     let (read_half, write_half) = stream.into_split();
-    let lane = Lane {
+    let protocol = Protocol {
         writer: AsyncMutex::new(write_half),
         pending: Mutex::new(HashMap::new()),
         next_id: AtomicU64::new(0),
     };
-    Ok((lane, read_half))
+    Ok((protocol, read_half))
 }
 
 /// Read framed lines forever, classifying them for the dispatch loop.
@@ -227,7 +229,7 @@ pub async fn read_loop(read_half: OwnedReadHalf, sender: mpsc::UnboundedSender<I
             let chunk = match reader.fill_buf().await {
                 Ok(chunk) => chunk,
                 Err(error) => {
-                    crate::log_line("error", &format!("lane read: {error}"));
+                    crate::log_line("error", &format!("stall protocol read: {error}"));
                     return;
                 }
             };
@@ -235,7 +237,7 @@ pub async fn read_loop(read_half: OwnedReadHalf, sender: mpsc::UnboundedSender<I
                 crate::log_line(
                     "warn",
                     &format!(
-                        "lane closed at EOF; {} bytes of an unfinished line dropped",
+                        "stall protocol closed at EOF; {} bytes of an unfinished line dropped",
                         splitter.buffered()
                     ),
                 );
@@ -255,22 +257,24 @@ pub async fn read_loop(read_half: OwnedReadHalf, sender: mpsc::UnboundedSender<I
                 }
                 Line::Overlong => crate::log_line(
                     "error",
-                    &format!("lane line over {MAX_LINE} bytes discarded"),
+                    &format!("stall protocol line over {MAX_LINE} bytes discarded"),
                 ),
-                Line::NonUtf8 => crate::log_line("error", "lane line was not valid UTF-8"),
+                Line::NonUtf8 => {
+                    crate::log_line("error", "stall protocol line was not valid UTF-8")
+                }
             }
         }
     }
 }
 
-impl Lane {
+impl Protocol {
     /// Send a request to the broker and wait for its response.
     pub async fn request(
         &self,
         method: &str,
         params: Value,
         timeout: Duration,
-    ) -> Result<Value, LaneError> {
+    ) -> Result<Value, ProtocolError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (reply, wait) = oneshot::channel();
         self.pending
@@ -286,27 +290,27 @@ impl Lane {
 
         match tokio::time::timeout(timeout, wait).await {
             Ok(Ok(Ok(result))) => Ok(result),
-            Ok(Ok(Err(failure))) => Err(LaneError::Rpc(failure)),
-            Ok(Err(_)) => Err(LaneError::Closed),
+            Ok(Ok(Err(failure))) => Err(ProtocolError::Rpc(failure)),
+            Ok(Err(_)) => Err(ProtocolError::Closed),
             Err(_) => {
                 self.forget(id);
-                Err(LaneError::Timeout)
+                Err(ProtocolError::Timeout)
             }
         }
     }
 
-    /// Reply to an inbound lane request.
+    /// Reply to an inbound stall protocol request.
     pub async fn respond(&self, id: Value, result: Value) {
         let message = json!({"jsonrpc": "2.0", "id": id, "result": result});
         if let Err(error) = self.write_value(&message).await {
-            crate::log_line("error", &format!("lane respond: {error}"));
+            crate::log_line("error", &format!("stall protocol respond: {error}"));
         }
     }
 
     pub async fn respond_error(&self, id: Value, code: i64, message: &str) {
         let body = json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}});
         if let Err(error) = self.write_value(&body).await {
-            crate::log_line("error", &format!("lane respond: {error}"));
+            crate::log_line("error", &format!("stall protocol respond: {error}"));
         }
     }
 
@@ -330,21 +334,21 @@ impl Lane {
             .remove(&id);
     }
 
-    async fn write_value(&self, value: &Value) -> Result<(), LaneError> {
+    async fn write_value(&self, value: &Value) -> Result<(), ProtocolError> {
         let mut bytes = serde_json::to_vec(value)
-            .map_err(|error| LaneError::Io(format!("serialize: {error}")))?;
+            .map_err(|error| ProtocolError::Io(format!("serialize: {error}")))?;
         if bytes.len() + 1 > MAX_LINE {
-            return Err(LaneError::TooLarge(bytes.len() + 1));
+            return Err(ProtocolError::TooLarge(bytes.len() + 1));
         }
         bytes.push(b'\n');
         let mut writer = self.writer.lock().await;
         writer
             .write_all(&bytes)
             .await
-            .map_err(|error| LaneError::Io(error.to_string()))?;
+            .map_err(|error| ProtocolError::Io(error.to_string()))?;
         writer
             .flush()
             .await
-            .map_err(|error| LaneError::Io(error.to_string()))
+            .map_err(|error| ProtocolError::Io(error.to_string()))
     }
 }

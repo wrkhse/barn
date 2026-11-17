@@ -3,6 +3,10 @@ name = "stall-b"
 version = "0.1.0"
 edition = "2021"
 
+# The spike is its own workspace on purpose and is never a member of barn's:
+# it is throwaway code, so barn's workspace and its gates do not own it.
+[workspace]
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 hyper = { version = "1", features = ["server", "http1"] }
