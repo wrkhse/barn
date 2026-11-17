@@ -330,9 +330,3 @@ fn every_method_keeps_its_name() {
         assert_eq!(constant, wire);
     }
 }
-
-// The proof commit's test break: an ordinary #[test] that fails.
-#[test]
-fn a_deliberate_failure() {
-    assert_eq!(PROTOCOL_VERSION, 2);
-}
