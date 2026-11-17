@@ -107,3 +107,8 @@ is built for them until B1 settles them:
 - the error codes for `budget` and `unknown_outcome`, with what data they carry.
 - whether `Job.every` is a duration grammar, and which one.
 - whether `stall.start`'s `state` arrives expanded or as `~`.
+
+#### A heading that skips a level
+
+This break is deliberate: markdownlint's MD001 refuses a heading that is more
+than one level deeper than the one before it.

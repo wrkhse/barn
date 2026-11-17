@@ -99,7 +99,7 @@ impl CliCommand {
 /// one of them. Each command says so on stderr and exits non-zero, so a script
 /// calling barn never reads a stub as a success.
 pub fn run() -> ExitCode {
-    let cli = Cli::parse();
+    let cli    =    Cli::parse();
     let typed = cli.command.typed();
     eprintln!("barn {typed}: not built yet. B1 builds the supervisor that answers it.");
     ExitCode::FAILURE

@@ -63,6 +63,7 @@ dependencies = [
 name = "barn-stall"
 version = "0.1.0"
 dependencies = [
+ "itoa",
  "serde",
  "serde_json",
 ]

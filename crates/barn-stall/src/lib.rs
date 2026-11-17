@@ -1,3 +1,4 @@
+#![feature(never_type)]
 //! The Rust stall SDK.
 //!
 //! A stall is a project's logic — its request handlers, its background jobs and

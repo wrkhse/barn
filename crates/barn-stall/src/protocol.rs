@@ -26,9 +26,15 @@ pub const DENIED_CODE: i32 = -32_001;
 /// Whether a line, without its terminator, fits the protocol's limit.
 ///
 /// [`MAX_LINE_BYTES`] is the longest line barn and a stall accept.
+///
+/// A zero-length line is not a line:
+///
+/// ```
+/// assert!(!barn_stall::fits_line(0));
+/// ```
 #[must_use]
 pub const fn fits_line(len: usize) -> bool {
-    len <= MAX_LINE_BYTES
+    len as u64 <= MAX_LINE_BYTES as u64
 }
 
 /// The names of the protocol's methods.
