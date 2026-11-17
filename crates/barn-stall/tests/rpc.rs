@@ -117,6 +117,14 @@ fn a_null_id_beside_a_method_is_refused() {
 }
 
 #[test]
+fn a_method_that_is_not_a_string_is_refused() {
+    assert_eq!(
+        Message::parse(r#"{"jsonrpc":"2.0","id":1,"method":5}"#),
+        Err(RpcError::Strict(StrictReason::MethodNotString))
+    );
+}
+
+#[test]
 fn a_method_beside_a_result_is_refused() {
     assert_eq!(
         Message::parse(r#"{"jsonrpc":"2.0","id":1,"method":"log","result":true}"#),
@@ -305,6 +313,10 @@ fn every_error_says_what_went_wrong() {
         (
             StrictReason::NotAnObject,
             "the line is not a JSON-RPC object",
+        ),
+        (
+            StrictReason::MethodNotString,
+            "the method member is not a string",
         ),
         (StrictReason::MissingVersion, "jsonrpc is missing"),
         (StrictReason::WrongVersion, "jsonrpc is not 2.0"),

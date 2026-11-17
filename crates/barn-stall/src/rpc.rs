@@ -92,8 +92,10 @@ pub struct ErrorObject {
 /// operator has to look at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StrictReason {
-    /// The line is not a JSON object, or its `method` is not a string.
+    /// The line is not JSON, or it is not a JSON object.
     NotAnObject,
+    /// The `method` member is present and is not a string.
+    MethodNotString,
     /// The `jsonrpc` member is missing.
     MissingVersion,
     /// The `jsonrpc` member is not `2.0`.
@@ -120,6 +122,7 @@ impl fmt::Display for StrictReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let text = match self {
             Self::NotAnObject => "the line is not a JSON-RPC object",
+            Self::MethodNotString => "the method member is not a string",
             Self::MissingVersion => "jsonrpc is missing",
             Self::WrongVersion => "jsonrpc is not 2.0",
             Self::IdShape => "the id is not a positive integer",
@@ -182,8 +185,9 @@ impl Message {
     /// [`RpcError::Strict`] with the [`StrictReason`] that names the rule: a
     /// line that is not a JSON object, a `jsonrpc` that is missing or not
     /// `2.0`, an `id` that is not a positive integer, a `null` `id` beside
-    /// a method, a method beside a result or an error, params that are not an
-    /// object, and an answer with both or neither of result and error.
+    /// a method, a method that is not a string, a method beside a result or an
+    /// error, params that are not an object, and an answer with both or
+    /// neither of result and error.
     pub fn parse(line: &str) -> Result<Self, RpcError> {
         let value: Value =
             serde_json::from_str(line).map_err(|_| RpcError::Strict(StrictReason::NotAnObject))?;
@@ -268,7 +272,7 @@ fn call(object: &Map<String, Value>) -> Result<Message, RpcError> {
 
     let method = match object.get("method") {
         Some(Value::String(method)) => method.clone(),
-        _ => return Err(RpcError::Strict(StrictReason::NotAnObject)),
+        _ => return Err(RpcError::Strict(StrictReason::MethodNotString)),
     };
     let params = params(object)?;
 
