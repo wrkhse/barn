@@ -16,5 +16,6 @@ pub mod protocol;
 
 pub use protocol::{
     DEFAULT_MAX_BODY_BYTES, DENIED_CODE, Job, MAX_LINE_BYTES, NetAuth, NetRequestParams,
-    NetResponse, PROTOCOL_VERSION, StallStartParams, StallStartResult, fits_line, method,
+    NetResponse, PROTOCOL_VERSION, StallStartParams, StallStartResult, fits_default_body,
+    fits_line, method,
 };
