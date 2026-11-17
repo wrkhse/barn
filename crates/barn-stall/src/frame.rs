@@ -14,6 +14,12 @@ use crate::rpc::{Message, RpcError};
 /// cap. The cap itself is still the limit; this only bounds each read call.
 const CHUNK: usize = 65_536;
 
+/// The most blank lines a peer may send in a row between two messages: 1024.
+///
+/// One more is refused with [`RpcError::Strict`]: too many blank lines arrived,
+/// and a peer cannot be allowed to keep the reader busy on nothing.
+pub const MAX_BLANK_LINES: usize = 1_024;
+
 /// A peer read and written as lines: the two halves of its socket.
 pub struct Lines<R, W> {
     reader: R,
@@ -45,27 +51,40 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Lines<R, W> {
 
     /// Reads the next message.
     ///
-    /// A blank line is skipped. The bytes of a line that is not finished stay
-    /// in the buffer across calls, so a read dropped part way through one
+    /// A blank line between messages is skipped, but no more than
+    /// [`MAX_BLANK_LINES`] in a row: one more is refused with
+    /// [`RpcError::Strict`], for too many blank lines, so a peer cannot keep
+    /// the reader busy on nothing. The bytes of a line that is not finished
+    /// stay in the buffer across calls, so a read dropped part way through one
     /// leaves them for the next.
     ///
     /// # Errors
     ///
     /// [`RpcError::OverLimit`] for a line over the cap, and
-    /// [`RpcError::Strict`] for `\r\n`, a line that is not UTF-8, or a
-    /// message JSON-RPC 2.0 does not allow. Either of those poisons the lines,
-    /// so every later read returns [`RpcError::Poisoned`]: the caller answers
-    /// `-32600` once and closes. [`RpcError::PartialLine`] when the stream
-    /// ends inside a line, and [`RpcError::Io`] when it fails.
+    /// [`RpcError::Strict`] for `\r\n`, a line that is not UTF-8, too many
+    /// blank lines, or a message JSON-RPC 2.0 does not allow. Each of those
+    /// poisons the lines, so every later read returns [`RpcError::Poisoned`]:
+    /// the caller answers `-32600` once and closes. [`RpcError::PartialLine`]
+    /// when the stream ends inside a line, and [`RpcError::Io`] when it fails.
     pub async fn read(&mut self) -> Result<Message, RpcError> {
         if self.poisoned {
             return Err(RpcError::Poisoned);
         }
 
-        let result = self
-            .next_message()
-            .await
-            .and_then(|line| Message::parse(&line));
+        let mut blank_lines = 0_usize;
+        let result = loop {
+            match self.next_line().await {
+                Ok(line) if line.is_empty() => {
+                    blank_lines = blank_lines.saturating_add(1);
+
+                    if blank_lines > MAX_BLANK_LINES {
+                        break Err(RpcError::Strict);
+                    }
+                }
+                Ok(line) => break Message::parse(&line),
+                Err(error) => break Err(error),
+            }
+        };
 
         match result {
             Ok(message) => Ok(message),
@@ -101,17 +120,6 @@ impl<R: AsyncRead + Unpin, W: AsyncWrite + Unpin> Lines<R, W> {
             .map_err(|error| io_error(&error))?;
 
         Ok(())
-    }
-
-    /// The next line, with blank lines skipped and its newline removed.
-    async fn next_message(&mut self) -> Result<String, RpcError> {
-        loop {
-            let line = self.next_line().await?;
-
-            if !line.is_empty() {
-                return Ok(line);
-            }
-        }
     }
 
     /// The next line, without its newline.
