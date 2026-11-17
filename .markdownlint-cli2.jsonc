@@ -1,0 +1,8 @@
+{
+  // Prose and tables wrap where the sentence ends; length is not a gate.
+  "config": {
+    "MD013": false
+  },
+  "globs": ["**/*.md"],
+  "ignores": ["node_modules/**", "target/**"]
+}
