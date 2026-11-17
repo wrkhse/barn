@@ -4,8 +4,10 @@ on:
   push:
     branches:
       - spike/stall-runtime
+    # A change to markdown alone does not start a measurement run; anything else under the spike does.
     paths:
       - 'spike/stall-runtime/**'
+      - '!spike/stall-runtime/**/*.md'
       - '.github/workflows/stall-runtime-spike.yml'
   workflow_dispatch:
     inputs:
