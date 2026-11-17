@@ -478,6 +478,7 @@ barn-plugin-host should start with djs behind its own trait, because the host-ca
 - djs's figures are one commit of one crate's engine — `djs-embed` at `0e58f62c80252fc3f4156ab7a3744746434ed860` — so they are a statement about that commit, not about djs as it will be.
 - The two engines share the prelude and the bundles, so nothing here says how their JavaScript semantics differ. test262 coverage is djs's own claim, not measured here.
 - In this run candidate A's 500-monitor steady figures came out better than in the previous run (1.01 polls a monitor and 29.87 events a second against 0.84 and 20.84, and 320.6 MB against 323.7 MB a run earlier), which is runner variance on a shared machine, not a change to A.
+- A second full run of the same matrix on the same commit (run 44135335847) reproduced every conclusion here. Idle, the quiet runs and the storage-isolated groups agreed with the figures above within 3-8%: candidate C's 3.04 ms of CPU per poll at 500 monitors with the store out of the way came back as 3.14, its 23.0 MB as 23.0 MB, and its 33.33 events a second as 33.33. The store-bound 500-monitor steady group is the noisiest: there candidate C's 34.07 ms per poll came back as 40.50 and its 29.69 events a second as 22.31, with candidate B moving the same way (34.01 to 39.78 ms), so the absolute figures for that one group should be read as one run of a noisy measurement while the comparison holds — B and C stayed within 2% of each other in both runs, and candidate A stayed far behind in both.
 
 ## How to re-run it
 
