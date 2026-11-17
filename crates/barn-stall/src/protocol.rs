@@ -23,6 +23,14 @@ pub const DEFAULT_MAX_BODY_BYTES: usize = 4_194_304;
 /// The JSON-RPC error code for a request barn refused: `denied`.
 pub const DENIED_CODE: i32 = -32_001;
 
+/// Whether a line, without its terminator, fits the protocol's limit.
+///
+/// [`MAX_LINE_BYTES`] is the longest line barn and a stall accept.
+#[must_use]
+pub const fn fits_line(len: usize) -> bool {
+    len <= MAX_LINE_BYTES
+}
+
 /// The names of the protocol's methods.
 pub mod method {
     /// barn to stall: start, which returns the stall's jobs.
