@@ -302,26 +302,40 @@ fn every_error_says_what_went_wrong() {
     }
 
     let reasons = [
-        StrictReason::NotAnObject,
-        StrictReason::MissingVersion,
-        StrictReason::WrongVersion,
-        StrictReason::IdShape,
-        StrictReason::MethodWithAnswer,
-        StrictReason::ParamsShape,
-        StrictReason::AnswerShape,
-        StrictReason::AnswerWithoutId,
-        StrictReason::NotUtf8,
-        StrictReason::CarriageReturn,
-        StrictReason::TooManyBlankLines,
+        (
+            StrictReason::NotAnObject,
+            "the line is not a JSON-RPC object",
+        ),
+        (StrictReason::MissingVersion, "jsonrpc is missing"),
+        (StrictReason::WrongVersion, "jsonrpc is not 2.0"),
+        (StrictReason::IdShape, "the id is not a positive integer"),
+        (
+            StrictReason::MethodWithAnswer,
+            "a method cannot sit beside a result or an error",
+        ),
+        (StrictReason::ParamsShape, "params is not an object"),
+        (
+            StrictReason::AnswerShape,
+            "an answer carries a result or an error, never both and never neither",
+        ),
+        (StrictReason::AnswerWithoutId, "an answer carries no id"),
+        (StrictReason::NotUtf8, "the line is not UTF-8"),
+        (
+            StrictReason::CarriageReturn,
+            "a line ends with a newline, never a carriage return",
+        ),
+        (
+            StrictReason::TooManyBlankLines,
+            "too many blank lines arrived in a row",
+        ),
     ];
 
-    for reason in reasons {
-        let rendered = RpcError::Strict(reason).to_string();
-
-        assert!(rendered.contains(&reason.to_string()), "{rendered}");
-        assert!(
-            rendered.starts_with("the line is not acceptable: "),
-            "{rendered}"
-        );
+    for (reason, sentence) in reasons {
+        assert_eq!(reason.to_string(), sentence);
     }
+
+    assert_eq!(
+        RpcError::Strict(StrictReason::IdShape).to_string(),
+        "the line is not acceptable: the id is not a positive integer"
+    );
 }
