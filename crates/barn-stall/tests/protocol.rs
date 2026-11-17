@@ -2,9 +2,13 @@
 //! limits table are read from docs/stall-protocol.md itself, so a constant or a
 //! field that drifts from the page fails here.
 
+use std::time::Duration;
+
 use barn_stall::{
-    BodyEncoding, DEFAULT_MAX_BODY_BYTES, DENIED_CODE, Headers, MAX_LINE_BYTES, NetAuth,
-    NetRequestParams, NetResponse, PROTOCOL_VERSION, StallStartParams, StallStartResult, method,
+    AuthScheme, BodyEncoding, DEFAULT_MAX_BODY_BYTES, DENIED_CODE, DrainParams, DrainResult,
+    DurationError, Headers, HealthResult, Job, JobRunParams, JobRunResult, LogLevel, LogParams,
+    MAX_LINE_BYTES, NO_SUCH_METHOD, NetAuth, NetRequestParams, NetResponse, PROTOCOL_VERSION,
+    StallStartAnswer, StallStartParams, Token, VERSION_REFUSED, method, parse_duration,
 };
 use serde_json::{Value, json};
 
@@ -32,6 +36,28 @@ fn answered(id: i64) -> Option<Value> {
     lines()?.into_iter().find(|message| {
         message.get("id").and_then(Value::as_i64) == Some(id) && message.get("result").is_some()
     })
+}
+
+/// The page's message with this id that carries an error.
+fn errored(id: i64) -> Option<Value> {
+    lines()?.into_iter().find(|message| {
+        message.get("id").and_then(Value::as_i64) == Some(id) && message.get("error").is_some()
+    })
+}
+
+/// The page's message that sends this method without an id, as a log line does.
+fn notified(name: &str) -> Option<Value> {
+    lines()?.into_iter().find(|message| {
+        message.get("method").and_then(Value::as_str) == Some(name) && message.get("id").is_none()
+    })
+}
+
+/// A message's error code.
+fn code(message: &Value) -> Option<i64> {
+    message
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_i64)
 }
 
 /// The page's constants table: each name and the value it pins.
@@ -74,22 +100,36 @@ fn the_pages_table_pins_the_constants() {
         i64::try_from(DEFAULT_MAX_BODY_BYTES).expect("fits an i64")
     );
     assert_eq!(pinned("DENIED_CODE"), i64::from(DENIED_CODE));
+    assert_eq!(pinned("VERSION_REFUSED"), i64::from(VERSION_REFUSED));
+    assert_eq!(pinned("NO_SUCH_METHOD"), i64::from(NO_SUCH_METHOD));
 }
 
 #[test]
 fn the_denied_error_carries_the_pages_code() {
-    let code = lines()
-        .expect("every JSON-RPC line on the page parses")
-        .into_iter()
-        .find_map(|message| {
-            message
-                .get("error")
-                .and_then(|error| error.get("code"))
-                .and_then(Value::as_i64)
-        })
-        .expect("the page carries a denied error");
+    let denied = errored(8).expect("the page carries a denied error");
 
-    assert_eq!(code, i64::from(DENIED_CODE));
+    assert_eq!(code(&denied), Some(i64::from(DENIED_CODE)));
+}
+
+#[test]
+fn a_refused_version_carries_the_pages_code() {
+    let refused = errored(1).expect("the page answers a refused stall.start with an error");
+
+    assert_eq!(code(&refused), Some(i64::from(VERSION_REFUSED)));
+    assert_eq!(
+        refused
+            .get("error")
+            .and_then(|error| error.get("data"))
+            .and_then(|data| data.get("protocol")),
+        Some(&Value::from(2))
+    );
+}
+
+#[test]
+fn a_stall_start_at_a_stall_carries_the_pages_code() {
+    let refused = errored(5).expect("the page answers a stall.start at a stall with an error");
+
+    assert_eq!(code(&refused), Some(i64::from(NO_SUCH_METHOD)));
 }
 
 #[test]
@@ -102,31 +142,139 @@ fn stall_start_reads_the_pages_request() {
             .expect("stall.start carries params"),
     )
     .expect("the page's stall.start parameters");
+    let token: Token = serde_json::from_value(json!("9f2c5a1e7b3d4c6f8a0b1c2d3e4f5a6b"))
+        .expect("the page's token is a string");
 
+    assert_eq!(params.protocol, PROTOCOL_VERSION);
+    assert_eq!(params.stall, "sourcefed");
+    assert_eq!(params.token, token);
+    assert_eq!(params.version, "0.6.0");
+    assert_eq!(params.jobs.len(), 2);
+
+    let poll = params.jobs.get("poll").expect("the page declares poll");
     assert_eq!(
-        params,
-        StallStartParams {
-            protocol: PROTOCOL_VERSION,
-            stall: "sourcefed".to_owned(),
-            state: "~/.local/state/sourcefed".to_owned(),
+        poll,
+        &Job {
+            every: "15s".to_owned()
         }
     );
+    assert_eq!(parse_duration(&poll.every), Ok(Duration::from_secs(15)));
 }
 
 #[test]
-fn stall_start_reads_the_pages_result() {
-    let result: StallStartResult = serde_json::from_value(
+fn stall_start_reads_the_pages_answer() {
+    let answer: StallStartAnswer = serde_json::from_value(
         answered(1)
             .expect("the page answers stall.start with id 1")
             .get("result")
             .cloned()
             .expect("stall.start carries a result"),
     )
-    .expect("the page's stall.start result");
+    .expect("the page's stall.start answer");
 
-    assert!(result.ready);
-    assert_eq!(result.version, "0.6.0");
-    assert_eq!(result.jobs.len(), 1);
+    assert!(
+        answer.state.starts_with('/'),
+        "the state folder is absolute: {}",
+        answer.state
+    );
+    assert_eq!(
+        answer.state,
+        "/Users/steven/.local/state/barn/stalls/sourcefed"
+    );
+}
+
+#[test]
+fn a_token_never_reaches_a_debug_line() {
+    let params: StallStartParams = serde_json::from_value(
+        sent(1)
+            .expect("the page sends stall.start with id 1")
+            .get("params")
+            .cloned()
+            .expect("stall.start carries params"),
+    )
+    .expect("the page's stall.start parameters");
+    let token: Token =
+        serde_json::from_value(json!("a-secret-value")).expect("a token is a string");
+
+    assert_eq!(format!("{token:?}"), "[redacted]");
+    assert!(format!("{params:?}").contains("[redacted]"));
+    assert!(!format!("{params:?}").contains("9f2c5a1e"));
+}
+
+#[test]
+fn health_reads_the_pages_result() {
+    let result: HealthResult = serde_json::from_value(
+        answered(2)
+            .expect("the page answers stall.health with id 2")
+            .get("result")
+            .cloned()
+            .expect("stall.health carries a result"),
+    )
+    .expect("the page's stall.health result");
+
+    assert!(result.ok);
+    assert_eq!(result.status, "ready");
+}
+
+#[test]
+fn drain_reads_the_pages_parameters_and_result() {
+    let params: DrainParams = serde_json::from_value(
+        sent(3)
+            .expect("the page sends stall.drain with id 3")
+            .get("params")
+            .cloned()
+            .expect("stall.drain carries params"),
+    )
+    .expect("the page's stall.drain parameters");
+    let result: DrainResult = serde_json::from_value(
+        answered(3)
+            .expect("the page answers stall.drain with id 3")
+            .get("result")
+            .cloned()
+            .expect("stall.drain carries a result"),
+    )
+    .expect("the page's stall.drain result");
+
+    assert_eq!(params.deadline_ms, 5000);
+    assert!(result.drained);
+}
+
+#[test]
+fn job_run_reads_the_pages_parameters_and_result() {
+    let params: JobRunParams = serde_json::from_value(
+        sent(4)
+            .expect("the page sends job.run with id 4")
+            .get("params")
+            .cloned()
+            .expect("job.run carries params"),
+    )
+    .expect("the page's job.run parameters");
+    let result: JobRunResult = serde_json::from_value(
+        answered(4)
+            .expect("the page answers job.run with id 4")
+            .get("result")
+            .cloned()
+            .expect("job.run carries a result"),
+    )
+    .expect("the page's job.run result");
+
+    assert_eq!(params.job, "poll");
+    assert!(result.ran);
+}
+
+#[test]
+fn log_reads_the_pages_line() {
+    let params: LogParams = serde_json::from_value(
+        notified("log")
+            .expect("the page sends log without an id")
+            .get("params")
+            .cloned()
+            .expect("log carries params"),
+    )
+    .expect("the page's log parameters");
+
+    assert_eq!(params.level, LogLevel::Info);
+    assert_eq!(params.message, "polled 12 releases");
 }
 
 #[test]
@@ -151,7 +299,7 @@ fn net_request_reads_the_pages_parameters() {
             body_encoding: BodyEncoding::Utf8,
             auth: Some(NetAuth {
                 secret: "github-token".to_owned(),
-                scheme: "bearer".to_owned(),
+                scheme: AuthScheme::Bearer,
             }),
             budget: Some("github".to_owned()),
         }
@@ -310,6 +458,90 @@ fn a_response_without_headers_reads_the_defaults() {
 }
 
 #[test]
+fn an_auth_scheme_writes_as_its_wire_name() {
+    assert_eq!(
+        serde_json::to_value(AuthScheme::Bearer).expect("the scheme serialises"),
+        json!("bearer")
+    );
+    assert_eq!(
+        serde_json::from_value::<AuthScheme>(json!("bearer")).expect("the wire name reads back"),
+        AuthScheme::Bearer
+    );
+}
+
+#[test]
+fn an_unknown_auth_scheme_is_refused() {
+    let refused =
+        serde_json::from_value::<NetAuth>(json!({"secret": "github-token", "as": "basic"}));
+
+    assert!(refused.is_err(), "a scheme off the list is a new version");
+}
+
+#[test]
+fn every_log_level_keeps_its_name() {
+    let levels = [
+        (LogLevel::Debug, "debug"),
+        (LogLevel::Info, "info"),
+        (LogLevel::Warn, "warn"),
+        (LogLevel::Error, "error"),
+    ];
+
+    for (level, wire) in levels {
+        assert_eq!(
+            serde_json::to_value(level).expect("the level serialises"),
+            json!(wire)
+        );
+    }
+}
+
+#[test]
+fn a_duration_reads_its_unit() {
+    let durations = [
+        ("250ms", Duration::from_millis(250)),
+        ("15s", Duration::from_secs(15)),
+        ("10m", Duration::from_secs(600)),
+        ("2h", Duration::from_secs(7_200)),
+    ];
+
+    for (text, duration) in durations {
+        assert_eq!(parse_duration(text), Ok(duration), "{text}");
+    }
+}
+
+#[test]
+fn an_empty_duration_is_refused() {
+    assert_eq!(parse_duration(""), Err(DurationError::Empty));
+}
+
+#[test]
+fn a_duration_without_a_unit_is_refused() {
+    assert_eq!(parse_duration("15"), Err(DurationError::MissingUnit));
+}
+
+#[test]
+fn a_duration_with_an_unknown_unit_is_refused() {
+    assert_eq!(parse_duration("15d"), Err(DurationError::UnknownUnit));
+}
+
+#[test]
+fn a_duration_without_digits_is_refused() {
+    assert_eq!(parse_duration("fifteen"), Err(DurationError::NotNumeric));
+}
+
+#[test]
+fn a_zero_duration_is_refused() {
+    assert_eq!(parse_duration("0s"), Err(DurationError::Zero));
+}
+
+#[test]
+fn a_duration_too_large_for_its_unit_is_refused() {
+    assert_eq!(
+        parse_duration("18446744073709551615h"),
+        Err(DurationError::TooLarge)
+    );
+}
+
+#[test]
 fn every_method_keeps_its_name() {
     let names = [
         (method::STALL_START, "stall.start"),
@@ -328,5 +560,23 @@ fn every_method_keeps_its_name() {
 
     for (constant, wire) in names {
         assert_eq!(constant, wire);
+    }
+}
+
+#[test]
+fn every_duration_refusal_says_what_is_wrong() {
+    let refusals = [
+        ("", "the duration is empty"),
+        ("fifteen", "does not start with digits"),
+        ("15", "has no unit"),
+        ("15d", "is not one of"),
+        ("0s", "is zero"),
+        ("18446744073709551615h", "too large"),
+    ];
+
+    for (text, phrase) in refusals {
+        let error = parse_duration(text).expect_err("the duration is refused");
+
+        assert!(error.to_string().contains(phrase), "{text}: {error}");
     }
 }

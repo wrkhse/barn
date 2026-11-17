@@ -3,3 +3,12 @@
 # caller still counts.
 test_workspace = true
 test_tool = "nextest"
+
+# A mutant that makes the read loop never return spins without awaiting, so the
+# test's deadline cannot fire and the harness hangs. The three are excluded by
+# name, and the read's behaviour is covered by the tests that do run.
+exclude_re = [
+  'frame\.rs:\d+:\d+: replace Lines<R, W>::next_line ',
+  'frame\.rs:\d+:\d+: replace Lines<R, W>::take ',
+  'frame\.rs:\d+:\d+: replace Lines<R, W>::fill ',
+]
