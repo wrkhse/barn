@@ -1,0 +1,49 @@
+[workspace]
+resolver = "3"
+members = ["crates/barn", "crates/barn-stall"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.100"
+publish = false
+repository = "https://github.com/wrkhse/barn"
+
+[workspace.dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+# The pedantic and nursery groups with Chauffeur's explicit denials: barn is the
+# daemon every project leans on, so the gates are the strict ones.
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+# Explicit panics
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+todo = "deny"
+exit = "deny"
+dbg_macro = "deny"
+# Implicit panics
+indexing_slicing = "deny"
+string_slice = "deny"
+arithmetic_side_effects = "deny"
+unchecked_time_subtraction = "deny"
+as_conversions = "deny"
+# Size
+too_many_lines = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
