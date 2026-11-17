@@ -1,4 +1,5 @@
 # A mutant must be caught by some test in the workspace, not only by its own
-# crate's: the binary's tests exercise the SDK through the library.
+# crate's: the whole suite runs for each mutant, so a test that lives beside a
+# caller still counts.
 test_workspace = true
 test_tool = "nextest"

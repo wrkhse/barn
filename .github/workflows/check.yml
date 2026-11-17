@@ -1,5 +1,5 @@
 # barn's gates, one job each: B0's acceptance is that a deliberate break fails
-# exactly the job it targets, so fmt, clippy and the tests are separate jobs
+# the job it targets, so fmt, clippy and the tests are separate jobs
 # rather than steps of one.
 name: Check
 
@@ -21,16 +21,22 @@ concurrency:
 jobs:
   fmt:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # rust-toolchain.toml pins the toolchain and its components; rustup installs them.
-      - run: rustup show active-toolchain
+      # rust-toolchain.toml pins the toolchain; installing it here keeps rustup's
+      # deprecated auto-install out of the log.
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
       - run: cargo fmt --all -- --check
 
   clippy:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       # -D warnings reaches rustc and clippy only; this fails Cargo's own lints too.
       CARGO_BUILD_WARNINGS: deny
@@ -38,26 +44,34 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup show active-toolchain
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup show active-toolchain
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
       - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: cargo-nextest@0.9.152
       - run: cargo nextest run --workspace --locked
       - run: cargo test --doc --workspace --locked
 
-  # Cargo.toml's rust-version, exactly. The pinned toolchain is a nightly, so
-  # anything only it accepts fails here and nowhere else.
+  # Cargo.toml's rust-version, exactly. Today the pinned toolchain is the same
+  # version, so this job states the floor a pin change would have to keep.
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -67,10 +81,16 @@ jobs:
 
   deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # cargo-deny reads the manifests through cargo, so the pin is installed first.
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
       - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: cargo-deny@0.20.2
@@ -89,7 +109,10 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - run: rustup show active-toolchain
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
       - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: cargo-mutants@27.1.0,cargo-nextest@0.9.152
@@ -118,10 +141,11 @@ jobs:
           path: mutants.out
           if-no-files-found: ignore
 
-  # The markdown a change adds: formatted by prettier and linted by
-  # markdownlint, both pinned.
+  # The markdown a change adds: prettier and markdownlint, both pinned in
+  # package-lock.json, installed with npm ci so CI runs what a person runs.
   docs:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -129,5 +153,5 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
-      - run: npx --yes prettier@3.9.10 --check "**/*.md"
-      - run: npx --yes markdownlint-cli2@0.24.1
+      - run: npm ci
+      - run: npm run check

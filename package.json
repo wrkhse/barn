@@ -1,0 +1,12 @@
+{
+  "name": "barn",
+  "private": true,
+  "description": "The markdown gates, pinned so CI and a person run the same tools.",
+  "scripts": {
+    "check": "prettier --check \"**/*.md\" && markdownlint-cli2"
+  },
+  "devDependencies": {
+    "markdownlint-cli2": "0.24.1",
+    "prettier": "3.9.10"
+  }
+}
