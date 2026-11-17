@@ -1,6 +1,6 @@
 # Spike: sourcefed's stall runtime, TypeScript on Node against Rust
 
-**Status: measured.** Every figure below is a median from the aggregate of the run JSONs that `.github/workflows/stall-runtime-spike.yml` produced on GitHub Actions `ubuntu-latest`; the raw JSON is in the `stall-spike-results` artifact of that run. This branch is throwaway spike code. It is never merged into main. It exists to answer one question for the owner: should sourcefed's stall (its daemon under barn) stay TypeScript on Node 26, or be rewritten in Rust with source plugins in QuickJS realms?
+**Status: measured.** Every figure below is a median from the aggregate of the run JSONs that `.github/workflows/stall-runtime-spike.yml` produced on GitHub Actions `ubuntu-latest`; the raw JSON is in the `stall-spike-results` artifact of that run. The figures are from workflow run 44104115314 (workflow "Stall runtime spike") on commit `5af5a97`, and any later run of the same workflow reproduces the same matrix. This branch is throwaway spike code. It is never merged into main. It exists to answer one question for the owner: should sourcefed's stall (its daemon under barn) stay TypeScript on Node 26, or be rewritten in Rust with source plugins in QuickJS realms?
 
 ## The two candidates
 
