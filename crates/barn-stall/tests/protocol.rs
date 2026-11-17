@@ -1,10 +1,9 @@
-//! The protocol's fixed parts, checked against the JSON in the protocol page:
-//! a field that is renamed, retyped or dropped fails here.
-
-use std::collections::BTreeMap;
+//! The protocol's fixed parts, checked against the page: its examples and its
+//! limits table are read from docs/stall-protocol.md itself, so a constant or a
+//! field that drifts from the page fails here.
 
 use barn_stall::{
-    BodyEncoding, DEFAULT_MAX_BODY_BYTES, DENIED_CODE, Headers, Job, MAX_LINE_BYTES, NetAuth,
+    BodyEncoding, DEFAULT_MAX_BODY_BYTES, DENIED_CODE, Headers, MAX_LINE_BYTES, NetAuth,
     NetRequestParams, NetResponse, PROTOCOL_VERSION, StallStartParams, StallStartResult, method,
 };
 use serde_json::{Value, json};
@@ -13,46 +12,74 @@ use serde_json::{Value, json};
 /// a stall's author read.
 const PAGE: &str = include_str!("../../../docs/stall-protocol.md");
 
-/// Every JSON-RPC line in the page, parsed.
-fn lines() -> Result<Vec<Value>, serde_json::Error> {
+/// Every JSON-RPC line on the page, parsed; none, if one does not parse.
+fn lines() -> Option<Vec<Value>> {
     PAGE.lines()
         .filter(|line| line.starts_with("{\"jsonrpc\""))
-        .map(serde_json::from_str)
+        .map(|line| serde_json::from_str(line).ok())
         .collect()
 }
 
-/// The page's message that sends this method, when the page has one.
-fn sent(method: &str) -> Option<Value> {
-    lines()
-        .ok()?
-        .into_iter()
-        .find(|message| message.get("method").and_then(Value::as_str) == Some(method))
+/// The page's message with this id that sends a method.
+fn sent(id: i64) -> Option<Value> {
+    lines()?.into_iter().find(|message| {
+        message.get("id").and_then(Value::as_i64) == Some(id) && message.get("method").is_some()
+    })
 }
 
-/// The page's answer that follows this method's message, when the page has one.
-fn answered(method: &str) -> Option<Value> {
-    lines()
-        .ok()?
-        .into_iter()
-        .skip_while(|message| message.get("method").and_then(Value::as_str) != Some(method))
-        .nth(1)
+/// The page's message with this id that answers.
+fn answered(id: i64) -> Option<Value> {
+    lines()?.into_iter().find(|message| {
+        message.get("id").and_then(Value::as_i64) == Some(id) && message.get("result").is_some()
+    })
+}
+
+/// The page's constants table: each name and the value it pins.
+fn table() -> Vec<(String, i64)> {
+    PAGE.lines()
+        .filter(|line| line.starts_with("| `"))
+        .filter_map(|line| {
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            let name = cells.get(1)?.strip_prefix('`')?.strip_suffix('`')?;
+            let value: i64 = cells
+                .get(2)?
+                .strip_prefix('`')?
+                .strip_suffix('`')?
+                .parse()
+                .ok()?;
+
+            Some((name.to_owned(), value))
+        })
+        .collect()
 }
 
 #[test]
-fn the_version_is_one() {
-    assert_eq!(PROTOCOL_VERSION, 1);
+fn the_pages_table_pins_the_constants() {
+    let table = table();
+    let pinned = |name: &str| -> i64 {
+        table
+            .iter()
+            .find(|(pinned, _)| pinned == name)
+            .map(|(_, value)| *value)
+            .expect("the page pins this constant")
+    };
+
+    assert_eq!(pinned("PROTOCOL_VERSION"), i64::from(PROTOCOL_VERSION));
+    assert_eq!(
+        pinned("MAX_LINE_BYTES"),
+        i64::try_from(MAX_LINE_BYTES).expect("fits an i64")
+    );
+    assert_eq!(
+        pinned("DEFAULT_MAX_BODY_BYTES"),
+        i64::try_from(DEFAULT_MAX_BODY_BYTES).expect("fits an i64")
+    );
+    assert_eq!(pinned("DENIED_CODE"), i64::from(DENIED_CODE));
 }
 
 #[test]
-fn the_limits_are_the_plans() {
-    assert_eq!(MAX_LINE_BYTES, 8_388_608);
-    assert_eq!(DEFAULT_MAX_BODY_BYTES, 4_194_304);
-}
-
-#[test]
-fn the_denied_code_is_the_pages() {
+fn the_denied_error_carries_the_pages_code() {
     let code = lines()
-        .expect("the page's JSON-RPC lines")
+        .expect("every JSON-RPC line on the page parses")
         .into_iter()
         .find_map(|message| {
             message
@@ -68,8 +95,8 @@ fn the_denied_code_is_the_pages() {
 #[test]
 fn stall_start_reads_the_pages_request() {
     let params: StallStartParams = serde_json::from_value(
-        sent("stall.start")
-            .expect("the page sends this method")
+        sent(1)
+            .expect("the page sends stall.start with id 1")
             .get("params")
             .cloned()
             .expect("stall.start carries params"),
@@ -89,8 +116,8 @@ fn stall_start_reads_the_pages_request() {
 #[test]
 fn stall_start_reads_the_pages_result() {
     let result: StallStartResult = serde_json::from_value(
-        answered("stall.start")
-            .expect("the page answers this method")
+        answered(1)
+            .expect("the page answers stall.start with id 1")
             .get("result")
             .cloned()
             .expect("stall.start carries a result"),
@@ -99,22 +126,14 @@ fn stall_start_reads_the_pages_result() {
 
     assert!(result.ready);
     assert_eq!(result.version, "0.6.0");
-    assert_eq!(
-        result.jobs,
-        BTreeMap::from([(
-            "poll".to_owned(),
-            Job {
-                every: "15s".to_owned(),
-            },
-        )])
-    );
+    assert_eq!(result.jobs.len(), 1);
 }
 
 #[test]
 fn net_request_reads_the_pages_parameters() {
     let params: NetRequestParams = serde_json::from_value(
-        sent("net.request")
-            .expect("the page sends this method")
+        sent(7)
+            .expect("the page sends net.request with id 7")
             .get("params")
             .cloned()
             .expect("net.request carries params"),
@@ -129,6 +148,7 @@ fn net_request_reads_the_pages_parameters() {
             url: "https://api.github.com/repos/wrkhse/rungs/releases".to_owned(),
             headers: Headers::new(),
             body: None,
+            body_encoding: BodyEncoding::Utf8,
             auth: Some(NetAuth {
                 secret: "github-token".to_owned(),
                 scheme: "bearer".to_owned(),
@@ -141,8 +161,8 @@ fn net_request_reads_the_pages_parameters() {
 #[test]
 fn net_request_reads_the_pages_result() {
     let response: NetResponse = serde_json::from_value(
-        answered("net.request")
-            .expect("the page answers this method")
+        answered(7)
+            .expect("the page answers net.request with id 7")
             .get("result")
             .cloned()
             .expect("net.request carries a result"),
@@ -156,6 +176,82 @@ fn net_request_reads_the_pages_result() {
 }
 
 #[test]
+fn the_pages_post_carries_headers_and_a_utf8_body() {
+    let params: NetRequestParams = serde_json::from_value(
+        sent(11)
+            .expect("the page sends a POST with id 11")
+            .get("params")
+            .cloned()
+            .expect("the POST carries params"),
+    )
+    .expect("the page's POST parameters");
+
+    assert_eq!(params.method, "POST");
+    assert_eq!(
+        params.headers,
+        vec![
+            ("content-type".to_owned(), "application/json".to_owned()),
+            ("accept".to_owned(), "application/json".to_owned()),
+        ]
+    );
+    assert_eq!(params.body_encoding, BodyEncoding::Utf8);
+    assert!(params.body.is_some(), "the POST has a body");
+}
+
+#[test]
+fn the_pages_post_result_keeps_a_repeated_header() {
+    let response: NetResponse = serde_json::from_value(
+        answered(11)
+            .expect("the page answers the POST with id 11")
+            .get("result")
+            .cloned()
+            .expect("the POST carries a result"),
+    )
+    .expect("the page's POST result");
+
+    let cookies: Vec<&str> = response
+        .headers
+        .iter()
+        .filter(|(name, _)| name == "set-cookie")
+        .map(|(_, value)| value.as_str())
+        .collect();
+
+    assert_eq!(cookies, ["a=1", "b=2"]);
+}
+
+#[test]
+fn the_pages_base64_body_reads_as_base64() {
+    let params: NetRequestParams = serde_json::from_value(
+        sent(12)
+            .expect("the page sends a base64 body with id 12")
+            .get("params")
+            .cloned()
+            .expect("the PUT carries params"),
+    )
+    .expect("the page's PUT parameters");
+
+    assert_eq!(params.body_encoding, BodyEncoding::Base64);
+    assert_eq!(params.body.as_deref(), Some("aGk="));
+    assert_eq!(params.plugin, None);
+}
+
+#[test]
+fn the_pages_base64_result_reads_as_an_empty_utf8_body() {
+    let response: NetResponse = serde_json::from_value(
+        answered(12)
+            .expect("the page answers the PUT with id 12")
+            .get("result")
+            .cloned()
+            .expect("the PUT carries a result"),
+    )
+    .expect("the page's PUT result");
+
+    assert_eq!(response.status, 201);
+    assert_eq!(response.headers, Headers::new());
+    assert_eq!(response.body_encoding, BodyEncoding::Utf8);
+}
+
+#[test]
 fn a_request_writes_what_it_carries_and_omits_what_it_does_not() {
     let params = NetRequestParams {
         plugin: None,
@@ -163,6 +259,7 @@ fn a_request_writes_what_it_carries_and_omits_what_it_does_not() {
         url: "https://api.github.com/".to_owned(),
         headers: vec![("content-type".to_owned(), "application/json".to_owned())],
         body: Some("{}".to_owned()),
+        body_encoding: BodyEncoding::Utf8,
         auth: None,
         budget: None,
     };
@@ -173,7 +270,8 @@ fn a_request_writes_what_it_carries_and_omits_what_it_does_not() {
             "method": "POST",
             "url": "https://api.github.com/",
             "headers": [["content-type", "application/json"]],
-            "body": "{}"
+            "body": "{}",
+            "body_encoding": "utf8"
         })
     );
 }

@@ -16,18 +16,28 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The longest line the protocol allows, in bytes, its newline included: 8 MiB.
 ///
-/// A longer line is answered with `-32600` and the connection is closed, as
-/// Chauffeur v2's socket server does.
+/// A longer line is answered with `-32600` and an `id` of `null`, because the
+/// line was never parsed, and then the connection is closed, as Chauffeur v2's
+/// socket server does.
 pub const MAX_LINE_BYTES: usize = 8_388_608;
 
-/// The default cap on a body a stall carries inline: 4 MiB.
+/// The default cap on an inline body, counted in decoded bytes: 4 MiB.
+///
+/// The side that sends a body uses UTF-8 when the bytes are valid UTF-8 and the
+/// line still fits `MAX_LINE_BYTES`, and base64 otherwise, with `body_encoding`
+/// saying which. A body over the cap is refused.
 pub const DEFAULT_MAX_BODY_BYTES: usize = 4_194_304;
 
 /// The JSON-RPC error code for a request barn refused: `denied`.
 pub const DENIED_CODE: i32 = -32_001;
 
 /// Headers as the wire carries them: one entry per value, so a repeated name
-/// keeps every value. A response's names are lower-cased.
+/// keeps every value.
+///
+/// Either side may send a name in any case; barn lower-cases names on the way in
+/// and on the way out, so a stall always sees lower-case names. A header whose
+/// value is not valid UTF-8 is dropped, and barn logs it once per request with
+/// its name; the request or response still goes through.
 pub type Headers = Vec<(String, String)>;
 
 /// The names of the protocol's methods.
@@ -115,6 +125,9 @@ pub struct NetRequestParams {
     /// The request body, inline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// How this request's body is encoded, as a response's is.
+    #[serde(default)]
+    pub body_encoding: BodyEncoding,
     /// The secret to add, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<NetAuth>,
@@ -123,7 +136,10 @@ pub struct NetRequestParams {
     pub budget: Option<String>,
 }
 
-/// How a `net.request` result's body is encoded.
+/// How a body is encoded.
+///
+/// The set is closed within a protocol version: another encoding is a new
+/// version, never a value added inside this one.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BodyEncoding {

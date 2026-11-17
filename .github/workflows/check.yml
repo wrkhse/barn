@@ -1,5 +1,5 @@
 # barn's gates, one job each: B0's acceptance is that a deliberate break fails
-# exactly the job it targets, so fmt, clippy and the tests are separate jobs
+# the job it targets, so fmt, clippy and the tests are separate jobs
 # rather than steps of one.
 name: Check
 

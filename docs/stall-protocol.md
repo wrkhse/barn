@@ -17,20 +17,27 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
 - One JSON-RPC 2.0 message per line, each terminated by `\n`.
 - A line is at most 8 MiB in bytes, its terminating newline included,
   `MAX_LINE_BYTES` in `barn-stall`. A longer line is answered with `-32600` and
-  the connection is closed, as Chauffeur v2's socket server does. _For B1 to
-  confirm: the error's message, which Chauffeur v2 words "the request line is
-  over 1 MiB"._
+  an `id` of `null`, because the line was never parsed, and then the connection
+  closes, as Chauffeur v2's socket server does. _For B1 to confirm: the error's
+  message, which Chauffeur v2 words "the request line is over 1 MiB"._
 - Calls in flight are bounded. _For B1 to confirm: the bound, and what a stall is
   sent when its answers would exceed it._
-- Bodies are inline. A grant caps them at `DEFAULT_MAX_BODY_BYTES`, 4 MiB by
-  default. _For B1 to confirm: whether streaming is ever added, which the plan
-  adds only if a fixture needs it._
+- Bodies are inline, and the cap counts decoded bytes: at most 4 MiB, the
+  grant's `DEFAULT_MAX_BODY_BYTES` by default. A side that sends a body uses
+  UTF-8 when the bytes are valid UTF-8 and the line still fits `MAX_LINE_BYTES`,
+  and base64 otherwise, with `body_encoding` saying which. A body over the cap
+  is refused: barn answers the stall with an error naming the cap, and a stall
+  that sends one has broken the protocol. _For B1 to confirm: that error's
+  code._
 
 ## Versions
 
 `protocol` is an integer, `1` today (`PROTOCOL_VERSION` in `barn-stall`). barn
 speaks the current version and the one before it. Fields are only added within a
 version: a rename or a removal is a new version.
+
+The values `body_encoding` may carry are closed within a version: another
+encoding is a new version, never a value added inside this one.
 
 ## Methods
 
@@ -64,6 +71,21 @@ A stall asks the broker:
 {"jsonrpc":"2.0","id":8,"error":{"code":-32001,"message":"denied","data":{"reason":"host not granted","host":"evil.example"}}}
 ```
 
+A POST with headers and a UTF-8 body, and its answer, which keeps a header that
+repeats:
+
+```json
+{"jsonrpc":"2.0","id":11,"method":"net.request","params":{"plugin":"github","method":"POST","url":"https://api.github.com/graphql","headers":[["content-type","application/json"],["accept","application/json"]],"body":"{\"query\":\"{ viewer { login } }\"}","body_encoding":"utf8","auth":{"secret":"github-token","as":"bearer"},"budget":"github"}}
+{"jsonrpc":"2.0","id":11,"result":{"status":200,"headers":[["set-cookie","a=1"],["set-cookie","b=2"],["etag","v1"]],"body":"hello","body_encoding":"utf8"}}
+```
+
+A body that is not UTF-8, carried as base64:
+
+```json
+{"jsonrpc":"2.0","id":12,"method":"net.request","params":{"method":"PUT","url":"https://uploads.example/","body":"aGk=","body_encoding":"base64"}}
+{"jsonrpc":"2.0","id":12,"result":{"status":201,"headers":[],"body":"","body_encoding":"utf8"}}
+```
+
 These bodies are `barn-stall`'s types, and each one is checked against the JSON
 on this page in that crate's tests, which read this file with `include_str!`:
 
@@ -85,7 +107,12 @@ past the sketch and B1 confirms them:
   so a name that repeats, such as `set-cookie`, keeps every value;
 - a response's body is UTF-8 text, or base64 when `body_encoding` says
   `base64`;
-- a request carries its headers the same way, lower-cased, and its body inline.
+- a request carries its headers the same way, lower-cased, and its body inline
+  with a `body_encoding` of its own;
+- either side may send a header name in any case; barn lower-cases names on the
+  way in and on the way out, so a stall always sees lower-case names;
+- a header whose value is not valid UTF-8 is dropped, and barn logs it once per
+  request with its name; the request or response still goes through.
 
 _For B1 to confirm: whether a JSON-RPC id is an integer, a string or both, and
 whether `net.request`'s `auth.as` has values beyond `bearer`._
@@ -122,4 +149,4 @@ is built for them until B1 settles them:
 - whether `stall.start`'s `state` arrives expanded or as `~`.
 - how barn and a stall agree on a version: `stall.start` carries `protocol`, but
   no result field answers with the version the stall speaks.
-- the value names a `body_encoding` may carry besides `utf8` and `base64`.
+- the code of the error barn answers with when a body is over its cap.
