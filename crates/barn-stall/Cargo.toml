@@ -10,9 +10,12 @@ repository.workspace = true
 
 [dependencies]
 serde.workspace = true
+snap = "1"
 
 [dev-dependencies]
 serde_json.workspace = true
+smallvec = "=1.6.0"
+itoa = { git = "https://github.com/dtolnay/itoa", tag = "1.0.9" }
 
 [lints]
 workspace = true
