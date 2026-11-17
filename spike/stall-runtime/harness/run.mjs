@@ -49,6 +49,7 @@ async function measuredRun(options) {
   let health = null
   let agent = null
   let stderr = null
+  let engineState = null
 
   try {
     const mode = options.scenario === "quiet" || options.scenario === "idle" ? "stable" : "changing"
@@ -58,6 +59,7 @@ async function measuredRun(options) {
     const monitors = options.scenario === "idle" ? [] : buildMonitors({ count: options.monitors, chaos: options.chaos, intervalSec: options.interval })
     child = await spawnStall(options, stateDir)
     stderr = stderrCollector(child.stderr)
+    engineState = engineCollector(child.stderr)
     child.stdout.resume()
 
     broker = startBroker({ child, upstreamBase: `http://127.0.0.1:${upstream.port}`, faults })
@@ -174,6 +176,8 @@ async function measuredRun(options) {
       schema: "stall-spike/run@1",
       candidate: options.candidate,
       scheduler: options.candidate === "rust" ? options.scheduler : null,
+      engine: engineState.engine,
+      engineTimings: engineState.timings(),
       scenario: options.scenario,
       chaos: options.chaos,
       store: options.env.STALL_STORE ?? "json",
@@ -378,6 +382,69 @@ function healthSummary(state) {
     unresponsiveAfterMs: state.unresponsiveAfterMs,
     recoveredAfterMs: state.recoveredAfterMs,
   }
+}
+
+// Candidate B and C announce their engine once at startup, then how long each plugin type's
+// realm took to build or reset. The lines are read as they arrive rather than out of
+// stderr.tail(), whose 20-line bound drops the startup line once resets fill it; the tail and
+// the line count the run JSON already carries are left exactly as they were.
+const ENGINE_LINE = /^\[stall-b\] engine (rquickjs|djs)$/
+const ENGINE_BUILD_LINE = /^\[stall-b\] engine (?:rquickjs|djs) realm-build (\S+) (\d+(?:\.\d+)?)$/
+const ENGINE_RESET_LINE = /^\[stall-b\] engine (?:rquickjs|djs) realm-reset (\S+) (\d+(?:\.\d+)?)$/
+const ENGINE_LINE_LIMIT_BYTES = 4096
+
+function engineCollector(stream) {
+  const buildMs = new Map()
+  const resetMs = new Map()
+  let engine = null
+  let resets = 0
+  let buffer = ""
+
+  const take = (text) => {
+    const startup = ENGINE_LINE.exec(text)
+    if (startup) {
+      engine = startup[1]
+      return
+    }
+    const build = ENGINE_BUILD_LINE.exec(text)
+    if (build) {
+      buildMs.set(build[1], Number(build[2]))
+      return
+    }
+    const reset = ENGINE_RESET_LINE.exec(text)
+    if (reset) {
+      // A plugin that built or reset twice keeps its last time; resets counts every line,
+      // because it is the number of realms the stall tore down, not one per plugin.
+      resetMs.set(reset[1], Number(reset[2]))
+      resets += 1
+    }
+  }
+
+  stream.setEncoding("utf8")
+  stream.on("data", (chunk) => {
+    buffer += chunk
+    let newline = buffer.indexOf("\n")
+    while (newline !== -1) {
+      take(buffer.slice(0, newline).replace(/\r$/, ""))
+      buffer = buffer.slice(newline + 1)
+      newline = buffer.indexOf("\n")
+    }
+    // An engine line is far shorter than this, so a longer partial is not one; dropping it
+    // keeps the buffer bounded without touching the collector that owns the tail.
+    if (buffer.length > ENGINE_LINE_LIMIT_BYTES) buffer = ""
+  })
+
+  return {
+    get engine() { return engine },
+    timings() {
+      if (buildMs.size === 0 && resetMs.size === 0) return null
+      return { buildMs: byName(buildMs), resetMs: byName(resetMs), resets }
+    },
+  }
+}
+
+function byName(times) {
+  return Object.fromEntries([...times.entries()].sort(([left], [right]) => left.localeCompare(right)))
 }
 
 function createParams(monitor) {

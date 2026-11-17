@@ -1,35 +1,34 @@
-//! Plugin realms.
+//! Plugin realms: which thread runs a poll, and what the poll is asked.
 //!
-//! Each plugin type's JavaScript runs in its own QuickJS realm on a dedicated
-//! OS thread, so the tokio runtime never executes plugin code and a runaway
-//! poll cannot stall the protocol or the HTTP server. `STALL_SCHEDULER=realm` (the
-//! default) gives every plugin type its own thread, so polls of different types
-//! run in parallel and polls of the same type serialise inside their realm;
-//! `STALL_SCHEDULER=seq` gives every realm to one thread that runs polls one at
-//! a time, mirroring candidate A's sequential tick.
+//! Each plugin type's JavaScript runs in its own realm on a dedicated OS thread, so the
+//! tokio runtime never executes plugin code and a runaway poll cannot stall the protocol or
+//! the HTTP server. `STALL_SCHEDULER=realm` (the default) gives every plugin type its own
+//! thread, so polls of different types run in parallel and polls of the same type serialise
+//! inside their realm; `STALL_SCHEDULER=seq` gives every realm to one thread that runs
+//! polls one at a time, mirroring candidate A's sequential tick.
 //!
-//! A poll is synchronous from JavaScript's point of view: the prelude's http
-//! wrapper calls a native host function which blocks this realm thread until
-//! the tokio side answers. That keeps bundles free of async plumbing and lets
-//! the realm's interrupt handler bound plugin code that never yields.
+//! A realm is an `engine::Engine` and nothing here knows which engine it is: this module
+//! builds a poll's input, keeps one realm per plugin type, decodes the envelope the poll
+//! answers with, and owns the host bridge. A poll is synchronous from JavaScript's point of
+//! view: the prelude's http wrapper awaits a host function which blocks this realm thread
+//! until the tokio side answers, and the engine's budget bounds plugin code that never
+//! yields.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rquickjs::{Context, Ctx, Function, Object, Promise, Runtime, Value as JsValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc as async_mpsc, oneshot, Semaphore};
 
+use crate::engine::{self, Engine, Failure};
 use crate::model::{self, Monitor, Source, SourceEvent, SourceType, Target};
 use crate::stall::Protocol;
 
-const PRELUDE: &str = include_str!("prelude.js");
-const MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 /// Jobs waiting for a realm. The scheduler keeps at most one job per monitor in
 /// flight, so this is far above the workload and `submit` never blocks.
 const JOB_QUEUE_CAPACITY: usize = 8192;
@@ -232,7 +231,7 @@ struct NetRequestParams<'a> {
 
 #[derive(Default)]
 struct RealmSlot {
-    realm: Option<Realm>,
+    realm: Option<Box<dyn Engine>>,
     interruptions: u64,
 }
 
@@ -276,23 +275,25 @@ fn poll_job(
     let slot = slots.entry(source_type).or_default();
 
     if slot.realm.is_none() {
-        match Realm::load(source_type, config) {
+        match engine::realm(source_type, config) {
             Ok(realm) => slot.realm = Some(realm),
             Err(error) => return Err(format!("plugin {source_type} realm unavailable: {error}")),
         }
     }
 
+    let input = poll_input(monitor)?;
     let started = Instant::now();
     let result = match slot.realm.as_mut() {
-        Some(realm) => realm.poll(monitor),
+        Some(realm) => realm.poll(&input),
         None => return Err(format!("plugin {source_type} realm unavailable")),
     };
 
-    match result {
+    // The engine returns the prelude's envelope, so the decoding is the same for both.
+    match result.and_then(|envelope| decode_envelope(&envelope)) {
         Ok(output) => Ok(output),
-        Err(RealmFailure::Interrupted) => {
+        Err(Failure::Interrupted) => {
+            // The engine has already recovered the realm, so only the poll is lost.
             let elapsed = started.elapsed().as_millis();
-            slot.realm = None;
             slot.interruptions += 1;
             interruptions.fetch_add(1, Ordering::Relaxed);
             crate::log_line(
@@ -304,163 +305,41 @@ fn poll_job(
             );
             Err(format!("poll interrupted after {elapsed}ms"))
         }
-        Err(RealmFailure::Js(message)) => Err(message),
-        Err(RealmFailure::Fatal(message)) => {
+        Err(Failure::Js(message)) => Err(message),
+        Err(Failure::Fatal(message)) => {
             slot.realm = None;
             Err(message)
         }
     }
 }
 
-enum RealmFailure {
-    Interrupted,
-    Js(String),
-    Fatal(String),
+/// What `__stallInvokePoll` parses: the monitor's source, its cursor and its id.
+fn poll_input(monitor: &Monitor) -> Result<String, String> {
+    let input = json!({
+        "source": monitor.source.source_json(),
+        "cursor": monitor.plugin_cursor(),
+        "monitorId": monitor.id,
+    });
+    serde_json::to_string(&input).map_err(|error| format!("poll input json: {error}"))
 }
 
-struct Realm {
-    // The context keeps its own handle to the runtime; this field only makes
-    // ownership explicit and drops the realm with its thread slot.
-    _runtime: Runtime,
-    context: Context,
-    clock: Arc<PollClock>,
-    deadline: Duration,
-}
-
-impl Realm {
-    fn load(source_type: SourceType, config: &WorkerConfig) -> Result<Realm, String> {
-        let runtime = Runtime::new().map_err(|error| format!("runtime: {error}"))?;
-        runtime.set_memory_limit(MEMORY_LIMIT_BYTES);
-
-        let clock = Arc::new(PollClock::new());
-        let handler_clock = clock.clone();
-        runtime.set_interrupt_handler(Some(Box::new(move || handler_clock.expired())));
-
-        let context = Context::full(&runtime).map_err(|error| format!("context: {error}"))?;
-        let path = config.plugin_dir.join(format!("{source_type}.js"));
-        let bundle = std::fs::read_to_string(&path)
-            .map_err(|error| format!("cannot read plugin bundle {}: {error}", path.display()))?;
-        let realm_config = serde_json::to_string(&json!({
-            "plugin": source_type.as_str(),
-            "faults": config.faults,
-            "env": realm_env(),
-        }))
-        .map_err(|error| format!("realm config json: {error}"))?;
-        let bridge = HostBridge {
-            plugin: source_type.as_str().to_string(),
-            calls: config.host_calls.clone(),
-        };
-        let bundle_path = path.display().to_string();
-
-        // Bound bundle evaluation too: a broken (or hostile) bundle must not
-        // wedge the realm thread before it ever serves a poll.
-        clock.arm(config.deadline);
-        let loaded = context.with(|ctx| -> Result<(), String> {
-            ctx.globals()
-                .set("__stall_cfg", realm_config)
-                .map_err(|error| describe_error(&ctx, error, "install realm config"))?;
-            let http_host = Function::new(ctx.clone(), move |payload: String| -> String {
-                bridge.handle(&payload)
-            })
-            .map_err(|error| describe_error(&ctx, error, "install http host function"))?;
-            ctx.globals()
-                .set("__stallHostHttp", http_host)
-                .map_err(|error| describe_error(&ctx, error, "install http host function"))?;
-            let log_host = Function::new(ctx.clone(), move |level: String, message: String| {
-                let level = match level.as_str() {
-                    "warn" | "error" | "debug" => level,
-                    _ => "info".to_string(),
-                };
-                crate::log_line(&level, &format!("plugin {source_type}: {message}"));
-            })
-            .map_err(|error| describe_error(&ctx, error, "install log host function"))?;
-            ctx.globals()
-                .set("__stallLog", log_host)
-                .map_err(|error| describe_error(&ctx, error, "install log host function"))?;
-            ctx.eval::<JsValue, _>(PRELUDE)
-                .map_err(|error| describe_error(&ctx, error, "prelude"))?;
-            ctx.eval::<JsValue, _>(bundle.as_bytes())
-                .map_err(|error| describe_error(&ctx, error, &format!("bundle {bundle_path}")))?;
-            let defined: bool = ctx
-                .eval("typeof globalThis.__stall.pluginPoll === 'function'")
-                .map_err(|error| describe_error(&ctx, error, "check pluginPoll"))?;
-            if !defined {
-                return Err(format!(
-                    "plugin bundle {bundle_path} did not define globalThis.__stall.pluginPoll"
-                ));
-            }
-            Ok(())
-        });
-        if clock.disarm() {
-            return Err(format!(
-                "plugin bundle {bundle_path} exceeded the {}ms load deadline",
-                config.deadline.as_millis()
-            ));
-        }
-        loaded?;
-
-        let malloc_limit = runtime.memory_usage().malloc_limit;
-        let accepted = malloc_limit > 0 && malloc_limit as usize <= MEMORY_LIMIT_BYTES;
-        crate::log_line(
-            "info",
-            &format!(
-                "plugin {source_type} realm loaded from {} (memory limit {} MiB {}; allocator malloc_limit {} bytes)",
-                path.display(),
-                MEMORY_LIMIT_BYTES >> 20,
-                if accepted { "accepted" } else { "NOT accepted" },
-                malloc_limit
-            ),
-        );
-
-        Ok(Realm {
-            _runtime: runtime,
-            context,
-            clock,
-            deadline: config.deadline,
-        })
+/// The envelope the prelude always answers with. A malformed one means the bundle replaced
+/// `__stallInvokePoll` or the engine lost the result, so the realm is dropped rather than
+/// reused; a reported failure is the plugin's own throw and leaves it usable.
+fn decode_envelope(envelope: &str) -> Result<PollOutput, Failure> {
+    let envelope: PollEnvelope = serde_json::from_str(envelope).map_err(|error| {
+        Failure::Fatal(format!("pluginPoll returned a malformed envelope: {error}"))
+    })?;
+    if !envelope.ok {
+        return Err(Failure::Js(
+            envelope
+                .error
+                .unwrap_or_else(|| "pluginPoll threw".to_string()),
+        ));
     }
-
-    fn poll(&mut self, monitor: &Monitor) -> Result<PollOutput, RealmFailure> {
-        self.clock.arm(self.deadline);
-        let input = json!({
-            "source": monitor.source.source_json(),
-            "cursor": monitor.plugin_cursor(),
-            "monitorId": monitor.id,
-        });
-        let input_json = serde_json::to_string(&input)
-            .map_err(|error| RealmFailure::Fatal(format!("poll input json: {error}")))?;
-
-        let result = self.context.with(|ctx| -> Result<String, RealmFailure> {
-            let invoke: Function = ctx.globals().get("__stallInvokePoll").map_err(|error| {
-                RealmFailure::Fatal(describe_error(&ctx, error, "look up __stallInvokePoll"))
-            })?;
-            let promise: Promise = invoke.call((input_json,)).map_err(|error| {
-                RealmFailure::Fatal(describe_error(&ctx, error, "call pluginPoll"))
-            })?;
-            promise.finish::<String>().map_err(|error| {
-                RealmFailure::Fatal(describe_error(&ctx, error, "pluginPoll result"))
-            })
-        });
-
-        let fired = self.clock.disarm();
-        if fired {
-            return Err(RealmFailure::Interrupted);
-        }
-
-        let envelope: PollEnvelope = serde_json::from_str(&result?).map_err(|error| {
-            RealmFailure::Fatal(format!("pluginPoll returned a malformed envelope: {error}"))
-        })?;
-        if !envelope.ok {
-            return Err(RealmFailure::Js(
-                envelope
-                    .error
-                    .unwrap_or_else(|| "pluginPoll threw".to_string()),
-            ));
-        }
-        envelope
-            .result
-            .ok_or_else(|| RealmFailure::Js("pluginPoll returned no result".to_string()))
-    }
+    envelope
+        .result
+        .ok_or_else(|| Failure::Js("pluginPoll returned no result".to_string()))
 }
 
 #[derive(Deserialize)]
@@ -495,16 +374,24 @@ struct HostReply {
     error: Option<String>,
 }
 
-struct HostBridge {
+/// The realm side of the broker bridge, shared by both engines.
+pub(crate) struct HostBridge {
     plugin: String,
     calls: async_mpsc::UnboundedSender<HostCall>,
 }
 
 impl HostBridge {
-    /// Called on the realm thread from inside QuickJS. It blocks that thread
+    pub(crate) fn new(plugin: SourceType, calls: async_mpsc::UnboundedSender<HostCall>) -> Self {
+        Self {
+            plugin: plugin.as_str().to_string(),
+            calls,
+        }
+    }
+
+    /// Called on the realm thread from inside the engine. It blocks that thread
     /// until the tokio side has the broker's answer, which is why it must never
     /// run on a tokio worker.
-    fn handle(&self, payload: &str) -> String {
+    pub(crate) fn handle(&self, payload: &str) -> String {
         let request: HttpRequestPayload = match serde_json::from_str(payload) {
             Ok(request) => request,
             Err(error) => return reply_error(format!("bad host http payload: {error}")),
@@ -549,55 +436,10 @@ fn reply_error(message: String) -> String {
         .unwrap_or_else(|_| "{\"ok\":false,\"error\":\"encode\"}".to_string())
 }
 
-/// QuickJS calls this regularly while executing bytecode; returning true
-/// raises an uncatchable exception that aborts the current poll.
-struct PollClock {
-    origin: Instant,
-    deadline_ms: AtomicU64,
-    fired: AtomicBool,
-}
-
-impl PollClock {
-    fn new() -> Self {
-        Self {
-            origin: Instant::now(),
-            deadline_ms: AtomicU64::new(0),
-            fired: AtomicBool::new(false),
-        }
-    }
-
-    fn arm(&self, deadline: Duration) {
-        let now = self.origin.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        let budget = deadline.as_millis().min(u64::MAX as u128) as u64;
-        self.fired.store(false, Ordering::SeqCst);
-        self.deadline_ms
-            .store(now.saturating_add(budget), Ordering::SeqCst);
-    }
-
-    fn disarm(&self) -> bool {
-        self.deadline_ms.store(0, Ordering::SeqCst);
-        self.fired.swap(false, Ordering::SeqCst)
-    }
-
-    fn expired(&self) -> bool {
-        let deadline = self.deadline_ms.load(Ordering::Relaxed);
-        if deadline == 0 {
-            return false;
-        }
-        let now = self.origin.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        if now >= deadline {
-            self.fired.store(true, Ordering::SeqCst);
-            true
-        } else {
-            false
-        }
-    }
-}
-
 /// The variables the pinned providers read from `process.env`. Only these are
 /// handed to a realm; the Jira base keeps the documented default so the bundles
 /// can build issue URLs without a workspace being configured.
-fn realm_env() -> Value {
+pub(crate) fn realm_env() -> Value {
     let mut env = serde_json::Map::new();
     let jira_base = std::env::var("SOURCEFED_JIRA_BASE_URL")
         .ok()
@@ -620,29 +462,4 @@ fn realm_env() -> Value {
         }
     }
     Value::Object(env)
-}
-
-fn describe_error(ctx: &Ctx<'_>, error: rquickjs::Error, what: &str) -> String {
-    if matches!(error, rquickjs::Error::Exception) {
-        return format!("{what}: {}", describe_thrown(&ctx.catch()));
-    }
-    format!("{what}: {error}")
-}
-
-fn describe_thrown(thrown: &JsValue<'_>) -> String {
-    if thrown.is_error() {
-        if let Ok(object) = Object::from_value(thrown.clone()) {
-            let message: Option<String> = object.get("message").ok().flatten();
-            let stack: Option<String> = object.get("stack").ok().flatten();
-            let message = message.unwrap_or_else(|| "exception".to_string());
-            return match stack {
-                Some(stack) if !stack.is_empty() => format!("{message}\n{stack}"),
-                _ => message,
-            };
-        }
-    }
-    if let Ok(text) = thrown.get::<String>() {
-        return text;
-    }
-    "unprintable JavaScript value".to_string()
 }

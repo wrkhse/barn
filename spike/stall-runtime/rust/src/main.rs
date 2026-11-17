@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
+use stall_b::engine;
 use stall_b::model::VERSION;
 use stall_b::plugin::{self, Workers};
 use stall_b::sse::Hub;
@@ -124,7 +125,33 @@ struct System {
     workers: Workers,
 }
 
+/// The engine line the harness greps, and a check that a stale `STALL_ENGINE` cannot
+/// quietly disagree with the binary that was built.
+fn announce_engine() -> Result<(), String> {
+    eprintln!("[stall-b] engine {}", engine::name());
+    check_engine_selector(std::env::var("STALL_ENGINE").ok())
+}
+
+/// An unset or empty `STALL_ENGINE` says nothing; any other value has to name this binary's
+/// engine, because the engine is fixed when the binary is built.
+fn check_engine_selector(selector: Option<String>) -> Result<(), String> {
+    match selector {
+        Some(other) if !other.is_empty() && other != engine::name() => Err(format!(
+            "STALL_ENGINE={other:?} but this binary was built with engine {:?}; the engine is \
+             fixed at build time, so --no-default-features --features engine-djs builds the \
+             other one",
+            engine::name()
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn main() {
+    if let Err(error) = announce_engine() {
+        log_line("error", &format!("startup: {error}"));
+        std::process::exit(1);
+    }
+
     let env = match Env::from_env() {
         Ok(env) => env,
         Err(error) => {
@@ -412,4 +439,17 @@ fn truncate(text: &str, limit: usize) -> String {
         end -= 1;
     }
     format!("{}...", &text[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_engine_selector;
+
+    #[test]
+    fn only_a_disagreeing_stall_engine_is_an_error() {
+        assert!(check_engine_selector(None).is_ok());
+        assert!(check_engine_selector(Some(String::new())).is_ok());
+        assert!(check_engine_selector(Some(stall_b::engine::name().to_string())).is_ok());
+        assert!(check_engine_selector(Some("quickjs".to_string())).is_err());
+    }
 }

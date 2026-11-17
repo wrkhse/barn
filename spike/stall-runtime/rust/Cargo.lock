@@ -37,6 +37,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "djs-core"
+version = "0.0.0"
+source = "git+https://github.com/earendil-works/djs?rev=0e58f62c80252fc3f4156ab7a3744746434ed860#0e58f62c80252fc3f4156ab7a3744746434ed860"
+dependencies = [
+ "djs-libm",
+]
+
+[[package]]
+name = "djs-embed"
+version = "0.1.1"
+source = "git+https://github.com/earendil-works/djs?rev=0e58f62c80252fc3f4156ab7a3744746434ed860#0e58f62c80252fc3f4156ab7a3744746434ed860"
+dependencies = [
+ "djs-core",
+ "djs-prelude",
+]
+
+[[package]]
+name = "djs-libm"
+version = "0.0.0"
+source = "git+https://github.com/earendil-works/djs?rev=0e58f62c80252fc3f4156ab7a3744746434ed860#0e58f62c80252fc3f4156ab7a3744746434ed860"
+
+[[package]]
+name = "djs-lzrc"
+version = "0.0.0"
+source = "git+https://github.com/earendil-works/djs?rev=0e58f62c80252fc3f4156ab7a3744746434ed860#0e58f62c80252fc3f4156ab7a3744746434ed860"
+
+[[package]]
+name = "djs-prelude"
+version = "0.0.0"
+source = "git+https://github.com/earendil-works/djs?rev=0e58f62c80252fc3f4156ab7a3744746434ed860#0e58f62c80252fc3f4156ab7a3744746434ed860"
+dependencies = [
+ "djs-core",
+ "djs-lzrc",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -347,6 +383,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "bytes",
+ "djs-embed",
  "futures-util",
  "http-body-util",
  "hyper",

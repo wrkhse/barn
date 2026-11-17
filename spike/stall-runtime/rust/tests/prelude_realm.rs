@@ -2,6 +2,10 @@
 //! installed, the http shim shapes one GET request, and a provider-style async
 //! poll resolves through the job queue. In-process only: no sockets, no child
 //! processes, no signals.
+//!
+//! QuickJS only: the same prelude under djs is tests/engine_realm.rs.
+
+#![cfg(feature = "engine-rquickjs")]
 
 use rquickjs::{Context, Function, Runtime, Value};
 
@@ -52,7 +56,7 @@ fn the_prelude_runs_under_quickjs() {
             .eval(
                 r#"
                 globalThis.__stall.pluginPoll = async function () {
-                  var response = globalThis.__stall.http(
+                  var response = await globalThis.__stall.http(
                     "https://api.github.com/repos/example-org/repo-1/issues?state=open",
                     { accept: "application/vnd.github+json" }
                   );

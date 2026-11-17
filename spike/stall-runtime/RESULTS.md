@@ -82,7 +82,7 @@ Candidate A, chaos none, store json:
 
 ### Steady state, 100 monitors
 
-All three still keep every poll. Candidate A's footprint reaches 180.7 MB against 18.3 and 15.7 MB and its CPU per poll 39.40 ms against 12.35 and 12.30, yet its p95 latency, 10.3 ms, now beats both Rust schedulers (423.4 ms and 366.7 ms): at this size the serialised whole-file store, not the runtime, is what delivery waits behind.
+All three still keep every poll. Candidate A's footprint reaches 180.7 MB against 18.3 and 15.7 MB and its CPU per poll 39.40 ms against 12.35 and 12.30, yet its p95 latency, 10.3 ms, is now the lower one, against 423.4 and 366.7 ms: at this size the serialised whole-file store, not the runtime, is what delivery waits behind.
 
 Candidate B, scheduler realm, chaos none, store json:
 
@@ -104,7 +104,7 @@ Candidate A, chaos none, store json:
 
 ### Steady state, 500 monitors
 
-Here the runtime and the store stop being separable. Candidate A falls behind (0.84 polls a monitor, `behind` 1, 20.8 events/s) while both Rust schedulers keep every poll (2.00 polls a monitor, 23.6 events/s) in 46.0 and 37.9 MB against A's 323.7 MB — but delivery now queues behind the store, so the Rust p95 is about 20 s against A's 1.57 s. That figure is a statement about the store, and the memory-store tables below are the reading of the runtime without it.
+Here the runtime and the store stop being separable. Priming at this size costs candidate B 5.5 s, and candidate A reaches the harness's 45 s cap. Candidate A then falls behind (0.84 polls a monitor, about nine polls a second, `behind` 1, 20.8 events/s) while both Rust schedulers keep every poll (2.00 polls a monitor, 23.6 events/s) in 46.0 and 37.9 MB against A's 323.7 MB — but delivery now queues behind the store, so the Rust p95 is about 20 s against A's 1.57 s. That figure is a statement about the store, and the memory-store tables below are the reading of the runtime without it.
 
 Candidate B, scheduler realm, chaos none, store json:
 

@@ -20,6 +20,11 @@ const METRICS = [
   { key: "latencyMs.p99", label: "p99 latency ms", digits: 1 },
   { key: "health.failures", label: "health failures", digits: 0 },
   { key: "drainMs", label: "drain ms", digits: 1 },
+  // Candidate B and C report one realm build per plugin type, so a run's build column is its
+  // slowest build (the plugin that costs most to load) and a group's is the median of those.
+  // buildMsMax is derived from engineTimings.buildMs and is not a field in the run JSON.
+  { key: "engineTimings.buildMsMax", label: "realm build ms", digits: 1, derive: slowestBuild },
+  { key: "engineTimings.resets", label: "realm resets", digits: 0 },
 ]
 const SCENARIO_ORDER = { steady: 0, quiet: 1, idle: 2, fault: 3 }
 const CAVEATS = [
@@ -32,6 +37,7 @@ const CAVEATS = [
   "idleRssMb is null for steady, quiet and fault runs; the idle scenario reports the window median. startupMs is spawn to first net.request, with no settle.",
   "Health probes are stall protocol RPCs every second; their CPU is part of the sampled process tree.",
   "A metric with no sample in a run is null and is left out of its cell; if no run has a sample the cell is —.",
+  "The realm columns exist only for candidates B and C: realm build ms is the median of each run's slowest plugin build, realm resets the median count of realms torn down; candidate A on Node logs neither, so its cells are —.",
   "The fault scenario adds a chaos monitor, so its monitor count is one higher than steady or quiet at the same setting.",
   "Run JSONs are the only record: state dirs and upstream ports are ephemeral.",
 ]
@@ -80,7 +86,7 @@ async function loadRuns(directory) {
 function groupRuns(runs) {
   const byKey = new Map()
   for (const run of runs) {
-    const key = [run.scenario, run.monitors, run.candidate, run.scheduler ?? "", run.chaos ?? "none", run.store ?? "json"].join("\u0000")
+    const key = [run.scenario, run.monitors, run.candidate, run.scheduler ?? "", run.engine ?? "", run.chaos ?? "none", run.store ?? "json"].join("\u0000")
     const list = byKey.get(key)
     if (list) list.push(run)
     else byKey.set(key, [run])
@@ -100,6 +106,7 @@ function summariseGroup(list) {
     monitors: first.monitors,
     candidate: first.candidate,
     scheduler: first.scheduler ?? null,
+    engine: first.engine ?? null,
     chaos: first.chaos ?? "none",
     store: first.store ?? "json",
     n: list.length,
@@ -113,6 +120,7 @@ function compareGroups(left, right) {
     || left.monitors - right.monitors
     || left.candidate.localeCompare(right.candidate)
     || String(left.scheduler ?? "").localeCompare(String(right.scheduler ?? ""))
+    || String(left.engine ?? "").localeCompare(String(right.engine ?? ""))
     || left.chaos.localeCompare(right.chaos)
     || left.store.localeCompare(right.store)
 }
@@ -140,11 +148,11 @@ function render(runs, groups) {
 }
 
 function groupHeading(group) {
-  return `## ${group.scenario} · ${group.monitors} monitors · ${group.candidate} · scheduler ${group.scheduler ?? "—"} · chaos ${group.chaos} · store ${group.store}`
+  return `## ${group.scenario} · ${group.monitors} monitors · ${group.candidate} · scheduler ${group.scheduler ?? "—"} · engine ${group.engine ?? "—"} · chaos ${group.chaos} · store ${group.store}`
 }
 
 function methodParagraph(runs) {
-  return `Every run spawns one stall, drives the same workload through its stall protocol and HTTP API, and samples the process tree once a second. Values are medians of the runs found (the planned 10 per cell; n says how many), with [min–max] across those runs. Request and SSE frame times come only from the harness's own hrtime clock, so the latency columns measure host-side processing and delivery after the mock upstream answered, never a clock inside either candidate. Each table heading names the scenario, monitor count, candidate, scheduler, chaos and store it covers. With priming outside the window, a candidate that kept up polls each monitor floor(windowSec/intervalSec) - 1 to floor(windowSec/intervalSec) times, so its poll ratio sits between pollRatioFloor and 1; polls/monitor is the mean across monitors, and behind is 1 for a run below that floor (a group's behind cell is the median of those 0/1 values, so 0 [0–1] means some runs fell below and some did not). ${runs.length} runs in this table.`
+  return `Every run spawns one stall, drives the same workload through its stall protocol and HTTP API, and samples the process tree once a second. Values are medians of the runs found (the planned 10 per cell; n says how many), with [min–max] across those runs. Request and SSE frame times come only from the harness's own hrtime clock, so the latency columns measure host-side processing and delivery after the mock upstream answered, never a clock inside either candidate. Each table heading names the scenario, monitor count, candidate, scheduler, engine, chaos and store it covers. With priming outside the window, a candidate that kept up polls each monitor floor(windowSec/intervalSec) - 1 to floor(windowSec/intervalSec) times, so its poll ratio sits between pollRatioFloor and 1; polls/monitor is the mean across monitors, and behind is 1 for a run below that floor (a group's behind cell is the median of those 0/1 values, so 0 [0–1] means some runs fell below and some did not). ${runs.length} runs in this table.`
 }
 
 function machineParagraph(runs) {
@@ -176,9 +184,17 @@ function formatCell(metric, entry) {
 }
 
 function metricValue(run, metric) {
+  if (metric.derive) return metric.derive(run)
   const value = read(run, metric.key)
   if (metric.kind === "boolean") return typeof value === "boolean" ? (value ? 1 : 0) : null
   return numeric(value)
+}
+
+// A run builds each plugin type once when it loads it, so the run's build cost is the
+// slowest of those builds; a group of them answers for the worst plugin's realm.
+function slowestBuild(run) {
+  const builds = Object.values(run?.engineTimings?.buildMs ?? {}).filter((value) => typeof value === "number" && Number.isFinite(value))
+  return builds.length === 0 ? null : maximum(builds)
 }
 
 function read(value, key) {

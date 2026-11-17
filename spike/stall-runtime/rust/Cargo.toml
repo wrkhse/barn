@@ -7,6 +7,15 @@ edition = "2021"
 # it is throwaway code, so barn's workspace and its gates do not own it.
 [workspace]
 
+[features]
+# One JavaScript engine per binary, chosen when it is built, so each binary's size and
+# timings stand on their own: rquickjs is candidate B's realm, djs gives candidate C the
+# same stall with a different interpreter. Building with neither, or with both, is a
+# compile error (src/lib.rs).
+default = ["engine-rquickjs"]
+engine-rquickjs = ["dep:rquickjs"]
+engine-djs = ["dep:djs-embed"]
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 hyper = { version = "1", features = ["server", "http1"] }
@@ -16,8 +25,13 @@ bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
-rquickjs = "0.14"
+rquickjs = { version = "0.14", optional = true }
 futures-util = "0.3"
+# djs-embed is publish = false, so it can only come from the repository, never from
+# crates.io. The pin is a commit, 0e58f62c80252fc3f4156ab7a3744746434ed860 ("docs: mark
+# the index and introduction as experimental"), not a tag or a branch, because djs-embed
+# is 0.x and a moving ref could change its API under the spike.
+djs-embed = { git = "https://github.com/earendil-works/djs", rev = "0e58f62c80252fc3f4156ab7a3744746434ed860", optional = true }
 
 [profile.release]
 strip = true

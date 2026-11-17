@@ -1,6 +1,7 @@
 // Stall realm prelude: the Node-flavoured globals the pinned sourcefed providers
-// use, plus globalThis.__stall.http(url, headers). http is synchronous — it blocks
-// the realm thread on the broker — and returns the Response-like providers read.
+// use, plus globalThis.__stall.http(url, headers). http is async: it awaits the host
+// function, which is a blocking native call under rquickjs and a promise under djs, and
+// resolves to the Response-like providers read. One prelude serves both engines.
 "use strict";
 
 (function () {
@@ -156,7 +157,8 @@
     };
   }
   // Faults apply before the native call: "throw" rejects the request the way a
-  // transport error would, "loop" runs bytecode only the interrupt handler stops.
+  // transport error would, "loop" runs bytecode only the poll's budget stops — the
+  // interrupt handler under rquickjs, the deadline under djs.
   function applyFaults(url) {
     for (var index = 0; index < faults.length; index += 1) {
       var fault = faults[index];
@@ -166,8 +168,10 @@
     }
   }
 
-  // The pinned provider request functions only ever GET.
-  function http(url, headers) {
+  // The pinned provider request functions only ever GET. Awaiting the host call keeps
+  // one prelude for both engines: rquickjs answers it with a string, which settles
+  // through the job queue Promise::finish drains, and djs answers its promise.
+  async function http(url, headers) {
     var target = String(url);
     applyFaults(target);
     var request = { method: "GET", url: target, headers: {} };
@@ -175,7 +179,7 @@
       var names = Object.keys(headers);
       for (var index = 0; index < names.length; index += 1) request.headers[String(names[index])] = String(headers[names[index]]);
     }
-    var reply = JSON.parse(__stallHostHttp(JSON.stringify(request)));
+    var reply = JSON.parse(await __stallHostHttp(JSON.stringify(request)));
     if (!reply.ok) throw new Error(reply.error || "http request failed");
     return makeResponse(reply.response);
   }

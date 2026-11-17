@@ -29,7 +29,7 @@ env:
 
 jobs:
   build:
-    name: Build both candidates and publish the measurement inputs
+    name: Build every candidate and publish the measurement inputs
     runs-on: ubuntu-latest
     timeout-minutes: 30
     defaults:
@@ -78,6 +78,18 @@ jobs:
 
       - name: Compile candidate B in release mode
         run: cargo build --release --manifest-path rust/Cargo.toml
+
+      # Candidate C is the same Rust stall with the djs engine instead of QuickJS: one crate,
+      # two features, two binaries. Both builds write rust/target/release/stall-b, so
+      # candidate B's binary is set aside while candidate C is built and copied out, and each
+      # artifact then carries the binary it names rather than whichever build ran last.
+      - name: Compile candidate C (the same stall with the djs engine) and keep candidate B's binary
+        run: |
+          cp rust/target/release/stall-b rust/target/release/stall-b-rquickjs
+          cargo build --release --no-default-features --features engine-djs --manifest-path rust/Cargo.toml
+          cp rust/target/release/stall-b rust/target/release/stall-c
+          mv rust/target/release/stall-b-rquickjs rust/target/release/stall-b
+          ls -l rust/target/release/stall-b rust/target/release/stall-c
 
       - name: Record toolchain versions, bundle sizes and package provenance
         run: |
@@ -139,6 +151,9 @@ jobs:
             vendorDirBytes,
             npmPackageBytes: npmPackageBytes(),
             rustBinaryBytes: fs.statSync('rust/target/release/stall-b').size,
+            rustDjsBinaryBytes: fs.statSync('rust/target/release/stall-c').size,
+            djsRepository: 'https://github.com/earendil-works/djs',
+            djsCommit: '0e58f62c80252fc3f4156ab7a3744746434ed860',
             pluginBundles: JSON.parse(fs.readFileSync('plugins-dist/manifest.json', 'utf8')),
           };
 
@@ -210,6 +225,13 @@ jobs:
           path: spike/stall-runtime/rust/target/release/stall-b
           retention-days: 7
 
+      - name: Upload the candidate C binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: stall-c
+          path: spike/stall-runtime/rust/target/release/stall-c
+          retention-days: 7
+
       - name: Upload the built plugin bundles
         # Candidate B reads these through STALL_PLUGIN_DIR, so the measurement jobs
         # need them alongside the vendor tree and the binary.
@@ -223,7 +245,7 @@ jobs:
     name: Steady state at ${{ matrix.monitors }} monitors
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -254,6 +276,12 @@ jobs:
           name: stall-b
           path: spike/stall-runtime/rust/target/release
 
+      - name: Download the candidate C binary (the same Rust stall with the djs engine)
+        uses: actions/download-artifact@v4
+        with:
+          name: stall-c
+          path: spike/stall-runtime/rust/target/release
+
       - name: Download the built plugin bundles
         uses: actions/download-artifact@v4
         with:
@@ -263,14 +291,15 @@ jobs:
       - name: Extract the vendored candidate A tree
         run: tar -xf vendor-sourcefed.tar -C .
 
-      - name: Make the downloaded candidate B binary executable
-        run: chmod +x rust/target/release/stall-b
+      - name: Make the downloaded candidate binaries executable
+        run: chmod +x rust/target/release/stall-b rust/target/release/stall-c
 
       - name: Measure steady state at ${{ matrix.monitors }} monitors
         env:
           MODE: ${{ inputs.mode }}
         run: |
           if [ "$MODE" = "smoke" ]; then
+            # One short run of each variant, rust-djs included.
             RUNS=1
             INTERVAL=15
             WINDOW=15
@@ -280,7 +309,7 @@ jobs:
             WINDOW=45
           fi
           node scripts/matrix.mjs \
-            --variants ts,rust-seq,rust-realm \
+            --variants ts,rust-seq,rust-realm,rust-djs \
             --scenario steady \
             --monitors "${{ matrix.monitors }}" \
             --runs "$RUNS" \
@@ -310,7 +339,7 @@ jobs:
     name: Idle cost with zero monitors
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: spike/stall-runtime
@@ -335,6 +364,12 @@ jobs:
           name: stall-b
           path: spike/stall-runtime/rust/target/release
 
+      - name: Download the candidate C binary (the same Rust stall with the djs engine)
+        uses: actions/download-artifact@v4
+        with:
+          name: stall-c
+          path: spike/stall-runtime/rust/target/release
+
       - name: Download the built plugin bundles
         uses: actions/download-artifact@v4
         with:
@@ -344,8 +379,8 @@ jobs:
       - name: Extract the vendored candidate A tree
         run: tar -xf vendor-sourcefed.tar -C .
 
-      - name: Make the downloaded candidate B binary executable
-        run: chmod +x rust/target/release/stall-b
+      - name: Make the downloaded candidate binaries executable
+        run: chmod +x rust/target/release/stall-b rust/target/release/stall-c
 
       - name: Measure idle cost with zero monitors
         env:
@@ -359,7 +394,7 @@ jobs:
             WINDOW=20
           fi
           node scripts/matrix.mjs \
-            --variants ts,rust-seq,rust-realm \
+            --variants ts,rust-seq,rust-realm,rust-djs \
             --scenario idle \
             --monitors 0 \
             --runs "$RUNS" \
@@ -388,7 +423,7 @@ jobs:
     name: Quiet upstream with 100 monitors
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: spike/stall-runtime
@@ -413,6 +448,12 @@ jobs:
           name: stall-b
           path: spike/stall-runtime/rust/target/release
 
+      - name: Download the candidate C binary (the same Rust stall with the djs engine)
+        uses: actions/download-artifact@v4
+        with:
+          name: stall-c
+          path: spike/stall-runtime/rust/target/release
+
       - name: Download the built plugin bundles
         uses: actions/download-artifact@v4
         with:
@@ -422,8 +463,8 @@ jobs:
       - name: Extract the vendored candidate A tree
         run: tar -xf vendor-sourcefed.tar -C .
 
-      - name: Make the downloaded candidate B binary executable
-        run: chmod +x rust/target/release/stall-b
+      - name: Make the downloaded candidate binaries executable
+        run: chmod +x rust/target/release/stall-b rust/target/release/stall-c
 
       - name: Measure 100 monitors against a stable upstream
         env:
@@ -437,7 +478,7 @@ jobs:
             WINDOW=30
           fi
           node scripts/matrix.mjs \
-            --variants ts,rust-seq,rust-realm \
+            --variants ts,rust-seq,rust-realm,rust-djs \
             --scenario quiet \
             --monitors 100 \
             --runs "$RUNS" \
@@ -466,7 +507,7 @@ jobs:
     name: Fault isolation when a plugin throws and when it loops
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: spike/stall-runtime
@@ -491,6 +532,12 @@ jobs:
           name: stall-b
           path: spike/stall-runtime/rust/target/release
 
+      - name: Download the candidate C binary (the same Rust stall with the djs engine)
+        uses: actions/download-artifact@v4
+        with:
+          name: stall-c
+          path: spike/stall-runtime/rust/target/release
+
       - name: Download the built plugin bundles
         uses: actions/download-artifact@v4
         with:
@@ -500,8 +547,8 @@ jobs:
       - name: Extract the vendored candidate A tree
         run: tar -xf vendor-sourcefed.tar -C .
 
-      - name: Make the downloaded candidate B binary executable
-        run: chmod +x rust/target/release/stall-b
+      - name: Make the downloaded candidate binaries executable
+        run: chmod +x rust/target/release/stall-b rust/target/release/stall-c
 
       - name: Measure fault isolation with plugins that throw
         env:
@@ -515,7 +562,7 @@ jobs:
             WINDOW=30
           fi
           node scripts/matrix.mjs \
-            --variants ts,rust-seq,rust-realm \
+            --variants ts,rust-seq,rust-realm,rust-djs \
             --scenario fault \
             --monitors 20 \
             --chaos throw \
@@ -536,7 +583,7 @@ jobs:
             WINDOW=30
           fi
           node scripts/matrix.mjs \
-            --variants ts,rust-seq,rust-realm \
+            --variants ts,rust-seq,rust-realm,rust-djs \
             --scenario fault \
             --monitors 20 \
             --chaos loop \
@@ -577,7 +624,7 @@ jobs:
     name: In-memory storage at 100 and 500 monitors (storage-isolated variant)
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: spike/stall-runtime
@@ -602,6 +649,12 @@ jobs:
           name: stall-b
           path: spike/stall-runtime/rust/target/release
 
+      - name: Download the candidate C binary (the same Rust stall with the djs engine)
+        uses: actions/download-artifact@v4
+        with:
+          name: stall-c
+          path: spike/stall-runtime/rust/target/release
+
       - name: Download the built plugin bundles
         uses: actions/download-artifact@v4
         with:
@@ -611,8 +664,8 @@ jobs:
       - name: Extract the vendored candidate A tree
         run: tar -xf vendor-sourcefed.tar -C .
 
-      - name: Make the downloaded candidate B binary executable
-        run: chmod +x rust/target/release/stall-b
+      - name: Make the downloaded candidate binaries executable
+        run: chmod +x rust/target/release/stall-b rust/target/release/stall-c
 
       - name: Measure steady state with the in-memory store at 100 monitors
         env:
@@ -626,7 +679,7 @@ jobs:
             WINDOW=30
           fi
           node scripts/matrix.mjs \
-            --variants ts,rust-seq,rust-realm \
+            --variants ts,rust-seq,rust-realm,rust-djs \
             --scenario steady \
             --monitors 100 \
             --runs "$RUNS" \
@@ -641,7 +694,7 @@ jobs:
         if: inputs.mode != 'smoke'
         run: |
           node scripts/matrix.mjs \
-            --variants ts,rust-seq,rust-realm \
+            --variants ts,rust-seq,rust-realm,rust-djs \
             --scenario steady \
             --monitors 500 \
             --runs 5 \
@@ -684,7 +737,7 @@ jobs:
     name: Ramp to the monitor count where each candidate's polls fall behind
     needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: spike/stall-runtime
@@ -709,6 +762,12 @@ jobs:
           name: stall-b
           path: spike/stall-runtime/rust/target/release
 
+      - name: Download the candidate C binary (the same Rust stall with the djs engine)
+        uses: actions/download-artifact@v4
+        with:
+          name: stall-c
+          path: spike/stall-runtime/rust/target/release
+
       - name: Download the built plugin bundles
         uses: actions/download-artifact@v4
         with:
@@ -718,8 +777,8 @@ jobs:
       - name: Extract the vendored candidate A tree
         run: tar -xf vendor-sourcefed.tar -C .
 
-      - name: Make the downloaded candidate B binary executable
-        run: chmod +x rust/target/release/stall-b
+      - name: Make the downloaded candidate binaries executable
+        run: chmod +x rust/target/release/stall-b rust/target/release/stall-c
 
       - name: Find the monitor count where each candidate's polls fall behind
         env:
@@ -735,7 +794,7 @@ jobs:
           failed=""
           for monitors in $SIZES; do
             node scripts/matrix.mjs \
-              --variants ts,rust-seq,rust-realm \
+              --variants ts,rust-seq,rust-realm,rust-djs \
               --scenario steady \
               --monitors "$monitors" \
               --runs 1 \
@@ -924,7 +983,7 @@ jobs:
             printf '# Stall runtime spike\n\nNo measurement run files were produced in this workflow run.\n' > results/summary.md
           fi
           cat results/summary.md >> "$GITHUB_STEP_SUMMARY"
-          printf '\nEvery table names the scenario, monitors, candidate, scheduler, chaos and store of its group.\n' >> "$GITHUB_STEP_SUMMARY"
+          printf '\nEvery table names the scenario, monitors, candidate, scheduler, engine, chaos and store of its group.\n' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the aggregated results
         if: always()

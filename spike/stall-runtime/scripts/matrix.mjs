@@ -3,7 +3,7 @@
 // Variants are interleaved by run index so runner drift hits them all alike.
 //
 // Usage (from spike/stall-runtime):
-//   node scripts/matrix.mjs --variants ts,rust-seq,rust-realm --scenario steady \
+//   node scripts/matrix.mjs --variants ts,rust-seq,rust-realm,rust-djs --scenario steady \
 //     --monitors 100 --runs 10 --interval 15 --window 45 --out results/steady-100
 // --interval is the monitor poll interval in seconds, passed to every run.
 
@@ -16,6 +16,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const HARNESS = join(ROOT, 'harness/run.mjs');
 const PLUGINS = join(ROOT, 'plugins-dist');
 const RUST_BINARY = join(ROOT, 'rust/target/release/stall-b');
+const RUST_DJS_BINARY = join(ROOT, 'rust/target/release/stall-c');
 const OUTPUT_LIMIT = 256 * 1024;
 const TIMEOUT_SLACK_MS = 180_000;
 
@@ -23,6 +24,12 @@ const VARIANTS = {
   ts: { candidate: 'ts', scheduler: null, stallCmd: join(ROOT, '.vendor/sourcefed/.spike/stall-a.mjs') },
   'rust-seq': { candidate: 'rust', scheduler: 'seq', stallCmd: RUST_BINARY },
   'rust-realm': { candidate: 'rust', scheduler: 'realm', stallCmd: RUST_BINARY },
+  // The same Rust stall twice: stall-b builds the plugin realms in QuickJS, stall-c in djs.
+  // Only stall-c is told which engine to use, because stall-b's engine is compiled in.
+  'rust-djs': {
+    candidate: 'rust', scheduler: 'realm', stallCmd: RUST_DJS_BINARY, engine: 'djs',
+    build: 'cargo build --release --no-default-features --features engine-djs --manifest-path rust/Cargo.toml, then copy rust/target/release/stall-b to rust/target/release/stall-c',
+  },
 };
 
 const DEFAULTS = {
@@ -94,6 +101,7 @@ function invocation(variant, run, cfg) {
     args.push('--scheduler', spec.scheduler);
     args.push('--env', `STALL_PLUGIN_DIR=${PLUGINS}`);
     args.push('--env', `STALL_SCHEDULER=${spec.scheduler}`);
+    if (spec.engine) args.push('--env', `STALL_ENGINE=${spec.engine}`);
   }
   for (const pair of cfg.env) args.push('--env', pair);
   return { args, out };
@@ -137,7 +145,10 @@ async function main() {
   if (!existsSync(HARNESS)) fail(`harness not found at ${HARNESS}`);
   for (const variant of cfg.variants) {
     const spec = VARIANTS[variant];
-    if (!existsSync(spec.stallCmd)) fail(`${variant}: stall command not found at ${spec.stallCmd}`);
+    if (!existsSync(spec.stallCmd)) {
+      const hint = spec.build ? `; build it with ${spec.build}` : '';
+      fail(`${variant}: stall command not found at ${spec.stallCmd}${hint}`);
+    }
     if (spec.candidate === 'rust' && !existsSync(PLUGINS)) fail(`rust: plugin bundles not found at ${PLUGINS}`);
   }
 
