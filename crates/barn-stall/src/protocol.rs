@@ -31,14 +31,6 @@ pub const fn fits_line(len: usize) -> bool {
     len <= MAX_LINE_BYTES
 }
 
-/// Whether a body fits the default cap a grant sets.
-///
-/// [`DEFAULT_MAX_BODY_BYTES`] is the cap barn applies when a grant sets none.
-#[must_use]
-pub const fn fits_default_body(len: usize) -> bool {
-    len <= DEFAULT_MAX_BODY_BYTES
-}
-
 /// The names of the protocol's methods.
 pub mod method {
     /// barn to stall: start, which returns the stall's jobs.
