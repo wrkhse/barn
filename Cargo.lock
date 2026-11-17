@@ -63,11 +63,8 @@ dependencies = [
 name = "barn-stall"
 version = "0.1.0"
 dependencies = [
- "itoa 1.0.9",
  "serde",
  "serde_json",
- "smallvec",
- "snap",
 ]
 
 [[package]]
@@ -127,11 +124,6 @@ name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
-
-[[package]]
-name = "itoa"
-version = "1.0.9"
-source = "git+https://github.com/dtolnay/itoa?tag=1.0.9#81c115b833792b698cbac1af2d37d707c6a641ee"
 
 [[package]]
 name = "itoa"
@@ -205,24 +197,12 @@ version = "1.0.154"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
 dependencies = [
- "itoa 1.0.19",
+ "itoa",
  "memchr",
  "serde",
  "serde_core",
  "zmij",
 ]
-
-[[package]]
-name = "smallvec"
-version = "1.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a55ca5f3b68e41c979bf8c46a6f1da892ca4db8f94023ce0bd32407573b1ac0"
-
-[[package]]
-name = "snap"
-version = "1.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 
 [[package]]
 name = "strsim"

@@ -12,10 +12,6 @@
 //!
 //! [protocol]: https://github.com/wrkhse/barn/blob/main/docs/stall-protocol.md
 
-// The proof commit's licence break, kept as a real dependency of this crate so
-// the licences check sees it.
-use snap as _;
-
 pub mod protocol;
 
 pub use protocol::{
