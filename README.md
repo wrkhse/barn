@@ -25,8 +25,8 @@ and how to build and gate is [AGENTS.md](AGENTS.md).
 
 ## Layout
 
-| Path                | What it holds                                  |
-| ------------------- | ---------------------------------------------- |
-| `crates/barn`       | the `barn` binary and the library it stands on |
-| `crates/barn-stall` | the Rust stall SDK                             |
-| `docs`              | the stall protocol and what the plan fixes     |
+| Path | What it holds |
+| --- | --- |
+| `crates/barn` | the `barn` binary and the library it stands on |
+| `crates/barn-stall` | the Rust stall SDK |
+| `docs` | the stall protocol and what the plan fixes |
