@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 clap.workspace = true
+itoa = "1"
 
 [lints]
 workspace = true

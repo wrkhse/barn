@@ -101,7 +101,9 @@ impl CliCommand {
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     let typed = cli.command.typed();
-    eprintln!("barn {typed}: not built yet. B1 builds the supervisor that answers it.");
+    eprintln!(
+        "barn {typed}: not built yet. B1 builds the supervisor that answers it in its own process."
+    );
     ExitCode::FAILURE
 }
 
