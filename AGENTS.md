@@ -34,6 +34,10 @@ stall's own JavaScript, which `barn-plugin-host` runs when that crate exists.
 | `crates/barn`            | the `barn` binary: today the command line, later the supervisor                    |
 | `crates/barn-stall`      | the Rust stall SDK: the protocol's version, limits, method names and message types |
 | `docs/stall-protocol.md` | the protocol as it is fixed; anything not fixed is marked "for B1 to confirm"      |
+| `docs/grant.md`          | the grant contract and its planned crate                                           |
+| `docs/steering.md`       | the steering contract and its planned crate                                        |
+| `docs/approvals.md`      | the approvals contract and its planned crate                                       |
+| `docs/control.md`        | the control contract and its planned crate                                         |
 
 ## Build and gate
 

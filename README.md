@@ -23,10 +23,12 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1). The
 protocol's fixed parts are in [docs/stall-protocol.md](docs/stall-protocol.md),
 and how to build and gate is [AGENTS.md](AGENTS.md).
 
+The four layer-1 contracts and their planned crates live here: [grant](docs/grant.md), [steering](docs/steering.md), [approvals](docs/approvals.md) and [control](docs/control.md).
+
 ## Layout
 
 | Path                | What it holds                                  |
 | ------------------- | ---------------------------------------------- |
 | `crates/barn`       | the `barn` binary and the library it stands on |
 | `crates/barn-stall` | the Rust stall SDK                             |
-| `docs`              | the stall protocol and what the plan fixes     |
+| `docs`              | the stall protocol and the layer-1 contracts |
