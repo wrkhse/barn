@@ -35,11 +35,8 @@ method names and message types.
 
 ## Roadmap
 
-- [x] Rust stall SDK: the protocol's version, limits, method names and message
-      types
-- [x] The `barn` command line: `status`, `stalls`, `run` and `logs`
-- [ ] The supervisor behind those commands: start, restart and upgrade stalls,
-      hold their listeners ([barn#1](https://github.com/wrkhse/barn/issues/1))
+- [ ] The supervisor: start, restart and upgrade stalls and hold their listeners
+      ([barn#1](https://github.com/wrkhse/barn/issues/1))
 - [ ] [Broker](https://github.com/wrkhse/barn/issues/9),
       [gateway](https://github.com/wrkhse/barn/issues/10),
       [sandbox](https://github.com/wrkhse/barn/issues/11) and
