@@ -1,6 +1,6 @@
 [package]
 name = "barn-stall"
-description = "The Rust stall SDK: the types a stall speaks to barn with."
+description = "The Rust stall SDK: the types a stall speaks to barn with, and the serve loop it runs."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,9 +10,11 @@ repository.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "rt", "sync", "time"] }
 
 [dev-dependencies]
-serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
 workspace = true

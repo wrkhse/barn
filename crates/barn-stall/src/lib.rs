@@ -12,9 +12,17 @@
 //!
 //! [protocol]: https://github.com/wrkhse/barn/blob/main/docs/stall-protocol.md
 
+pub mod frame;
 pub mod protocol;
+pub mod rpc;
 
+pub use frame::Lines;
 pub use protocol::{
-    BodyEncoding, DEFAULT_MAX_BODY_BYTES, DENIED_CODE, Headers, Job, MAX_LINE_BYTES, NetAuth,
-    NetRequestParams, NetResponse, PROTOCOL_VERSION, StallStartParams, StallStartResult, method,
+    AuthScheme, BodyEncoding, DEFAULT_MAX_BODY_BYTES, DENIED_CODE, DrainParams, DrainResult,
+    DurationError, Headers, HealthResult, Job, JobRunParams, JobRunResult, LogLevel, LogParams,
+    MAX_LINE_BYTES, NO_SUCH_METHOD, NetAuth, NetRequestParams, NetResponse, PROTOCOL_VERSION,
+    StallStartAnswer, StallStartParams, Token, VERSION_REFUSED, method, parse_duration,
+};
+pub use rpc::{
+    Answer, ErrorObject, JsonRpc, Message, Notification, Request, RpcError, StrictReason,
 };
