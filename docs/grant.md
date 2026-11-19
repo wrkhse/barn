@@ -35,12 +35,12 @@ Decided 2026-11-02:
 - **Profiles live only in the user's config**, `~/.config/workhorse/profiles/`, written in TOML and validated against a published JSON Schema. A repository is untrusted input: it can name a profile, never grant anything.
 - **Grants are visible.** Each session prints a one-screen summary of its grant when it starts, `workhorse status` shows every session's grant and recent denials, and an approval shows the exact change it would make.
 
-| Part of a grant | Example | Enforced by | Changes live |
-|---|---|---|---|
-| Files | `~/code/x`, read-write | `sandbox` | No: restart and resume |
-| Network | `api.github.com` with secret `github-token` | `broker` | Yes |
-| Tools | `github: issues.*` | `gateway` | Yes |
-| Limits | 64 processes, 4 GB | `sandbox` | No: restart and resume |
+| Part of a grant | Example                                     | Enforced by | Changes live           |
+| --------------- | ------------------------------------------- | ----------- | ---------------------- |
+| Files           | `~/code/x`, read-write                      | `sandbox`   | No: restart and resume |
+| Network         | `api.github.com` with secret `github-token` | `broker`    | Yes                    |
+| Tools           | `github: issues.*`                          | `gateway`   | Yes                    |
+| Limits          | 64 processes, 4 GB                          | `sandbox`   | No: restart and resume |
 
 ## Open questions
 

@@ -31,4 +31,4 @@ The four layer-1 contracts and their planned crates live here: [grant](docs/gran
 | ------------------- | ---------------------------------------------- |
 | `crates/barn`       | the `barn` binary and the library it stands on |
 | `crates/barn-stall` | the Rust stall SDK                             |
-| `docs`              | the stall protocol and the layer-1 contracts |
+| `docs`              | the stall protocol and the layer-1 contracts   |
