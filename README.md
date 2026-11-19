@@ -1,34 +1,56 @@
 # barn
 
-barn is the only daemon on a wrkhse machine. Every project ships a **stall** —
-its own logic, in a child process — and barn owns the rest: starting, restarting
-and upgrading it, every listener clients connect to, logs and health, the
-sandbox, secrets, the network, webhooks and MCP.
+barn is the only daemon on a wrkhse machine. Each project ships a **stall**
+holding only its own logic: its request handlers, its background jobs and the
+events it emits.
 
-## Status
+barn starts each stall in its own sandboxed child process, holds every
+listener, and brokers the network, secrets, webhooks, MCP and upgrades.
 
-The repository and its gates are in place (slice B0). The supervisor is B1, so
-the commands below are the surface the plan fixes: each one says what is not
-built yet and exits non-zero.
+## Install
+
+With Rust 1.100.0 installed, install the CLI from the pinned source revision:
 
 ```sh
-barn status
-barn stalls
-barn stalls restart sourcefed
-barn run sourcefed
-barn logs sourcefed --follow
+cargo install --git https://github.com/wrkhse/barn \
+  --rev 521d5f88e565244e72cb2071815579afbb23a038 --locked barn
 ```
 
-The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1). The
-protocol's fixed parts are in [docs/stall-protocol.md](docs/stall-protocol.md),
-and how to build and gate is [AGENTS.md](AGENTS.md).
+## Check the version
 
-The four layer-1 contracts and their planned crates live here: [grant](docs/grant.md), [steering](docs/steering.md), [approvals](docs/approvals.md) and [control](docs/control.md).
+```text
+$ barn --version
+barn 0.1.0
+```
 
-## Layout
+## Write a stall in Rust
 
-| Path                | What it holds                                  |
-| ------------------- | ---------------------------------------------- |
-| `crates/barn`       | the `barn` binary and the library it stands on |
-| `crates/barn-stall` | the Rust stall SDK                             |
-| `docs`              | the stall protocol and the layer-1 contracts   |
+```toml
+[dependencies]
+barn-stall = { git = "https://github.com/wrkhse/barn", rev = "521d5f88e565244e72cb2071815579afbb23a038" }
+```
+
+The crate holds the [stall protocol](docs/stall-protocol.md)'s version, limits,
+method names and message types.
+
+## Roadmap
+
+- [x] Rust stall SDK: the protocol's version, limits, method names and message
+      types
+- [x] The `barn` command line: `status`, `stalls`, `run` and `logs`
+- [ ] The supervisor behind those commands: start, restart and upgrade stalls,
+      hold their listeners ([barn#1](https://github.com/wrkhse/barn/issues/1))
+- [ ] [Broker](https://github.com/wrkhse/barn/issues/9),
+      [gateway](https://github.com/wrkhse/barn/issues/10),
+      [sandbox](https://github.com/wrkhse/barn/issues/11) and
+      [conformance](https://github.com/wrkhse/barn/issues/12)
+- [ ] [The workhorse stall and CLI](https://github.com/wrkhse/barn/issues/13)
+- [ ] Contracts: [grant](https://github.com/wrkhse/barn/issues/14),
+      [steering](https://github.com/wrkhse/barn/issues/15),
+      [approvals](https://github.com/wrkhse/barn/issues/16),
+      [control](https://github.com/wrkhse/barn/issues/17)
+
+## More
+
+- [Stall protocol](docs/stall-protocol.md)
+- [Contributor and agent guidance](AGENTS.md)
