@@ -1,9 +1,9 @@
 # barn
 
 barn is a daemon engine that makes sandboxing and enforcement easy. It ships as
-tack's daemon module: each tool's daemon runs as a sandboxed **stall** holding
-only its own logic, its request handlers, background jobs and events, and barn
-enforces its grants, secrets and limits.
+tack's daemon module: each tool's daemon runs as a sandboxed **stall** that
+holds only its own logic (request handlers, background jobs and events), and
+barn enforces its grants, secrets and limits.
 
 barn starts each stall in its own sandboxed child process, holds every
 listener, and brokers the network, secrets, webhooks, MCP and upgrades.
@@ -14,8 +14,8 @@ Every listener, socket and secret on a wrkhse machine lives in barn. A project
 ships a **stall**, not a daemon: an adapter holding only its request
 handlers, background jobs and events. Built on barn's stall SDK, a stall speaks
 the [stall protocol](docs/stall-protocol.md) over a socket it inherits from
-barn, so it can be written in any language. The SDK comes as a Rust crate and a
-TypeScript package.
+barn, so it can be written in any language. The SDK comes as a Rust crate, and stall
+scripts are Luau, typed by `stall.d.luau`.
 
 A stall runs in its own sandboxed child process under only what its grant
 allows: a sandbox profile, no direct network and no secrets in its environment.
@@ -26,7 +26,7 @@ webhooks and MCP.
 ```mermaid
 flowchart LR
     CL["clients: OpenCode, Pi, CLI,<br/>adapters"] -- "HTTP, SSE, JSON-RPC,<br/>webhooks" --> L
-    subgraph B["barn: the only daemon"]
+    subgraph B["barn: tack's daemon module"]
         L["listeners"]
         S["supervisor<br/>start, health, restart, logs"]
         BR["broker<br/>grants, secrets, budgets"]
