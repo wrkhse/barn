@@ -1,8 +1,9 @@
 # barn
 
-barn is the only daemon on a wrkhse machine. Each project ships a **stall**
-holding only its own logic: its request handlers, its background jobs and the
-events it emits.
+barn is a daemon engine that makes sandboxing and enforcement easy. It ships as
+tack's daemon module: each tool's daemon runs as a sandboxed **stall** holding
+only its own logic, its request handlers, background jobs and events, and barn
+enforces its grants, secrets and limits.
 
 barn starts each stall in its own sandboxed child process, holds every
 listener, and brokers the network, secrets, webhooks, MCP and upgrades.
