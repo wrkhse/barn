@@ -16,10 +16,41 @@ yanked = "deny"
 # it, so an unused allowance never hides a licence nobody read.
 allow = ["Apache-2.0", "MIT", "Unicode-3.0"]
 
+# nono -> sigstore-verify pulls in foldhash, which is Zlib-licensed.
+[[licenses.exceptions]]
+allow = ["Zlib"]
+crate = "foldhash@=0.2.0"
+
+# nono -> sigstore-verify pulls in rustls-webpki, which is ISC-licensed.
+[[licenses.exceptions]]
+allow = ["ISC"]
+crate = "rustls-webpki@=0.103.17"
+
+# nono -> sigstore-verify pulls in untrusted, which is ISC-licensed.
+[[licenses.exceptions]]
+allow = ["ISC"]
+crate = "untrusted@=0.9.0"
+
 [bans]
 multiple-versions = "deny"
 wildcards = "deny"
 allow-wildcard-paths = true
+# nono -> sigstore-verify keeps these older versions in the tree; skipping
+# them leaves multiple-versions = "deny" and the rest of the gate unchanged.
+skip = [
+  # nono -> sigstore-verify keeps const-oid 0.9.6 beside the newer version.
+  { crate = "const-oid@0.9.6", reason = "nono -> sigstore-verify duplicate" },
+  # nono -> sigstore-verify keeps der 0.7.10 beside the newer version.
+  { crate = "der@0.7.10", reason = "nono -> sigstore-verify duplicate" },
+  # nono -> sigstore-verify keeps der_derive 0.7.3 beside the newer version.
+  { crate = "der_derive@0.7.3", reason = "nono -> sigstore-verify duplicate" },
+  # nono -> sigstore-verify keeps spki 0.7.3 beside the newer version.
+  { crate = "spki@0.7.3", reason = "nono -> sigstore-verify duplicate" },
+  # nono -> sigstore-verify keeps syn 2.0.119 beside the newer version.
+  { crate = "syn@2.0.119", reason = "nono -> sigstore-verify duplicate" },
+  # nono -> sigstore-verify keeps x509-cert 0.2.5 beside the newer version.
+  { crate = "x509-cert@0.2.5", reason = "nono -> sigstore-verify duplicate" },
+]
 
 [sources]
 unknown-registry = "deny"
