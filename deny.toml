@@ -46,8 +46,9 @@ skip = [
   { crate = "der_derive@0.7.3", reason = "nono -> sigstore-verify duplicate" },
   # nono -> sigstore-verify keeps spki 0.7.3 beside the newer version.
   { crate = "spki@0.7.3", reason = "nono -> sigstore-verify duplicate" },
-  # nono -> sigstore-verify keeps syn 2.0.119 beside the newer version.
-  { crate = "syn@2.0.119", reason = "nono -> sigstore-verify duplicate" },
+  # Proc-macro crates (der_derive, tracing-attributes, zeroize_derive and
+  # others) keep syn 2.0.119 beside the newer version.
+  { crate = "syn@2.0.119", reason = "many proc-macro crates depend on it" },
   # nono -> sigstore-verify keeps x509-cert 0.2.5 beside the newer version.
   { crate = "x509-cert@0.2.5", reason = "nono -> sigstore-verify duplicate" },
 ]
