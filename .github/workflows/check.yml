@@ -91,9 +91,10 @@ jobs:
         run: |
           channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+      # The pin matches the version installed locally.
       - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
-          tool: cargo-deny@0.20.2
+          tool: cargo-deny@0.22.0
       # Licences, advisories, sources and bans, as deny.toml sets them.
       - run: cargo deny check
 
