@@ -106,6 +106,23 @@ fn check_empty_grant(grant: &Grant, caps: &CapabilitySet, tree: &Tree) {
 }
 
 #[test]
+fn only_granted_hosts_are_allowed() {
+    let grant = Grant {
+        network_hosts: vec!["example.com".to_owned(), "api.github.com".to_owned()],
+        ..Grant::default()
+    };
+
+    let decisions = [
+        grant.allows_host("example.com"),
+        grant.allows_host("api.github.com"),
+        grant.allows_host("ungranted.example"),
+        grant.allows_host(""),
+    ];
+
+    assert_eq!(decisions, [true, true, false, false]);
+}
+
+#[test]
 fn the_built_set_has_granted_modes_and_no_dns() -> Result<(), Box<dyn Error>> {
     let tree = Tree::new()?;
     let grant = Grant {
