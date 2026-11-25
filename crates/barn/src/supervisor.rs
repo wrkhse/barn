@@ -1012,35 +1012,38 @@ mod tests {
         ));
     }
 
+    // A `Vec` sink never blocks, so a reply too large for a pipe still
+    // returns and the exact bytes decide the test.
     #[tokio::test]
     async fn a_reply_that_fits_is_written_as_one_line() {
-        let (mut barn, mut stall) = tokio::io::duplex(1024);
-
-        assert!(matches!(send_reply(&mut barn, &json!(1), "").await, Ok(())));
-        drop(barn);
-
         let mut written = Vec::new();
-        let read = stall.read_to_end(&mut written).await.ok();
 
-        assert_eq!(read, Some(EMPTY_REPLY.len()));
+        assert!(matches!(
+            send_reply(&mut written, &json!(1), "").await,
+            Ok(())
+        ));
         assert_eq!(written, EMPTY_REPLY);
+
+        let exact = filling_state();
+        let line = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"state":"{exact}"}}}}"#);
+        let mut written = Vec::new();
+
+        assert!(matches!(
+            send_reply(&mut written, &json!(1), &exact).await,
+            Ok(())
+        ));
+        assert_eq!(written, format!("{line}\n").into_bytes());
     }
 
     #[tokio::test]
     async fn an_oversized_reply_is_answered_with_the_line_limit_error() {
-        let (mut barn, mut stall) = tokio::io::duplex(1024);
         let above = format!("{}a", filling_state());
+        let mut written = Vec::new();
 
         assert!(matches!(
-            send_reply(&mut barn, &json!(1), &above).await,
+            send_reply(&mut written, &json!(1), &above).await,
             Err(SupervisorError::FrameTooLarge)
         ));
-        drop(barn);
-
-        let mut written = Vec::new();
-        let read = stall.read_to_end(&mut written).await.ok();
-
-        assert_eq!(read, Some(OVERSIZE_REPLY.len()));
         assert_eq!(written, OVERSIZE_REPLY);
     }
 
