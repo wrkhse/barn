@@ -9,8 +9,12 @@ publish.workspace = true
 repository.workspace = true
 
 [dependencies]
+barn-stall = { path = "../barn-stall" }
 clap.workspace = true
 nono.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true
