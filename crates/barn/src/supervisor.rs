@@ -16,8 +16,8 @@ use barn_stall::{StallStartParams, StallStartResult};
 use nono::{NonoError, SandboxState, UnixSocketMode};
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::io::BufReader;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
+use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
 use tokio::time::{sleep, timeout};
@@ -30,6 +30,7 @@ const CRASH_WINDOW: Duration = Duration::from_mins(10);
 const CRASH_LIMIT: usize = 5;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const TOKEN_BYTES: usize = 32;
+const TOKEN_TTL: Duration = Duration::from_secs(30);
 const PRIVATE_DIR: u32 = 0o700;
 const PRIVATE_FILE: u32 = 0o600;
 const SOCKET_FILE: &str = "proto.sock";
@@ -77,7 +78,13 @@ struct Transport {
     run_dir: RunDir,
     state: String,
     uid: u32,
-    token: Option<String>,
+    token: Option<Token>,
+}
+
+/// A start token and the moment it stops being accepted.
+struct Token {
+    secret: String,
+    expires_at: Instant,
 }
 
 struct Prepared {
@@ -284,6 +291,9 @@ pub enum SupervisorError {
     /// The token has already been spent.
     #[error("stall token already spent")]
     TokenSpent,
+    /// The token's deadline has passed; it is dropped unspent.
+    #[error("stall token expired")]
+    TokenExpired,
 }
 
 type Result<T> = std::result::Result<T, SupervisorError>;
@@ -340,7 +350,10 @@ impl Supervisor {
             .kill_on_drop(true)
             .spawn();
         let child = io_at("spawning barn-exec", child)?;
+        let started = Instant::now();
         let pid = child.id().ok_or(SupervisorError::MissingChildPid)?;
+        // A deadline past the clock's range fails closed: the token expires now.
+        let expires_at = started.checked_add(TOKEN_TTL).unwrap_or(started);
 
         Ok(RunningStall {
             child,
@@ -350,11 +363,14 @@ impl Supervisor {
                 run_dir: prepared.run_dir,
                 state: prepared.state,
                 uid: prepared.uid,
-                token: Some(prepared.token),
+                token: Some(Token {
+                    secret: prepared.token,
+                    expires_at,
+                }),
             },
             supervisor: self,
             spec,
-            started: Instant::now(),
+            started,
             epoch,
             restart,
         })
@@ -434,32 +450,56 @@ impl Transport {
         let mut reader = BufReader::new(stream);
         let (id, params) = match read_start(&mut reader).await {
             Err(SupervisorError::FrameTooLarge) => {
-                io_at(
-                    "answering oversized stall start",
-                    reader.write_all(OVERSIZE_REPLY).await,
-                )?;
+                refuse_oversize(&mut reader).await?;
 
                 return Err(SupervisorError::FrameTooLarge);
             }
             result => result?,
         };
-        spend_token(&mut self.token, &params.token)?;
-
-        let reply = StallStartResult {
-            state: self.state.clone(),
-        };
-        let response = json!({"jsonrpc":"2.0","id":id,"result":reply});
-        let mut frame = serde_json::to_vec(&response)?;
-        frame.push(b'\n');
-
-        if frame.len() > MAX_LINE_BYTES {
-            return Err(SupervisorError::FrameTooLarge);
-        }
-
-        io_at("answering stall start", reader.write_all(&frame).await)?;
+        spend_token(&mut self.token, &params.token, Instant::now())?;
+        send_reply(&mut reader, &id, &self.state).await?;
 
         Ok(reader)
     }
+}
+
+/// Writes the `stall.start` reply, or the oversize error when it cannot fit.
+async fn send_reply<W>(writer: &mut W, id: &Value, state: &str) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    match reply_frame(id, state) {
+        Ok(frame) => io_at("answering stall start", writer.write_all(&frame).await),
+        Err(SupervisorError::FrameTooLarge) => {
+            refuse_oversize(writer).await?;
+
+            Err(SupervisorError::FrameTooLarge)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn refuse_oversize(writer: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
+    io_at(
+        "answering oversized stall start",
+        writer.write_all(OVERSIZE_REPLY).await,
+    )
+}
+
+/// The `stall.start` reply as one newline-terminated line within the limit.
+fn reply_frame(id: &Value, state: &str) -> Result<Vec<u8>> {
+    let reply = StallStartResult {
+        state: state.to_owned(),
+    };
+    let response = json!({"jsonrpc":"2.0","id":id,"result":reply});
+    let mut frame = serde_json::to_vec(&response)?;
+    frame.push(b'\n');
+
+    if frame.len() > MAX_LINE_BYTES {
+        return Err(SupervisorError::FrameTooLarge);
+    }
+
+    Ok(frame)
 }
 
 type StartRequest = (Value, StallStartParams);
@@ -523,17 +563,25 @@ fn verify_peer(pid: Option<i32>, uid: u32, child: u32, owner: u32) -> Result<()>
     Ok(())
 }
 
-fn spend_token(saved: &mut Option<String>, offered: &str) -> Result<()> {
-    let expected = saved.as_ref().ok_or(SupervisorError::TokenSpent)?;
+fn spend_token(saved: &mut Option<Token>, offer: &str, now: Instant) -> Result<()> {
+    let issued = saved.as_ref().ok_or(SupervisorError::TokenSpent)?;
+
+    if now >= issued.expires_at {
+        *saved = None;
+
+        return Err(SupervisorError::TokenExpired);
+    }
+
+    let expected = &issued.secret;
 
     // The length is public; equal-length comparisons touch every byte.
-    if expected.len() != offered.len() {
+    if expected.len() != offer.len() {
         return Err(SupervisorError::InvalidToken);
     }
 
     let mut difference = 0;
 
-    for (left, right) in expected.bytes().zip(offered.bytes()) {
+    for (left, right) in expected.bytes().zip(offer.bytes()) {
         difference |= black_box(left ^ right);
     }
 
@@ -560,11 +608,7 @@ fn prepare(state_dir: &Path, spec: &StallSpec) -> Result<Prepared> {
     }
 
     let program = io_at("resolving stall program", spec.program.canonicalize())?;
-    let grant = Grant {
-        executable: Some(program.clone()),
-        ..spec.grant.clone()
-    };
-    let caps = grant.to_capability_set()?;
+    let caps = pin_executable(&spec.grant, program.clone()).to_capability_set()?;
     let (run_dir, state) = run_paths(state_dir, &spec.name)?;
     let socket = run_dir.path(SOCKET_FILE);
     let listener = io_at("binding stall socket", StdUnixListener::bind(&socket))?;
@@ -596,6 +640,15 @@ fn prepare(state_dir: &Path, spec: &StallSpec) -> Result<Prepared> {
         token,
         program,
     })
+}
+
+/// The grant with its executable set to the program barn-exec runs, so a
+/// symlink that changes after resolution cannot move the policy elsewhere.
+fn pin_executable(grant: &Grant, program: PathBuf) -> Grant {
+    Grant {
+        executable: Some(program),
+        ..grant.clone()
+    }
 }
 
 fn run_paths(state_dir: &Path, name: &str) -> Result<(RunDir, String)> {
@@ -727,23 +780,58 @@ mod tests {
         ));
     }
 
+    fn issued(expires_at: Instant) -> Token {
+        Token {
+            secret: "secret".to_owned(),
+            expires_at,
+        }
+    }
+
     #[test]
     fn only_the_exact_token_is_spent() {
-        let mut saved = Some("secret".to_owned());
+        let now = Instant::now();
+        let deadline = now.checked_add(TOKEN_TTL).expect("the deadline fits");
+        let mut saved = Some(issued(deadline));
 
         for offered in ["secre", "secrets", "xecret", "secrex", "secreT"] {
             assert!(matches!(
-                spend_token(&mut saved, offered),
+                spend_token(&mut saved, offered, now),
                 Err(SupervisorError::InvalidToken)
             ));
         }
 
-        assert!(spend_token(&mut saved, "secret").is_ok());
-        assert_eq!(saved, None);
+        assert!(matches!(spend_token(&mut saved, "secret", now), Ok(())));
+        assert!(saved.is_none());
         assert!(matches!(
-            spend_token(&mut saved, "secret"),
+            spend_token(&mut saved, "secret", now),
             Err(SupervisorError::TokenSpent)
         ));
+    }
+
+    #[test]
+    fn a_token_expires_at_its_deadline() {
+        let start = Instant::now();
+        let deadline = start.checked_add(TOKEN_TTL).expect("the deadline fits");
+        let before = deadline
+            .checked_sub(Duration::from_nanos(1))
+            .expect("the instant before the deadline fits");
+        let after = deadline
+            .checked_add(Duration::from_secs(1))
+            .expect("the instant after the deadline fits");
+
+        let mut saved = Some(issued(deadline));
+        assert!(matches!(spend_token(&mut saved, "secret", before), Ok(())));
+        assert!(saved.is_none());
+
+        for now in [deadline, after] {
+            let mut saved = Some(issued(deadline));
+
+            assert!(matches!(
+                spend_token(&mut saved, "secret", now),
+                Err(SupervisorError::TokenExpired)
+            ));
+            assert!(saved.is_none());
+        }
     }
 
     #[test]
@@ -868,5 +956,111 @@ mod tests {
         }
 
         assert!(matches!(decode_start(b"["), Err(SupervisorError::Json(_))));
+    }
+
+    #[test]
+    fn an_id_above_the_signed_range_is_accepted() {
+        let request = json!({
+            "jsonrpc": "2.0", "id": u64::MAX, "method": "stall.start",
+            "params": {"protocol": 1, "token": "secret"}
+        });
+        let frame = request.to_string();
+
+        assert_eq!(
+            decode_start(frame.as_bytes()).ok(),
+            Some((
+                json!(u64::MAX),
+                StallStartParams {
+                    protocol: 1,
+                    token: "secret".to_owned()
+                }
+            ))
+        );
+    }
+
+    /// The reply to id 1 with an empty state, newline included.
+    const EMPTY_REPLY: &[u8] = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"#,
+        r#""result":{"state":""}}"#,
+        "\n"
+    )
+    .as_bytes();
+
+    /// A state that makes the reply to id 1 exactly `MAX_LINE_BYTES` long.
+    fn filling_state() -> String {
+        "a".repeat(MAX_LINE_BYTES.saturating_sub(EMPTY_REPLY.len()))
+    }
+
+    #[test]
+    fn a_reply_fills_the_line_limit_and_no_more() {
+        assert_eq!(reply_frame(&json!(1), "").ok(), Some(EMPTY_REPLY.to_vec()));
+
+        let exact = filling_state();
+        let below = exact.get(1..).unwrap_or_default().to_owned();
+        let above = format!("{exact}a");
+        let length = |state: &str| {
+            let frame = reply_frame(&json!(1), state);
+
+            frame.map(|frame| frame.len())
+        };
+
+        assert_eq!(length(&below).ok(), Some(MAX_LINE_BYTES.saturating_sub(1)));
+        assert_eq!(length(&exact).ok(), Some(MAX_LINE_BYTES));
+        assert!(matches!(
+            length(&above),
+            Err(SupervisorError::FrameTooLarge)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_fits_is_written_as_one_line() {
+        let (mut barn, mut stall) = tokio::io::duplex(1024);
+
+        assert!(matches!(send_reply(&mut barn, &json!(1), "").await, Ok(())));
+        drop(barn);
+
+        let mut written = Vec::new();
+        let read = stall.read_to_end(&mut written).await.ok();
+
+        assert_eq!(read, Some(EMPTY_REPLY.len()));
+        assert_eq!(written, EMPTY_REPLY);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_reply_is_answered_with_the_line_limit_error() {
+        let (mut barn, mut stall) = tokio::io::duplex(1024);
+        let above = format!("{}a", filling_state());
+
+        assert!(matches!(
+            send_reply(&mut barn, &json!(1), &above).await,
+            Err(SupervisorError::FrameTooLarge)
+        ));
+        drop(barn);
+
+        let mut written = Vec::new();
+        let read = stall.read_to_end(&mut written).await.ok();
+
+        assert_eq!(read, Some(OVERSIZE_REPLY.len()));
+        assert_eq!(written, OVERSIZE_REPLY);
+    }
+
+    #[test]
+    fn the_policy_grants_the_resolved_program() {
+        let grant = Grant {
+            read_paths: vec!["/read".into()],
+            write_paths: vec!["/write".into()],
+            network_hosts: vec!["example.com".to_owned()],
+            executable: Some("/link".into()),
+        };
+
+        assert_eq!(
+            pin_executable(&grant, "/resolved".into()),
+            Grant {
+                read_paths: vec!["/read".into()],
+                write_paths: vec!["/write".into()],
+                network_hosts: vec!["example.com".to_owned()],
+                executable: Some("/resolved".into()),
+            }
+        );
     }
 }

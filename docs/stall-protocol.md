@@ -20,12 +20,19 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
   the socket. A missing peer PID fails authentication. barn checks and spends
   the token, then returns the absolute path of the stall's state folder,
   `state_dir/<stall>`.
+- The token expires 30 seconds after barn spawns the stall. A `stall.start`
+  that arrives at or after that deadline is refused as `TokenExpired`: barn
+  drops the token unspent and closes the connection without a reply, so only a
+  restart issues a new one.
 - One JSON-RPC 2.0 message per line, each terminated by `\n`.
 - A line is at most 8 MiB in bytes, its terminating newline included,
   `MAX_LINE_BYTES` in `barn-stall`. A longer line is answered with `-32600` and
   an `id` of `null`, because the line was never parsed, and then the connection
-  closes, as Chauffeur v2's socket server does. _For B1 to confirm: the error's
-  message, which Chauffeur v2 words "the request line is over 1 MiB"._
+  closes, as Chauffeur v2's socket server does. barn's own `stall.start` reply
+  is held to the same limit: a reply that would be longer is never sent, and
+  the stall gets the same `-32600` line before the connection closes. _For B1
+  to confirm: the error's message, which Chauffeur v2 words "the request line is
+  over 1 MiB"._
 - Calls in flight are bounded. _For B1 to confirm: the bound, and what a stall is
   sent when its answers would exceed it._
 - Bodies are inline, and the cap counts decoded bytes: at most 4 MiB, the

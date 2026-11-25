@@ -1,10 +1,111 @@
-//! Restart and health decisions, without spawning or signalling a process.
+//! Restart, health and run root decisions, without spawning or signalling a
+//! process. The run root tests name a helper that does not exist, so even a
+//! start that passes the run root check cannot start one.
 
+use std::fs;
+use std::io;
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use barn::Grant;
 use barn::supervisor::{
     HealthCheck, HealthDecision, HealthTracker, RestartDecision, RestartPolicy,
 };
+use barn::supervisor::{StallSpec, Supervisor, SupervisorError};
+
+static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// A scratch folder holding a state root and a granted program, removed on drop.
+struct Scratch {
+    dir: PathBuf,
+}
+
+impl Scratch {
+    fn new() -> io::Result<Self> {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let base = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+        let dir = base.join(format!("barn-supervisor-{}-{n}", std::process::id()));
+
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("state"))?;
+        fs::write(dir.join("stall"), b"")?;
+
+        Ok(Self { dir })
+    }
+
+    fn state(&self) -> PathBuf {
+        self.dir.join("state")
+    }
+
+    async fn start_error(&self) -> Option<SupervisorError> {
+        let program = self.dir.join("stall");
+        let spec = StallSpec {
+            name: "stall".to_owned(),
+            program: program.clone(),
+            args: Vec::new(),
+            grant: Grant {
+                executable: Some(program),
+                ..Grant::default()
+            },
+        };
+        let helper = self.dir.join("missing-barn-exec");
+
+        Supervisor::new(self.state(), helper)
+            .start(spec)
+            .await
+            .err()
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(self.state(), fs::Permissions::from_mode(0o700));
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[tokio::test]
+async fn a_run_root_that_cannot_be_created_reports_the_creation() {
+    let scratch = Scratch::new().expect("the scratch folder is created");
+    let state = scratch.state();
+    let read_only = fs::Permissions::from_mode(0o500);
+    fs::set_permissions(&state, read_only).expect("the state root is locked");
+
+    assert!(matches!(
+        scratch.start_error().await,
+        Some(SupervisorError::Io {
+            operation: "creating barn run root",
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn a_run_root_that_is_a_file_is_refused() {
+    let scratch = Scratch::new().expect("the scratch folder is created");
+    fs::write(scratch.state().join("run"), b"").expect("the run file is written");
+
+    assert!(matches!(
+        scratch.start_error().await,
+        Some(SupervisorError::RunRoot)
+    ));
+}
+
+#[tokio::test]
+async fn a_run_root_others_can_open_is_refused() {
+    let scratch = Scratch::new().expect("the scratch folder is created");
+    let run = scratch.state().join("run");
+    fs::create_dir(&run).expect("the run root is created");
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o777))
+        .expect("the run root is opened to others");
+
+    assert!(matches!(
+        scratch.start_error().await,
+        Some(SupervisorError::RunRoot)
+    ));
+}
 
 #[test]
 fn the_fifth_crash_in_ten_minutes_stops_automatic_restarts() {
