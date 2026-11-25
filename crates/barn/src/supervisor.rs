@@ -1,4 +1,4 @@
-//! Starts a sandboxed stall and verifies its connect-back handshake.
+//! Starts a sandboxed stall, authenticates it and supervises its health.
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
@@ -11,16 +11,18 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+use barn_stall::protocol::TOKEN_TTL_SECS;
 use barn_stall::{MAX_LINE_BYTES, PROTOCOL_VERSION, method};
 use barn_stall::{StallStartParams, StallStartResult};
-use nono::{NonoError, SandboxState, UnixSocketMode};
+use nono::{AccessMode, NonoError, SandboxState, UnixSocketMode};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant as TokioInstant, MissedTickBehavior, interval_at};
+use tokio::time::{sleep, timeout, timeout_at};
 
 use crate::{Grant, PolicyError};
 
@@ -29,8 +31,11 @@ const MAX_BACKOFF: Duration = Duration::from_mins(5);
 const CRASH_WINDOW: Duration = Duration::from_mins(10);
 const CRASH_LIMIT: usize = 5;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const TOKEN_BYTES: usize = 32;
-const TOKEN_TTL: Duration = Duration::from_secs(30);
+const TOKEN_TTL: Duration = Duration::from_secs(TOKEN_TTL_SECS);
 const PRIVATE_DIR: u32 = 0o700;
 const PRIVATE_FILE: u32 = 0o600;
 const SOCKET_FILE: &str = "proto.sock";
@@ -71,6 +76,7 @@ pub struct RunningStall {
     started: Instant,
     epoch: Instant,
     restart: RestartPolicy,
+    health: HealthTracker,
 }
 
 struct Transport {
@@ -96,7 +102,18 @@ struct Prepared {
     program: PathBuf,
 }
 
-struct RunDir(PathBuf);
+struct RunDir {
+    path: PathBuf,
+    _lock: File,
+}
+
+type StallStream = BufReader<UnixStream>;
+
+struct HealthProbe {
+    connection: Option<StallStream>,
+    id: u64,
+    frame: Vec<u8>,
+}
 
 /// What happens after a running child exits.
 pub enum RestartOutcome {
@@ -106,7 +123,7 @@ pub enum RestartOutcome {
     Failed,
     /// barn starts a replacement child after the backoff.
     Restarted {
-        /// The status of the child that crashed.
+        /// The exit status of the crashed or unhealthy child.
         crash: ExitStatus,
         /// The replacement, with a fresh listener and token.
         stall: Box<RunningStall>,
@@ -244,6 +261,9 @@ pub enum SupervisorError {
     /// nono cannot grant access to the connect-back socket.
     #[error("granting access to the stall socket: {0}")]
     SocketPolicy(#[source] NonoError),
+    /// nono cannot grant access to the stall's state directory.
+    #[error("granting access to the stall state directory: {0}")]
+    StatePolicy(#[source] NonoError),
     /// Preparing the transport fails.
     #[error("preparing stall transport: {0}")]
     Prepare(#[from] tokio::task::JoinError),
@@ -270,6 +290,9 @@ pub enum SupervisorError {
     /// The connection or its first message does not arrive before the deadline.
     #[error("stall connection timed out")]
     ConnectTimeout,
+    /// A child does not exit before the deadline after barn asks it to stop.
+    #[error("unhealthy stall did not exit after termination")]
+    TerminationTimeout,
     /// The peer closes before completing a line.
     #[error("stall start message ended before its newline")]
     IncompleteFrame,
@@ -373,6 +396,7 @@ impl Supervisor {
             started,
             epoch,
             restart,
+            health: HealthTracker::default(),
         })
     }
 }
@@ -403,16 +427,73 @@ impl RunningStall {
             .map_err(|_| SupervisorError::ConnectTimeout)?
     }
 
-    /// Waits for the child to exit and applies the restart policy on a crash.
+    /// Records one health check and returns the decision for this child.
+    pub fn record_health(&mut self, check: HealthCheck) -> HealthDecision {
+        self.health.record(check)
+    }
+
+    /// Checks the accepted connection every ten seconds until the child exits or
+    /// misses three checks, then applies the restart policy for this child.
+    /// The caller accepts and supervises a replacement from the returned outcome.
+    /// Dropping the future closes the connection and stops the owned child.
+    ///
+    /// # Errors
+    /// Returns the stage that fails while waiting, stopping or restarting.
+    pub async fn supervise(mut self, stream: StallStream) -> Result<RestartOutcome> {
+        let now = TokioInstant::now();
+        let start = now.checked_add(HEALTH_INTERVAL).unwrap_or(now);
+        let mut ticks = interval_at(start, HEALTH_INTERVAL);
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut probe = HealthProbe {
+            connection: Some(stream),
+            id: 0,
+            frame: Vec::new(),
+        };
+
+        loop {
+            let check = tokio::select! {
+                biased;
+                status = self.child.wait() => {
+                    io_at("waiting for stall", status)?;
+
+                    break;
+                }
+                check = async {
+                    ticks.tick().await;
+                    probe.tick().await
+                } => check,
+            };
+
+            if self.record_health(check) == HealthDecision::Restart {
+                break;
+            }
+        }
+
+        drop(probe);
+        self.wait_and_restart().await
+    }
+
+    /// Waits for the child to exit and applies the restart policy on a crash
+    /// or after three consecutive missed health checks.
     ///
     /// Dropping the future stops supervising this child.
     ///
     /// # Errors
     /// Returns the stage that fails while waiting or starting a replacement.
     pub async fn wait_and_restart(mut self) -> Result<RestartOutcome> {
-        let status = io_at("waiting for stall", self.child.wait().await)?;
+        let unhealthy = self.health == HealthTracker::Restart;
+        let status = if unhealthy {
+            io_at("terminating unhealthy stall", self.child.start_kill())?;
+            let status = timeout(STOP_TIMEOUT, self.child.wait())
+                .await
+                .map_err(|_| SupervisorError::TerminationTimeout)?;
 
-        if status.success() {
+            io_at("waiting for unhealthy stall", status)?
+        } else {
+            io_at("waiting for stall", self.child.wait().await)?
+        };
+
+        if status.success() && !unhealthy {
             return Ok(RestartOutcome::Exited);
         }
 
@@ -438,6 +519,92 @@ impl RunningStall {
             stall: Box::new(stall),
         })
     }
+}
+
+impl HealthProbe {
+    async fn tick(&mut self) -> HealthCheck {
+        let Some(mut connection) = self.connection.take() else {
+            return HealthCheck::Missed;
+        };
+        let Some(id) = self.id.checked_add(1) else {
+            return HealthCheck::Missed;
+        };
+        let Some(deadline) = TokioInstant::now().checked_add(HEALTH_TIMEOUT) else {
+            return HealthCheck::Missed;
+        };
+        self.id = id;
+        let method = method::STALL_HEALTH;
+        let request = json!({"jsonrpc":"2.0", "id":id, "method":method});
+        let Ok(line) = bounded_frame(&request) else {
+            return HealthCheck::Missed;
+        };
+
+        // A cancelled write may leave a partial frame; close that connection.
+        let sent = timeout_at(deadline, connection.write_all(&line)).await;
+
+        if !matches!(sent, Ok(Ok(()))) {
+            return HealthCheck::Missed;
+        }
+
+        let reply = timeout_at(deadline, self.read_reply(&mut connection)).await;
+
+        match reply {
+            Ok(None) => HealthCheck::Missed,
+            Ok(Some(check)) => {
+                self.connection = Some(connection);
+
+                check
+            }
+            Err(_) => {
+                // Keep the bytes already read so the next tick stays framed.
+                self.connection = Some(connection);
+
+                HealthCheck::Missed
+            }
+        }
+    }
+
+    async fn read_reply(&mut self, reader: &mut StallStream) -> Option<HealthCheck> {
+        // Allow two late answers from consecutive missed probes before this one.
+        for _ in 0..3 {
+            let remaining = MAX_LINE_BYTES.saturating_sub(self.frame.len());
+            let limit = u64::try_from(remaining).ok()?;
+            reader
+                .take(limit)
+                .read_until(b'\n', &mut self.frame)
+                .await
+                .ok()?;
+
+            if self.frame.last() != Some(&b'\n') {
+                return None;
+            }
+
+            let id = health_reply_id(&self.frame);
+            self.frame.clear();
+
+            match id {
+                Some(id) if id == self.id => return Some(HealthCheck::Answered),
+                Some(id) if id > 0 && id < self.id => {}
+                _ => return Some(HealthCheck::Missed),
+            }
+        }
+
+        Some(HealthCheck::Missed)
+    }
+}
+
+fn health_reply_id(frame: &[u8]) -> Option<u64> {
+    let reply: Value = serde_json::from_slice(frame).ok()?;
+
+    if reply.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || reply.get("result").is_none()
+        || reply.get("error").is_some()
+        || reply.get("method").is_some()
+    {
+        return None;
+    }
+
+    reply.get("id").and_then(Value::as_u64)
 }
 
 impl Transport {
@@ -492,7 +659,12 @@ fn reply_frame(id: &Value, state: &str) -> Result<Vec<u8>> {
         state: state.to_owned(),
     };
     let response = json!({"jsonrpc":"2.0","id":id,"result":reply});
-    let mut frame = serde_json::to_vec(&response)?;
+
+    bounded_frame(&response)
+}
+
+fn bounded_frame(message: &Value) -> Result<Vec<u8>> {
+    let mut frame = serde_json::to_vec(message)?;
     frame.push(b'\n');
 
     if frame.len() > MAX_LINE_BYTES {
@@ -608,8 +780,12 @@ fn prepare(state_dir: &Path, spec: &StallSpec) -> Result<Prepared> {
     }
 
     let program = io_at("resolving stall program", spec.program.canonicalize())?;
-    let caps = pin_executable(&spec.grant, program.clone()).to_capability_set()?;
     let (run_dir, state) = run_paths(state_dir, &spec.name)?;
+    let caps = pin_executable(&spec.grant, program.clone())
+        .to_capability_set()?
+        .allow_path(&state, AccessMode::ReadWrite)
+        .map_err(SupervisorError::StatePolicy)?;
+
     let socket = run_dir.path(SOCKET_FILE);
     let listener = io_at("binding stall socket", StdUnixListener::bind(&socket))?;
     io_at(
@@ -660,47 +836,114 @@ fn run_paths(state_dir: &Path, name: &str) -> Result<(RunDir, String)> {
             .create(state_dir),
     )?;
     let state_dir = io_at("resolving barn state root", state_dir.canonicalize())?;
-    let state = state_dir
-        .join(name)
-        .into_os_string()
-        .into_string()
-        .map_err(|_| SupervisorError::StatePath)?;
     let run_root = state_dir.join("run");
-
-    match DirBuilder::new().mode(PRIVATE_DIR).create(&run_root) {
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-        result => io_at("creating barn run root", result)?,
-    }
-
+    io_at("creating barn run root", ensure_private_dir(&run_root))?;
     let root = io_at("checking barn run root", fs::symlink_metadata(&run_root))?;
 
     if !root.is_dir() || root.mode() & 0o077 != 0 {
         return Err(SupervisorError::RunRoot);
     }
 
-    let path = run_root.join(name);
+    let state = state_dir
+        .join(name)
+        .into_os_string()
+        .into_string()
+        .map_err(|_| SupervisorError::StatePath)?;
     io_at(
-        "creating private stall run directory",
-        DirBuilder::new().mode(PRIVATE_DIR).create(&path),
+        "creating stall state directory",
+        ensure_private_dir(Path::new(&state)),
     )?;
-    let run_dir = RunDir(path);
-    chmod(&run_dir.0, PRIVATE_DIR)?;
+    let meta = io_at(
+        "checking stall state directory",
+        fs::symlink_metadata(&state),
+    )?;
+
+    if !meta.is_dir() {
+        return io_at(
+            "checking stall state directory",
+            Err(io::Error::from(io::ErrorKind::NotADirectory)),
+        );
+    }
+
+    let run_dir = RunDir::create(run_root.join(name), root.uid())?;
 
     Ok((run_dir, state))
 }
 
-impl RunDir {
-    fn path(&self, name: &str) -> PathBuf {
-        self.0.join(name)
+fn ensure_private_dir(path: &Path) -> io::Result<()> {
+    match DirBuilder::new().mode(PRIVATE_DIR).create(path) {
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        result => result,
     }
+}
+
+impl RunDir {
+    fn create(path: PathBuf, uid: u32) -> Result<Self> {
+        let mut builder = DirBuilder::new();
+        builder.mode(PRIVATE_DIR);
+
+        match builder.create(&path) {
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let lock = lock_dir(&path, uid);
+                let _stale = io_at("locking stale stall run directory", lock)?;
+                io_at("removing stale stall run directory", remove_run_dir(&path))?;
+                io_at(
+                    "creating private stall run directory",
+                    builder.create(&path),
+                )?;
+            }
+            result => io_at("creating private stall run directory", result)?,
+        }
+
+        let lock = io_at("locking stall run directory", lock_dir(&path, uid))?;
+        let dir = Self { path, _lock: lock };
+        chmod(&dir.path, PRIVATE_DIR)?;
+
+        Ok(dir)
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.path.join(name)
+    }
+}
+
+fn lock_dir(path: &Path, uid: u32) -> io::Result<File> {
+    let meta = fs::symlink_metadata(path)?;
+
+    if !meta.is_dir() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
+        return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+    }
+
+    let dir = File::open(path)?;
+    dir.try_lock()?;
+    let locked = dir.metadata()?;
+    let current = fs::symlink_metadata(path)?;
+
+    // A competing start can replace the directory before the lock is held.
+    if (meta.dev(), meta.ino()) != (locked.dev(), locked.ino())
+        || (locked.dev(), locked.ino()) != (current.dev(), current.ino())
+    {
+        return Err(io::Error::from(io::ErrorKind::WouldBlock));
+    }
+
+    Ok(dir)
+}
+
+fn remove_run_dir(path: &Path) -> io::Result<()> {
+    // Only remove the files barn owns; never traverse the stall's state.
+    for name in [SOCKET_FILE, POLICY_FILE] {
+        match fs::remove_file(path.join(name)) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            result => result?,
+        }
+    }
+
+    fs::remove_dir(path)
 }
 
 impl Drop for RunDir {
     fn drop(&mut self) {
-        // Only remove the files barn owns; never traverse the stall's state.
-        let _ = fs::remove_file(self.path(SOCKET_FILE));
-        let _ = fs::remove_file(self.path(POLICY_FILE));
-        let _ = fs::remove_dir(&self.0);
+        let _ = remove_run_dir(&self.path);
     }
 }
 
@@ -751,6 +994,8 @@ fn io_at<T>(operation: &'static str, result: io::Result<T>) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::FileTypeExt as _;
+
     use super::*;
 
     const START: &[u8] = concat!(
@@ -1065,5 +1310,298 @@ mod tests {
                 executable: Some("/resolved".into()),
             }
         );
+    }
+
+    struct PrepareFixture(PathBuf);
+
+    impl PrepareFixture {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, Ordering::Relaxed);
+            let pid = std::process::id();
+            let root = Path::new("/tmp").join(format!("barn-prep-{pid}-{n}"));
+            DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .expect("scratch root");
+
+            Self(root.canonicalize().expect("canonical scratch root"))
+        }
+
+        fn spec() -> StallSpec {
+            let program = std::env::current_exe().expect("test executable");
+
+            StallSpec {
+                name: "fixture".to_owned(),
+                program: program.clone(),
+                args: Vec::new(),
+                grant: Grant {
+                    executable: Some(program),
+                    ..Grant::default()
+                },
+            }
+        }
+    }
+
+    impl Drop for PrepareFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn prepare_replaces_a_stale_run_directory_and_keeps_state() {
+        let fixture = PrepareFixture::new();
+        let spec = PrepareFixture::spec();
+        let first = prepare(&fixture.0, &spec).expect("first prepare");
+        let path = first.run_dir.path.clone();
+        let record = Path::new(&first.state).join("record");
+        fs::write(&record, b"keep").expect("stall record");
+
+        assert_eq!(
+            prepare_failure(&fixture.0, &spec),
+            Some((
+                "locking stale stall run directory",
+                io::ErrorKind::WouldBlock
+            ))
+        );
+        let socket = fs::symlink_metadata(path.join(SOCKET_FILE)).ok();
+        assert_eq!(socket.map(|meta| meta.file_type().is_socket()), Some(true));
+        drop(first);
+
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .expect("stale directory");
+        let address = path.join(SOCKET_FILE);
+        let stale = StdUnixListener::bind(&address).expect("stale socket");
+        drop(stale);
+        fs::write(path.join(POLICY_FILE), b"stale").expect("stale policy");
+
+        let second = prepare(&fixture.0, &spec).expect("reclaim stale run dir");
+        let bound = second.listener.local_addr().expect("new socket address");
+        assert_eq!(bound.as_pathname(), Some(address.as_path()));
+        assert_eq!(fs::read(record).ok().as_deref(), Some(b"keep".as_slice()));
+    }
+
+    type PrepareFailure = (&'static str, io::ErrorKind);
+
+    fn prepare_failure(root: &Path, spec: &StallSpec) -> Option<PrepareFailure> {
+        let result = prepare(root, spec);
+        let Err(SupervisorError::Io { operation, source }) = result else {
+            return None;
+        };
+
+        Some((operation, source.kind()))
+    }
+
+    #[test]
+    fn prepare_does_not_remove_unknown_entries_or_follow_a_run_directory_symlink() {
+        let fixture = PrepareFixture::new();
+        let spec = PrepareFixture::spec();
+        let first = prepare(&fixture.0, &spec).expect("first prepare");
+        let run = first.run_dir.path.clone();
+        let state = PathBuf::from(&first.state);
+        drop(first);
+
+        fs::create_dir(&run).expect("stale directory");
+        chmod(&run, PRIVATE_DIR).expect("private stale directory");
+        let unknown = run.join("unknown");
+        fs::write(&unknown, b"keep").expect("unknown entry");
+        assert_eq!(
+            prepare_failure(&fixture.0, &spec),
+            Some((
+                "removing stale stall run directory",
+                io::ErrorKind::DirectoryNotEmpty
+            ))
+        );
+        assert_eq!(fs::read(&unknown).ok().as_deref(), Some(b"keep".as_slice()));
+        fs::remove_file(unknown).expect("remove fixture entry");
+        fs::remove_dir(&run).expect("remove stale directory");
+
+        let record = state.join(POLICY_FILE);
+        fs::write(&record, b"state").expect("state entry named like a run entry");
+        std::os::unix::fs::symlink(&state, &run).expect("run directory symlink");
+        assert_eq!(
+            prepare_failure(&fixture.0, &spec),
+            Some((
+                "locking stale stall run directory",
+                io::ErrorKind::PermissionDenied
+            ))
+        );
+        assert_eq!(fs::read(record).ok().as_deref(), Some(b"state".as_slice()));
+    }
+
+    #[test]
+    fn prepare_grants_read_write_on_the_created_state_directory() {
+        let fixture = PrepareFixture::new();
+        let state = fixture.0.join("fixture");
+        let mut spec = PrepareFixture::spec();
+        spec.grant.read_paths.push(state.clone());
+
+        let prepared = prepare(&fixture.0, &spec).expect("prepare fresh state");
+        let mode = fs::symlink_metadata(&state)
+            .ok()
+            .filter(fs::Metadata::is_dir)
+            .map(|metadata| metadata.mode() & 0o777);
+        assert_eq!(mode, Some(0o700));
+        assert_eq!(Path::new(&prepared.state), state);
+
+        let path = prepared.run_dir.path(POLICY_FILE);
+        let bytes = fs::read(path).expect("written policy");
+        let policy: SandboxState = serde_json::from_slice(&bytes).expect("policy");
+        let grants: Vec<_> = policy
+            .fs
+            .iter()
+            .filter(|cap| cap.resolved == state)
+            .map(|cap| (&cap.original, cap.access.as_str(), cap.is_file))
+            .collect();
+        assert_eq!(
+            grants,
+            [(&state, "read", false), (&state, "read+write", false)]
+        );
+    }
+
+    fn health_pair() -> (HealthProbe, BufReader<UnixStream>) {
+        let (barn, stall) = UnixStream::pair().expect("connected sockets");
+        let probe = HealthProbe {
+            connection: Some(BufReader::new(barn)),
+            id: 0,
+            frame: Vec::new(),
+        };
+
+        (probe, BufReader::new(stall))
+    }
+
+    async fn health_request(stall: &mut BufReader<UnixStream>, id: u64) {
+        let mut line = String::new();
+        timeout(HEALTH_TIMEOUT, stall.read_line(&mut line))
+            .await
+            .expect("request arrives")
+            .expect("read the request");
+
+        assert_eq!(line.as_bytes().last(), Some(&b'\n'));
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).ok(),
+            Some(json!({"id":id, "jsonrpc":"2.0", "method":"stall.health"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_health_tick_requires_a_complete_matching_success_reply() {
+        let health = "stall.health";
+        let success = json!({"jsonrpc":"2.0", "id":1, "result":null});
+        let cases = [
+            (success, HealthCheck::Answered),
+            (
+                json!({"jsonrpc":"1.0", "id":1, "result":null}),
+                HealthCheck::Missed,
+            ),
+            (
+                json!({"jsonrpc":"2.0", "id":2, "result":null}),
+                HealthCheck::Missed,
+            ),
+            (
+                json!({"jsonrpc":"2.0", "id":0, "result":null}),
+                HealthCheck::Missed,
+            ),
+            (
+                json!({"jsonrpc":"2.0", "id":"1", "result":null}),
+                HealthCheck::Missed,
+            ),
+            (json!({"jsonrpc":"2.0", "id":1}), HealthCheck::Missed),
+            (
+                json!({"jsonrpc":"2.0", "id":1, "result":null, "error":null}),
+                HealthCheck::Missed,
+            ),
+            (
+                json!({"jsonrpc":"2.0", "id":1, "result":null, "method":health}),
+                HealthCheck::Missed,
+            ),
+            (json!([]), HealthCheck::Missed),
+        ];
+
+        for (reply, expected) in cases {
+            let (mut probe, mut stall) = health_pair();
+            let (decision, ()) = tokio::join!(probe.tick(), async {
+                health_request(&mut stall, 1).await;
+                let next = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
+                stall
+                    .write_all(format!("{reply}\n{next}\n").as_bytes())
+                    .await
+                    .expect("reply");
+            });
+
+            assert_eq!(decision, expected, "{reply}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_health_tick_bounds_how_many_late_replies_it_reads() {
+        use HealthCheck::{Answered, Missed};
+
+        for (late, expected) in [(2, Answered), (3, Missed)] {
+            let (mut probe, mut stall) = health_pair();
+            probe.id = 2;
+            let old = concat!(r#"{"jsonrpc":"2.0","id":2,"result":null}"#, "\n");
+            let current = "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":null}\n";
+            let replies = format!("{}{current}", old.repeat(late));
+
+            let (decision, ()) = tokio::join!(probe.tick(), async {
+                health_request(&mut stall, 3).await;
+                stall
+                    .write_all(replies.as_bytes())
+                    .await
+                    .expect("health replies");
+            });
+            assert_eq!(decision, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_health_timeout_keeps_the_partial_reply_for_the_next_tick() {
+        let (mut probe, mut stall) = health_pair();
+        let (missed, ()) = tokio::join!(probe.tick(), async {
+            health_request(&mut stall, 1).await;
+            stall
+                .write_all(b"{\"jsonrpc\":\"2.0\",")
+                .await
+                .expect("partial reply");
+        });
+        assert_eq!(missed, HealthCheck::Missed);
+
+        let (answered, ()) = tokio::join!(probe.tick(), async {
+            health_request(&mut stall, 2).await;
+            let replies = concat!(
+                "\"id\":1,\"result\":null}\n",
+                "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}\n",
+            );
+            stall
+                .write_all(replies.as_bytes())
+                .await
+                .expect("late and current replies");
+        });
+        assert_eq!(answered, HealthCheck::Answered);
+    }
+
+    #[tokio::test]
+    async fn a_health_reply_cannot_use_more_than_the_line_limit() {
+        for (size, expected) in [
+            (MAX_LINE_BYTES, HealthCheck::Answered),
+            (MAX_LINE_BYTES.saturating_add(1), HealthCheck::Missed),
+        ] {
+            let (mut probe, mut stall) = health_pair();
+            let mut reply = br#"{"jsonrpc":"2.0","id":1,"result":null}"#.to_vec();
+            reply.resize(size.saturating_sub(1), b' ');
+            reply.push(b'\n');
+
+            let (decision, ()) = tokio::join!(probe.tick(), async {
+                health_request(&mut stall, 1).await;
+                let _ = timeout(HEALTH_TIMEOUT, stall.write_all(&reply)).await;
+            });
+            assert_eq!(decision, expected);
+        }
     }
 }

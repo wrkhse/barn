@@ -2,6 +2,7 @@
 //! limits table are read from docs/stall-protocol.md itself, so a constant or a
 //! field that drifts from the page fails here.
 
+use barn_stall::protocol::TOKEN_TTL_SECS;
 use barn_stall::{
     BodyEncoding, DEFAULT_MAX_BODY_BYTES, DENIED_CODE, Headers, MAX_LINE_BYTES, NetAuth,
     NetRequestParams, NetResponse, PROTOCOL_VERSION, StallStartParams, StallStartResult, method,
@@ -74,6 +75,15 @@ fn the_pages_table_pins_the_constants() {
         i64::try_from(DEFAULT_MAX_BODY_BYTES).expect("fits an i64")
     );
     assert_eq!(pinned("DENIED_CODE"), i64::from(DENIED_CODE));
+    assert_eq!(
+        pinned("TOKEN_TTL_SECS"),
+        i64::try_from(TOKEN_TTL_SECS).expect("fits an i64")
+    );
+}
+
+#[test]
+fn a_start_token_lasts_thirty_seconds() {
+    assert_eq!(TOKEN_TTL_SECS, 30);
 }
 
 #[test]

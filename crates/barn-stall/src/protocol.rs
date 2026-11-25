@@ -21,6 +21,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// socket server does.
 pub const MAX_LINE_BYTES: usize = 8_388_608;
 
+/// Seconds after launch before the single-use `BARN_TOKEN` expires.
+pub const TOKEN_TTL_SECS: u64 = 30;
+
 /// The default cap on an inline body, counted in decoded bytes: 4 MiB.
 ///
 /// The side that sends a body uses UTF-8 when the bytes are valid UTF-8 and the

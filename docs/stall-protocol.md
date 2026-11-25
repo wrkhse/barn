@@ -1,8 +1,7 @@
 # The stall protocol
 
-**Status: draft, version 1.** This page records what the plan already fixes and
-nothing more. Everything barn's stall code will settle in B1 is marked "for B1
-to confirm", with the question named.
+**Status: version 1 is a draft until barn's first release.** The page records
+what the plan fixes and names the open questions under "for B1 to confirm".
 
 A stall is a project's logic in its own child process: its request handlers, the
 jobs it runs and the events it emits. barn starts it, restarts it, holds its
@@ -14,21 +13,22 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
 - barn listens at `state_dir/run/<stall>/proto.sock`, a Unix socket with mode
   `0600` in a directory with mode `0700`. The stall's environment holds only
   `PATH`, `HOME`, `LANG`, the socket path in `BARN_SOCKET`, and the single-use
-  token in `BARN_TOKEN`.
+  token in `BARN_TOKEN`. barn clears a stale run directory before binding the
+  socket, leaving the stall's state folder intact.
 - The stall connects and sends `stall.start` as its first message. barn checks
   that the peer PID matches the child it spawned and that the peer UID owns
   the socket. A missing peer PID fails authentication. barn checks and spends
   the token, then returns the absolute path of the stall's state folder,
-  `state_dir/<stall>`.
-- The token expires 30 seconds after barn spawns the stall. A `stall.start`
-  that arrives at or after that deadline is refused as `TokenExpired`: barn
+  `state_dir/<stall>`, which barn creates and grants the stall read-write access to.
+- The token expires `TOKEN_TTL_SECS` (30 seconds) after barn spawns the stall.
+  A `stall.start` at or after that deadline is refused as `TokenExpired`: barn
   drops the token unspent and closes the connection without a reply, so only a
   restart issues a new one.
 - One JSON-RPC 2.0 message per line, each terminated by `\n`.
 - A line is at most 8 MiB in bytes, its terminating newline included,
-  `MAX_LINE_BYTES` in `barn-stall`. A longer line is answered with `-32600` and
-  an `id` of `null`, because the line was never parsed, and then the connection
-  closes, as Chauffeur v2's socket server does. barn's own `stall.start` reply
+  `MAX_LINE_BYTES` in `barn-stall`. A longer request line is answered with
+  `-32600` and an `id` of `null`, because the line was never parsed, and then the
+  connection closes, as Chauffeur v2's socket server does. barn's `stall.start` reply
   is held to the same limit: a reply that would be longer is never sent, and
   the stall gets the same `-32600` line before the connection closes. _For B1
   to confirm: the error's message, which Chauffeur v2 words "the request line is
@@ -45,9 +45,10 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
 
 ## Versions
 
-`protocol` is an integer, `1` today (`PROTOCOL_VERSION` in `barn-stall`). barn
-speaks the current version and the one before it. Fields are only added within a
-version: a rename or a removal is a new version.
+`protocol` is an integer, `1` (`PROTOCOL_VERSION` in `barn-stall`). Starting
+with barn's first release, barn speaks the current version and the one before
+it. Fields are only added within a released version: a rename or a removal
+requires a new version.
 
 The values `body_encoding` may carry are closed within a version: another
 encoding is a new version, never a value added inside this one.
@@ -76,6 +77,17 @@ A stall connects and receives its state folder:
 {"jsonrpc":"2.0","id":1,"method":"stall.start","params":{"protocol":1,"token":"…"}}
 {"jsonrpc":"2.0","id":1,"result":{"state":"/var/lib/barn/sourcefed"}}
 ```
+
+barn sends `stall.health` on the authenticated connection every 10 seconds:
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"stall.health"}
+{"jsonrpc":"2.0","id":2,"result":null}
+```
+
+A successful JSON-RPC reply with the matching id within 2 seconds answers the
+check. A timeout or an invalid reply misses it. barn restarts the stall after
+three consecutive misses.
 
 A stall asks the broker:
 
@@ -133,20 +145,19 @@ whether `net.request`'s `auth.as` has values beyond `bearer`._
 
 ## Limits and constants
 
-| Constant                 | Value     | Meaning                                       |
-| ------------------------ | --------- | --------------------------------------------- |
-| `PROTOCOL_VERSION`       | `1`       | the version barn speaks                       |
-| `MAX_LINE_BYTES`         | `8388608` | 8 MiB, the longest line, its newline included |
-| `DEFAULT_MAX_BODY_BYTES` | `4194304` | 4 MiB, the default cap on a body a grant sets |
-| `DENIED_CODE`            | `-32001`  | the error code for `denied`                   |
+| Constant                 | Value     | Meaning                                  |
+| ------------------------ | --------- | ---------------------------------------- |
+| `PROTOCOL_VERSION`       | `1`       | the version barn speaks                  |
+| `MAX_LINE_BYTES`         | `8388608` | 8 MiB per line, including the newline    |
+| `DEFAULT_MAX_BODY_BYTES` | `4194304` | 4 MiB, the default body cap a grant sets |
+| `DENIED_CODE`            | `-32001`  | the error code for `denied`              |
+| `TOKEN_TTL_SECS`         | `30`      | seconds before a start token expires     |
 
 ## For B1 to confirm
 
-The plan fixes these methods' names and directions but not their bodies. Nothing
-is built for them until B1 settles them:
+The plan fixes these methods' names and directions. These details remain open:
 
-- `stall.health`: its result, the short status it carries, and the deadline barn
-  gives it.
+- `stall.health`: the short status its result carries.
 - `stall.drain`: its parameters and the deadline a stall must finish in.
 - `request`: the method, params and connection id barn passes, and how a response
   stream is opened.

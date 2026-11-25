@@ -1,19 +1,20 @@
-//! Restart, health and run root decisions, without spawning or signalling a
-//! process. The run root tests name a helper that does not exist, so even a
-//! start that passes the run root check cannot start one.
+//! Restart, health and run root decisions. The process fixture runs in CI only.
 
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use barn::Grant;
-use barn::supervisor::{
-    HealthCheck, HealthDecision, HealthTracker, RestartDecision, RestartPolicy,
-};
+use barn::supervisor::{HealthCheck, HealthDecision, HealthTracker};
+use barn::supervisor::{RestartDecision, RestartOutcome, RestartPolicy};
 use barn::supervisor::{StallSpec, Supervisor, SupervisorError};
+use serde_json::{Value, json};
+use tokio::time::timeout;
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
@@ -207,4 +208,114 @@ fn the_third_consecutive_miss_requests_a_restart() {
         assert_eq!(tracker.record(check), decision);
         assert_eq!(tracker, state);
     }
+}
+
+#[tokio::test]
+async fn supervision_replaces_an_unhealthy_child_and_checks_the_replacement() {
+    if std::env::var_os("CI").is_none() {
+        return;
+    }
+
+    let scratch = Scratch::new().expect("scratch folder");
+    let helper = scratch.dir.join("fixture-exec");
+    // Exec keeps the PID the supervisor authenticates. Sandbox enforcement is
+    // covered separately by the barn-exec integration tests.
+    fs::write(&helper, "#!/bin/sh\nshift\nexec \"$@\"\n").expect("fixture helper");
+    let executable = fs::Permissions::from_mode(0o700);
+    fs::set_permissions(&helper, executable).expect("helper mode");
+    let program = std::env::current_exe().expect("fixture executable");
+    let spec = StallSpec {
+        name: "stall".to_owned(),
+        program: program.clone(),
+        args: ["--exact", "health_stall_fixture"].map(Into::into).to_vec(),
+        grant: Grant {
+            executable: Some(program),
+            ..Grant::default()
+        },
+    };
+    let supervisor = Supervisor::new(scratch.state(), helper);
+    let mut stall = supervisor.start(spec).await.expect("start first child");
+    let connection = stall.accept().await.expect("authenticate first child");
+
+    for _ in 0..2 {
+        assert_eq!(
+            stall.record_health(HealthCheck::Missed),
+            HealthDecision::Continue
+        );
+    }
+
+    let outcome = timeout(Duration::from_secs(18), stall.supervise(connection))
+        .await
+        .expect("health restart deadline")
+        .expect("health restart");
+    let RestartOutcome::Restarted { crash, mut stall } = outcome else {
+        panic!("unhealthy child must restart");
+    };
+    assert_eq!(crash.signal(), Some(9));
+
+    let connection = stall.accept().await.expect("authenticate replacement");
+    let outcome = timeout(Duration::from_secs(25), stall.supervise(connection))
+        .await
+        .expect("replacement supervision deadline")
+        .expect("replacement supervision");
+    let outcome = match outcome {
+        RestartOutcome::Exited => "exited",
+        RestartOutcome::Failed => "failed",
+        RestartOutcome::Restarted { .. } => "restarted",
+    };
+    assert_eq!(outcome, "exited");
+}
+
+#[test]
+fn health_stall_fixture() {
+    let Some(socket) = std::env::var_os("BARN_SOCKET") else {
+        return;
+    };
+
+    let stream = UnixStream::connect(socket).expect("connect to barn");
+    let deadline = Some(Duration::from_secs(35));
+    stream.set_read_timeout(deadline).expect("read timeout");
+    stream.set_write_timeout(deadline).expect("write timeout");
+    let mut client = BufReader::new(stream);
+    let token = std::env::var("BARN_TOKEN").expect("start token");
+    let start = json!({
+        "jsonrpc":"2.0", "id":"start", "method":"stall.start",
+        "params":{"protocol":1,"token":token}
+    });
+    writeln!(client.get_mut(), "{start}").expect("send start");
+    let reply = read_message(&mut client).expect("valid start reply");
+    let state = reply
+        .pointer("/result/state")
+        .and_then(Value::as_str)
+        .expect("state path");
+    let marker = PathBuf::from(state).join("started");
+
+    if !marker.exists() {
+        fs::write(&marker, b"").expect("remember the first launch");
+        assert_health_request(&mut client, 1);
+        writeln!(client.get_mut(), "{{").expect("send malformed reply");
+        std::thread::sleep(Duration::from_secs(25));
+
+        return;
+    }
+
+    for id in [1, 2] {
+        assert_health_request(&mut client, id);
+        let reply = json!({"jsonrpc":"2.0", "id":id, "result":null});
+        writeln!(client.get_mut(), "{reply}").expect("send health reply");
+    }
+}
+
+fn read_message(client: &mut BufReader<UnixStream>) -> Option<Value> {
+    let mut line = String::new();
+    client.read_line(&mut line).ok()?;
+
+    serde_json::from_str(&line).ok()
+}
+
+fn assert_health_request(client: &mut BufReader<UnixStream>, id: u64) {
+    assert_eq!(
+        read_message(client),
+        Some(json!({"jsonrpc":"2.0", "id":id, "method":"stall.health"}))
+    );
 }
