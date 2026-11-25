@@ -193,6 +193,30 @@ fn check_child_vs_sibling(grant: &Grant, tree: &Tree) {
 }
 
 #[test]
+fn a_subpath_grant_denies_its_parent_and_prefix_sibling() -> Result<(), Box<dyn Error>> {
+    let tree = Tree::new()?;
+    let grant = Grant {
+        read_paths: vec![tree.granted.join("a")],
+        ..Grant::default()
+    };
+
+    check_subpath_boundary(&grant, &tree);
+
+    Ok(())
+}
+
+fn check_subpath_boundary(grant: &Grant, tree: &Tree) {
+    let decisions = [
+        grant.allows_read(&tree.granted.join("a")),
+        grant.allows_read(&tree.granted.join("a/b")),
+        grant.allows_read(&tree.granted),
+        grant.allows_read(&tree.sibling),
+        grant.allows_read(&tree.sibling.join("a")),
+    ];
+    assert_eq!(decisions, [true, true, false, false, false]);
+}
+
+#[test]
 fn write_access_follows_the_write_grant() -> Result<(), Box<dyn Error>> {
     let tree = Tree::new()?;
     let grant = Grant {
