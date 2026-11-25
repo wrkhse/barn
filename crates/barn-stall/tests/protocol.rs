@@ -94,39 +94,55 @@ fn the_denied_error_carries_the_pages_code() {
 
 #[test]
 fn stall_start_reads_the_pages_request() {
-    let params: StallStartParams = serde_json::from_value(
-        sent(1)
-            .expect("the page sends stall.start with id 1")
-            .get("params")
-            .cloned()
-            .expect("stall.start carries params"),
-    )
-    .expect("the page's stall.start parameters");
+    let request = sent(1);
+    let wire = request.as_ref().and_then(|message| message.get("params"));
+    let params = StallStartParams {
+        protocol: PROTOCOL_VERSION,
+        token: "…".to_owned(),
+    };
 
     assert_eq!(
-        params,
-        StallStartParams {
-            protocol: PROTOCOL_VERSION,
-            stall: "sourcefed".to_owned(),
-            state: "~/.local/state/sourcefed".to_owned(),
-        }
+        request
+            .as_ref()
+            .and_then(|message| message.get("method"))
+            .and_then(Value::as_str),
+        Some(method::STALL_START)
     );
+    assert_eq!(
+        wire.cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
+        Some(params.clone())
+    );
+    assert_eq!(serde_json::to_value(params).ok().as_ref(), wire);
 }
 
 #[test]
 fn stall_start_reads_the_pages_result() {
-    let result: StallStartResult = serde_json::from_value(
-        answered(1)
-            .expect("the page answers stall.start with id 1")
-            .get("result")
-            .cloned()
-            .expect("stall.start carries a result"),
-    )
-    .expect("the page's stall.start result");
+    let reply = answered(1);
+    let wire = reply.as_ref().and_then(|message| message.get("result"));
+    let result = StallStartResult {
+        state: "/var/lib/barn/sourcefed".to_owned(),
+    };
 
-    assert!(result.ready);
-    assert_eq!(result.version, "0.6.0");
-    assert_eq!(result.jobs.len(), 1);
+    assert_eq!(
+        wire.cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
+        Some(result.clone())
+    );
+    assert_eq!(serde_json::to_value(result).ok().as_ref(), wire);
+}
+
+#[test]
+fn start_parameters_keep_the_token_out_of_diagnostics() {
+    let params = StallStartParams {
+        protocol: PROTOCOL_VERSION,
+        token: "secret".to_owned(),
+    };
+
+    assert_eq!(
+        format!("{params:?}"),
+        "StallStartParams { protocol: 1, token: \"[redacted]\" }"
+    );
 }
 
 #[test]

@@ -11,9 +11,15 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
 
 ## Transport
 
-- barn creates a Unix socket pair and passes the stall's end as file descriptor
-  `3`. The stall's environment holds only `PATH`, `HOME`, `LANG` and barn's own
-  variables.
+- barn listens at `state_dir/run/<stall>/proto.sock`, a Unix socket with mode
+  `0600` in a directory with mode `0700`. The stall's environment holds only
+  `PATH`, `HOME`, `LANG`, the socket path in `BARN_SOCKET`, and the single-use
+  token in `BARN_TOKEN`.
+- The stall connects and sends `stall.start` as its first message. barn checks
+  that the peer PID matches the child it spawned and that the peer UID owns
+  the socket. A missing peer PID fails authentication. barn checks and spends
+  the token, then returns the absolute path of the stall's state folder,
+  `state_dir/<stall>`.
 - One JSON-RPC 2.0 message per line, each terminated by `\n`.
 - A line is at most 8 MiB in bytes, its terminating newline included,
   `MAX_LINE_BYTES` in `barn-stall`. A longer line is answered with `-32600` and
@@ -41,26 +47,27 @@ encoding is a new version, never a value added inside this one.
 
 ## Methods
 
-| Method                                       | Direction     | Purpose                                                                                                 |
-| -------------------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------- |
-| `stall.start`, `stall.health`, `stall.drain` | barn to stall | Start, which returns the stall's jobs; report health; finish in-flight work and exit within a deadline  |
-| `request`, `cancel`                          | barn to stall | A client request from a listener; a cancel or a closed connection                                       |
-| `stream.send`, `stream.end`                  | stall to barn | Write to a response stream, such as SSE                                                                 |
-| `webhook`                                    | barn to stall | A verified webhook delivery                                                                             |
-| `job.run`                                    | barn to stall | Run a declared job; barn keeps the timers and shows them in `barn stalls`                               |
-| `net.request`                                | stall to barn | One HTTP request through the broker. Errors: `denied`, `budget` (with when to retry), `unknown_outcome` |
-| `mcp.call`                                   | stall to barn | Call a tool on an MCP server barn runs                                                                  |
-| `log`                                        | stall to barn | A structured log line                                                                                   |
+| Method                        | Direction     | Purpose                                                                                                 |
+| ----------------------------- | ------------- | ------------------------------------------------------------------------------------------------------- |
+| `stall.start`                 | stall to barn | Authenticate the stall and return its state folder                                                      |
+| `stall.health`, `stall.drain` | barn to stall | Report health; finish in-flight work and exit within a deadline                                         |
+| `request`, `cancel`           | barn to stall | A client request from a listener; a cancel or a closed connection                                       |
+| `stream.send`, `stream.end`   | stall to barn | Write to a response stream, such as SSE                                                                 |
+| `webhook`                     | barn to stall | A verified webhook delivery                                                                             |
+| `job.run`                     | barn to stall | Run a declared job; barn keeps the timers and shows them in `barn stalls`                               |
+| `net.request`                 | stall to barn | One HTTP request through the broker. Errors: `denied`, `budget` (with when to retry), `unknown_outcome` |
+| `mcp.call`                    | stall to barn | Call a tool on an MCP server barn runs                                                                  |
+| `log`                         | stall to barn | A structured log line                                                                                   |
 
 `barn-stall`'s `method` module names every one of them.
 
 ## The messages fixed so far
 
-barn starts a stall:
+A stall connects and receives its state folder:
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"stall.start","params":{"protocol":1,"stall":"sourcefed","state":"~/.local/state/sourcefed"}}
-{"jsonrpc":"2.0","id":1,"result":{"ready":true,"version":"0.6.0","jobs":{"poll":{"every":"15s"}}}}
+{"jsonrpc":"2.0","id":1,"method":"stall.start","params":{"protocol":1,"token":"…"}}
+{"jsonrpc":"2.0","id":1,"result":{"state":"/var/lib/barn/sourcefed"}}
 ```
 
 A stall asks the broker:
@@ -146,7 +153,6 @@ is built for them until B1 settles them:
 - `log`: the fields of a structured log line.
 - the error codes for `budget` and `unknown_outcome`, with what data they carry.
 - whether `Job.every` is a duration grammar, and which one.
-- whether `stall.start`'s `state` arrives expanded or as `~`.
-- how barn and a stall agree on a version: `stall.start` carries `protocol`, but
-  no result field answers with the version the stall speaks.
+- how barn reports an unsupported version: the stall sends its version in
+  `stall.start`'s `protocol` field.
 - the code of the error barn answers with when a body is over its cap.

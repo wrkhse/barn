@@ -4,7 +4,7 @@
 //! Every message is one line of JSON, so each field's name here is its wire
 //! name. A field added later is an addition inside a version, never a rename.
 
-use std::collections::BTreeMap;
+use std::fmt::{self, Debug, Formatter};
 
 use serde::{Deserialize, Serialize};
 
@@ -42,7 +42,7 @@ pub type Headers = Vec<(String, String)>;
 
 /// The names of the protocol's methods.
 pub mod method {
-    /// barn to stall: start, which returns the stall's jobs.
+    /// Stall to barn: authenticate and get the stall's state folder.
     pub const STALL_START: &str = "stall.start";
     /// barn to stall: report health.
     pub const STALL_HEALTH: &str = "stall.health";
@@ -68,15 +68,23 @@ pub mod method {
     pub const LOG: &str = "log";
 }
 
-/// The `stall.start` parameters barn sends.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The `stall.start` parameters a stall sends when it connects.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StallStartParams {
-    /// The protocol version barn speaks.
+    /// The protocol version the stall speaks.
     pub protocol: u32,
-    /// The stall's name, as its file in `~/.config/barn/stalls` names it.
-    pub stall: String,
-    /// The stall's state folder.
-    pub state: String,
+    /// The single-use token from `BARN_TOKEN`.
+    pub token: String,
+}
+
+impl Debug for StallStartParams {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StallStartParams")
+            .field("protocol", &self.protocol)
+            .field("token", &"[redacted]")
+            .finish()
+    }
 }
 
 /// A job a stall declares and barn keeps the timer for.
@@ -86,16 +94,11 @@ pub struct Job {
     pub every: String,
 }
 
-/// The `stall.start` result the stall answers with.
+/// The `stall.start` result barn sends after authenticating the stall.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StallStartResult {
-    /// Whether the stall is ready to take requests.
-    pub ready: bool,
-    /// The stall's own version.
-    pub version: String,
-    /// The jobs the stall declares, by name. A stall with no jobs sends none.
-    #[serde(default)]
-    pub jobs: BTreeMap<String, Job>,
+    /// The stall's state folder, as an absolute path.
+    pub state: String,
 }
 
 /// The secret a `net.request` names, and how barn adds it.
