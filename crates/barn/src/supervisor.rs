@@ -37,7 +37,6 @@ const MAX_LATE_HEALTH_REPLIES: usize = 3;
 const MAX_EXIT_DRAIN_FRAMES: usize = 64;
 const MAX_EXIT_DRAIN_BYTES: usize = 64 * 1024;
 const EXIT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
-const MAX_REJECTED_PEERS: usize = 16;
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const TOKEN_BYTES: usize = 32;
 const TOKEN_TTL: Duration = Duration::from_secs(TOKEN_TTL_SECS);
@@ -446,11 +445,12 @@ impl RunningStall {
     /// Accepts a connection from the child and responds to its start request.
     ///
     /// The returned reader keeps bytes the peer sent after the handshake.
-    /// Connections from other PIDs are dropped until the token deadline, so
-    /// one peer cannot end this handshake.
+    /// Connections from other PIDs are dropped; only the token deadline bounds
+    /// a flood of them, so one peer cannot end the real child's handshake.
     ///
     /// # Errors
-    /// Returns a named error for a timed-out, unauthenticated or invalid start.
+    /// Returns `TokenSpent` when the token is gone, `ConnectTimeout` when the
+    /// deadline passes, or a named error for an invalid start.
     pub async fn accept(&mut self) -> Result<BufReader<UnixStream>> {
         self.transport.accept(self.pid).await
     }
@@ -699,17 +699,35 @@ enum DrainStop {
     FrameLimit,
     /// The byte cap is reached.
     ByteLimit,
-    /// A read did not finish before the deadline.
+    /// The total deadline passed before the drain finished.
     Deadline,
 }
 
 /// Delivers the caller frames left on the connection at exit, in arrival
-/// order. Stops at the peer's close, a named cap or the read deadline,
-/// whichever comes first.
+/// order. One deadline bounds the whole drain, so a peer that trickles frames
+/// cannot hold up a restart by spending the timeout again on each line.
 async fn drain_on_exit(
     reader: &mut (impl AsyncBufRead + Unpin),
     current: u64,
     mut on_frame: impl FnMut(Vec<u8>),
+) -> DrainStop {
+    let started = TokioInstant::now();
+    let Some(deadline) = started.checked_add(EXIT_DRAIN_TIMEOUT) else {
+        return DrainStop::Deadline;
+    };
+    let draining = collect_exit_frames(reader, current, &mut on_frame);
+
+    timeout_at(deadline, draining)
+        .await
+        .unwrap_or(DrainStop::Deadline)
+}
+
+/// Collects frames until the peer closes or a frame or byte cap is reached.
+/// The caller's deadline cancels a slow read as well as a slow run of frames.
+async fn collect_exit_frames(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    current: u64,
+    on_frame: &mut impl FnMut(Vec<u8>),
 ) -> DrainStop {
     let mut frames = 0usize;
     let mut bytes = 0usize;
@@ -718,16 +736,11 @@ async fn drain_on_exit(
         let remaining = MAX_EXIT_DRAIN_BYTES.saturating_sub(bytes);
         let limit = u64::try_from(remaining).unwrap_or(u64::MAX);
         let mut line = Vec::new();
-        let read = timeout(
-            EXIT_DRAIN_TIMEOUT,
-            reader.take(limit).read_until(b'\n', &mut line),
-        )
-        .await;
-
-        let Ok(read) = read else {
-            return DrainStop::Deadline;
-        };
-        let read = read.unwrap_or(0);
+        let read = reader
+            .take(limit)
+            .read_until(b'\n', &mut line)
+            .await
+            .unwrap_or(0);
 
         if read == 0 {
             return DrainStop::Closed;
@@ -752,32 +765,24 @@ async fn drain_on_exit(
     }
 }
 
-/// Bounds the wrong-PID peers one accept call tolerates.
+/// The child barn spawned and the owner of its socket.
 struct PeerChecks {
     child: u32,
     owner: u32,
-    rejected: usize,
 }
 
 impl PeerChecks {
     const fn new(child: u32, owner: u32) -> Self {
-        Self {
-            child,
-            owner,
-            rejected: 0,
-        }
+        Self { child, owner }
     }
 
-    /// Accepts the child; wrong peers are dropped up to the bound and
-    /// skipped after it, so peer misbehaviour never ends a handshake.
-    fn check(&mut self, pid: Option<i32>, uid: u32) -> Result<bool> {
+    /// Accepts only the child; wrong peers are dropped without a count or a
+    /// cap. The token deadline bounds the wait, so a flood cannot fail the
+    /// real child's handshake.
+    fn check(&self, pid: Option<i32>, uid: u32) -> Result<bool> {
         match verify_peer(pid, uid, self.child, self.owner) {
             Ok(()) => Ok(true),
-            Err(SupervisorError::PeerPidMismatch) => {
-                self.rejected = self.rejected.saturating_add(1).min(MAX_REJECTED_PEERS);
-
-                Ok(false)
-            }
+            Err(SupervisorError::PeerPidMismatch) => Ok(false),
             Err(error) => Err(error),
         }
     }
@@ -785,18 +790,21 @@ impl PeerChecks {
 
 impl Transport {
     /// Holds the listener open until the token expires. Wrong peers are
-    /// dropped; only the child can end the wait with its handshake.
+    /// dropped without a cap, so a flood ends as `ConnectTimeout` and cannot
+    /// fail the child. A spent token is refused at once as `TokenSpent`.
     async fn accept(&mut self, child_pid: u32) -> Result<BufReader<UnixStream>> {
-        let deadline = self.token.as_ref().map_or_else(TokioInstant::now, |token| {
-            TokioInstant::from_std(token.expires_at)
-        });
+        let deadline = self
+            .token
+            .as_ref()
+            .ok_or(SupervisorError::TokenSpent)
+            .map(|token| TokioInstant::from_std(token.expires_at))?;
         timeout_at(deadline, self.handshake(child_pid))
             .await
             .map_err(|_| SupervisorError::ConnectTimeout)?
     }
 
     async fn handshake(&mut self, child_pid: u32) -> Result<BufReader<UnixStream>> {
-        let mut checks = PeerChecks::new(child_pid, self.uid);
+        let checks = PeerChecks::new(child_pid, self.uid);
         let stream = loop {
             let accepted = self.listener.accept().await;
             let (stream, _) = io_at("accepting stall socket", accepted)?;
@@ -1287,15 +1295,17 @@ mod tests {
         ));
     }
 
+    /// The accept loop calls `check` until the token deadline, so a flood of
+    /// wrong peers cannot keep the child's own start from being accepted.
     #[test]
     fn wrong_pid_peers_never_end_the_handshake_and_a_later_child_is_accepted() {
         let wrong = Some(18);
-        let mut checks = PeerChecks::new(17, 42);
+        let checks = PeerChecks::new(17, 42);
+        let flood = 1024;
 
-        for _ in 0..MAX_REJECTED_PEERS.saturating_mul(4) {
+        for _ in 0..flood {
             assert_eq!(checks.check(wrong, 42).ok(), Some(false));
         }
-        assert_eq!(checks.rejected, MAX_REJECTED_PEERS);
         assert_eq!(checks.check(Some(17), 42).ok(), Some(true));
     }
 
@@ -1304,6 +1314,87 @@ mod tests {
             secret: "secret".to_owned(),
             expires_at,
         }
+    }
+
+    /// A transport bound to `root/proto.sock`, with a token at `expiry`.
+    fn test_transport(root: &Path, expiry: Option<Instant>) -> Transport {
+        let socket = root.join(SOCKET_FILE);
+        let std_listener = StdUnixListener::bind(&socket).expect("stall socket");
+        std_listener
+            .set_nonblocking(true)
+            .expect("nonblocking stall socket");
+        let owner = fs::metadata(&socket).expect("socket owner").uid();
+        let listener = UnixListener::from_std(std_listener).expect("stall listener");
+        let lock = File::open(root).expect("run directory lock");
+        Transport {
+            listener,
+            run_dir: RunDir {
+                path: root.to_path_buf(),
+                _lock: lock,
+            },
+            state: String::new(),
+            uid: owner,
+            token: expiry.map(issued),
+            jobs: BTreeMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_accept_with_a_spent_token_returns_token_spent() {
+        let fixture = PrepareFixture::new();
+        let deadline = Instant::now()
+            .checked_add(TOKEN_TTL)
+            .expect("the token deadline fits");
+        let socket = fixture.0.join(SOCKET_FILE);
+        let mut transport = test_transport(&fixture.0, Some(deadline));
+        let child = std::process::id();
+
+        let mut peer = UnixStream::connect(&socket)
+            .await
+            .expect("the child connects");
+        peer.write_all(START).await.expect("the start request");
+        let stream = transport.accept(child).await.expect("the first handshake");
+        drop(stream);
+        drop(peer);
+
+        // No peer sends a second frame: a spent token is refused at once.
+        let short = Duration::from_millis(100);
+        let second = timeout(short, transport.accept(child)).await;
+        assert!(matches!(second, Ok(Err(SupervisorError::TokenSpent))));
+    }
+
+    #[tokio::test]
+    async fn wrong_pid_peers_are_bounded_only_by_the_token_deadline() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fixture = PrepareFixture::new();
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(500))
+            .expect("the token deadline fits");
+        let socket = fixture.0.join(SOCKET_FILE);
+        let mut transport = test_transport(&fixture.0, Some(deadline));
+        let arrivals = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&arrivals);
+
+        // This process is never the expected child, so every peer is wrong.
+        let wrong_child = std::process::id().wrapping_add(1);
+        let flood = tokio::spawn(async move {
+            loop {
+                let Ok(mut peer) = UnixStream::connect(&socket).await else {
+                    break;
+                };
+                counted.fetch_add(1, Ordering::Relaxed);
+                let _ = peer.write_all(START).await;
+                sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let accepted = transport.accept(wrong_child).await;
+        flood.abort();
+
+        assert!(arrivals.load(Ordering::Relaxed) > 1);
+        assert!(matches!(accepted, Err(SupervisorError::ConnectTimeout)));
     }
 
     #[test]
@@ -2397,6 +2488,31 @@ mod tests {
             DrainStop::Closed
         );
         assert_eq!(delivered, [log_frame(1), log_frame(2), log_frame(3)]);
+    }
+
+    #[tokio::test]
+    async fn a_trickle_of_exit_frames_stops_at_one_total_deadline() {
+        let (barn, mut stall) = UnixStream::pair().expect("connected sockets");
+        let mut reader = BufReader::new(barn);
+        let writer = tokio::spawn(async move {
+            for n in 0..MAX_EXIT_DRAIN_FRAMES {
+                stall
+                    .write_all(&log_frame(n))
+                    .await
+                    .expect("a trickled frame");
+                sleep(EXIT_DRAIN_TIMEOUT / 4).await;
+            }
+        });
+
+        let started = TokioInstant::now();
+        let mut delivered = Vec::new();
+        let stop = drain_on_exit(&mut reader, 1, |f| delivered.push(f)).await;
+        let elapsed = started.elapsed();
+        writer.abort();
+
+        assert_eq!(stop, DrainStop::Deadline);
+        assert!(elapsed < EXIT_DRAIN_TIMEOUT.saturating_mul(2));
+        assert!(delivered.len() < MAX_EXIT_DRAIN_FRAMES);
     }
 
     #[tokio::test]
