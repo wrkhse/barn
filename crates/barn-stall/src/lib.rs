@@ -13,8 +13,10 @@
 //!
 //! [protocol]: https://github.com/wrkhse/barn/blob/main/docs/stall-protocol.md
 
+pub mod frames;
 pub mod protocol;
 
+pub use frames::{Content, FRAMED_VERSION, Meta, Outcome, Reply, Request, ToolCall};
 pub use protocol::{
     BodyEncoding, DEFAULT_MAX_BODY_BYTES, DENIED_CODE, Headers, Job, MAX_LINE_BYTES, NetAuth,
     NetRequestParams, NetResponse, PROTOCOL_VERSION, StallStartParams, StallStartResult, method,

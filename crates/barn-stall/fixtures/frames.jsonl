@@ -1,0 +1,14 @@
+{"type":"hook","id":1,"version":1,"hook":"PreToolUse","call":{"tool":"bash","name":"run","input":{"command":"git push"}}}
+{"type":"hook","id":1,"outcome":{"deny":{"reason":"push blocked"}}}
+{"type":"hook","id":2,"version":1,"hook":"PostToolUse","call":{"tool":"bash","name":"run","input":{"command":"git status"},"session_id":"sess-42"},"_meta":{"traceparent":"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01","tracestate":"congo=t61rcWkgMzE"}}
+{"type":"hook","id":2,"outcome":{"rewrite":{"command":"git status --short"}}}
+{"type":"hook","id":3,"version":1,"hook":"PreToolUse","call":{"tool":"notes","name":"read","input":{"path":"/tmp/a.txt"}}}
+{"type":"hook","id":3,"outcome":"allow"}
+{"type":"hook","id":4,"version":1,"hook":"PostToolUse","call":{"tool":"notes","name":"write","input":{"path":"/tmp/a.txt","text":"hi"}}}
+{"type":"hook","id":4,"outcome":{"annotate":{"text":"review before merge"}}}
+{"type":"hook","id":5,"version":1,"hook":"PreToolUse","call":{"tool":"bash","name":"run","input":{"command":"echo hi"}}}
+{"type":"hook","id":5,"outcome":"drop"}
+{"type":"tool","id":6,"version":1,"call":{"tool":"notes","name":"read","input":{"path":"/tmp/note.txt"}}}
+{"type":"tool","id":6,"content":{"kind":"text","text":"buy milk"}}
+{"type":"hook","id":7,"version":1,"hook":"PreToolUse","call":{"tool":"bash","name":"run","input":{"command":"rm -rf /tmp/x"}}}
+{"type":"error","id":7,"error":"stall_unavailable","message":"the plugin stall did not answer"}
