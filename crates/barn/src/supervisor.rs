@@ -831,7 +831,8 @@ fn prepare(state_dir: &Path, spec: &StallSpec) -> Result<Prepared> {
         .to_capability_set()?
         .allow_path(&state, AccessMode::ReadWrite)
         .map_err(SupervisorError::StatePolicy)?;
-    let caps = allow_shell(caps, shell_grants(&grant))?;
+    let shell = shell_grants(&grant, Path::new(SHELL_SHIM), SHELL_GRANTS);
+    let caps = allow_shell(caps, shell)?;
 
     let socket = run_dir.path(SOCKET_FILE);
     let listener = io_at("binding stall socket", StdUnixListener::bind(&socket))?;
@@ -868,12 +869,11 @@ fn prepare(state_dir: &Path, spec: &StallSpec) -> Result<Prepared> {
     })
 }
 
-/// `SHELL_GRANTS` when the grant lets the stall execute `/bin/sh`, else none.
+/// `paths` when the grant lets the stall execute `shim`, else none.
 ///
 /// The executable may name the shim, or a read path may cover it: Seatbelt
 /// lets a stall execute what it can read, so it can start the shim itself.
-fn shell_grants(grant: &Grant) -> &'static [&'static str] {
-    let shim = Path::new(SHELL_SHIM);
+fn shell_grants<'a>(grant: &Grant, shim: &Path, paths: &'a [&str]) -> &'a [&'a str] {
     let resolved = shim.canonicalize().ok();
     let executable = grant
         .executable
@@ -882,7 +882,7 @@ fn shell_grants(grant: &Grant) -> &'static [&'static str] {
     let names_shim = resolved.is_some() && executable == resolved;
 
     if names_shim || grant.allows_read(shim) {
-        SHELL_GRANTS
+        paths
     } else {
         &[]
     }
@@ -1652,6 +1652,56 @@ mod tests {
     #[test]
     fn a_stall_not_granted_the_shell_gets_no_shim_literals() {
         assert_eq!(shim_entries(&PrepareFixture::spec()), []);
+    }
+
+    /// Stand-ins for `SHELL_GRANTS`, which is empty off macOS.
+    const FAKE_GRANTS: &[&str] = &["/fake/link", "/fake/shell"];
+
+    /// An empty file standing in for the shim, so it canonicalizes.
+    fn fake_shim(fixture: &PrepareFixture) -> PathBuf {
+        let shim = fixture.0.join("sh");
+        fs::write(&shim, b"").expect("fake shim");
+
+        shim
+    }
+
+    #[test]
+    fn a_grant_naming_the_shim_gets_the_shell_grants() {
+        let fixture = PrepareFixture::new();
+        let shim = fake_shim(&fixture);
+        let grant = Grant {
+            executable: Some(shim.clone()),
+            ..Grant::default()
+        };
+
+        assert_eq!(shell_grants(&grant, &shim, FAKE_GRANTS), FAKE_GRANTS);
+    }
+
+    #[test]
+    fn a_read_path_over_the_shim_gets_the_shell_grants() {
+        let fixture = PrepareFixture::new();
+        let shim = fake_shim(&fixture);
+        let grant = Grant {
+            read_paths: vec![fixture.0.clone()],
+            ..Grant::default()
+        };
+
+        assert_eq!(shell_grants(&grant, &shim, FAKE_GRANTS), FAKE_GRANTS);
+    }
+
+    #[test]
+    fn an_unrelated_grant_gets_no_shell_grants() {
+        let fixture = PrepareFixture::new();
+        let shim = fake_shim(&fixture);
+        let other = fixture.0.join("other");
+        fs::write(&other, b"").expect("other program");
+        let grant = Grant {
+            executable: Some(other),
+            ..Grant::default()
+        };
+        let none: &[&str] = &[];
+
+        assert_eq!(shell_grants(&grant, &shim, FAKE_GRANTS), none);
     }
 
     #[test]
