@@ -1106,6 +1106,17 @@ fn a_poisoned_call_lock_fails_closed() {
 
 #[test]
 fn clippy_configs_share_the_sandbox_thresholds() {
+    fn config_value<'a>(config: &'a str, key: &str) -> &'a str {
+        let line = config
+            .lines()
+            .find(|line| line.starts_with(key))
+            .unwrap_or_else(|| panic!("{key} is missing from clippy.toml"));
+        let (_, raw) = line
+            .split_once('=')
+            .unwrap_or_else(|| panic!("{key} has no value in clippy.toml"));
+        raw.trim()
+    }
+
     let workspace = include_str!("../../../../clippy.toml");
     let crate_local = include_str!("../../clippy.toml");
     for key in [
@@ -1115,13 +1126,10 @@ fn clippy_configs_share_the_sandbox_thresholds() {
         "allow-panic-in-tests",
         "allow-indexing-slicing-in-tests",
     ] {
-        assert!(
-            workspace.contains(key),
-            "{key} is missing from the workspace clippy.toml"
-        );
-        assert!(
-            crate_local.contains(key),
-            "{key} is missing from barn-luau's clippy.toml"
+        assert_eq!(
+            config_value(workspace, key),
+            config_value(crate_local, key),
+            "{key} differs between the workspace and barn-luau clippy.toml"
         );
     }
 
