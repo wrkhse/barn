@@ -261,6 +261,9 @@ pub enum SupervisorError {
     /// The name is reserved or not a single path component.
     #[error("invalid stall name")]
     InvalidName,
+    /// A name differs only in case from one already on disk.
+    #[error("stall name collides with one differing only in case")]
+    NameCollision,
     /// The target is not the executable named in the grant.
     #[error("stall program does not match its executable grant")]
     ExecutableNotGranted,
@@ -449,7 +452,7 @@ impl RunningStall {
     /// a flood of them, so one peer cannot end the real child's handshake.
     ///
     /// # Errors
-    /// Returns `TokenSpent` when the token is gone, `ConnectTimeout` when the
+    /// Returns `TokenSpent` when the token is gone, `TokenExpired` when the
     /// deadline passes, or a named error for an invalid start.
     pub async fn accept(&mut self) -> Result<BufReader<UnixStream>> {
         self.transport.accept(self.pid).await
@@ -790,17 +793,25 @@ impl PeerChecks {
 
 impl Transport {
     /// Holds the listener open until the token expires. Wrong peers are
-    /// dropped without a cap, so a flood ends as `ConnectTimeout` and cannot
-    /// fail the child. A spent token is refused at once as `TokenSpent`.
+    /// dropped without a cap; a flood ends as `TokenExpired` with the token
+    /// consumed. A spent token is refused as `TokenSpent` after its pending
+    /// peer is closed, so the child sees that connection end.
     async fn accept(&mut self, child_pid: u32) -> Result<BufReader<UnixStream>> {
-        let deadline = self
-            .token
-            .as_ref()
-            .ok_or(SupervisorError::TokenSpent)
-            .map(|token| TokioInstant::from_std(token.expires_at))?;
-        timeout_at(deadline, self.handshake(child_pid))
-            .await
-            .map_err(|_| SupervisorError::ConnectTimeout)?
+        let spent = self.token.is_none();
+        let remaining = self.token.as_ref().map_or(Duration::ZERO, |token| {
+            token.expires_at.saturating_duration_since(Instant::now())
+        });
+        let accepted = timeout(remaining, self.handshake(child_pid)).await;
+
+        match accepted {
+            Ok(result) => result,
+            Err(_) if spent => Err(SupervisorError::TokenSpent),
+            Err(_) => {
+                self.token = None;
+
+                Err(SupervisorError::TokenExpired)
+            }
+        }
     }
 
     async fn handshake(&mut self, child_pid: u32) -> Result<BufReader<UnixStream>> {
@@ -1085,6 +1096,23 @@ fn pin_executable(grant: &Grant, program: PathBuf) -> Grant {
     }
 }
 
+/// Whether `dir` holds an entry whose name matches only without case.
+fn case_variant(dir: &Path, name: &str) -> Result<bool> {
+    for entry in io_at("reading barn directory", fs::read_dir(dir))? {
+        let entry = io_at("reading barn directory entry", entry)?;
+        let existing = entry.file_name();
+        let Some(existing) = existing.to_str() else {
+            continue;
+        };
+
+        if existing != name && existing.eq_ignore_ascii_case(name) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 fn run_paths(state_dir: &Path, name: &str) -> Result<(RunDir, String)> {
     io_at(
         "creating barn state root",
@@ -1101,6 +1129,11 @@ fn run_paths(state_dir: &Path, name: &str) -> Result<(RunDir, String)> {
 
     if !is_private_dir(&root, owner) {
         return Err(SupervisorError::RunRoot);
+    }
+
+    // A case-only variant shares these paths on a case-insensitive volume.
+    if case_variant(&state_dir, name)? || case_variant(&run_root, name)? {
+        return Err(SupervisorError::NameCollision);
     }
 
     let state = state_dir
@@ -1349,10 +1382,12 @@ mod tests {
         let mut transport = test_transport(&fixture.0, Some(deadline));
         let child = std::process::id();
 
+        let mut start = START.to_vec();
+        start.push(b'\n');
         let mut peer = UnixStream::connect(&socket)
             .await
             .expect("the child connects");
-        peer.write_all(START).await.expect("the start request");
+        peer.write_all(&start).await.expect("the start request");
         let stream = transport.accept(child).await.expect("the first handshake");
         drop(stream);
         drop(peer);
@@ -1364,7 +1399,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrong_pid_peers_are_bounded_only_by_the_token_deadline() {
+    async fn a_spent_token_refusal_closes_the_pending_peer() {
+        let fixture = PrepareFixture::new();
+        let deadline = Instant::now()
+            .checked_add(TOKEN_TTL)
+            .expect("the token deadline fits");
+        let socket = fixture.0.join(SOCKET_FILE);
+        let mut transport = test_transport(&fixture.0, Some(deadline));
+        let child = std::process::id();
+        let mut start = START.to_vec();
+        start.push(b'\n');
+
+        let mut peer = UnixStream::connect(&socket)
+            .await
+            .expect("the child connects");
+        peer.write_all(&start).await.expect("the start request");
+        drop(transport.accept(child).await.expect("the first handshake"));
+        drop(peer);
+
+        let mut spent_peer = UnixStream::connect(&socket)
+            .await
+            .expect("the child reconnects with the spent token");
+        spent_peer
+            .write_all(&start)
+            .await
+            .expect("the second start request");
+        let refused = transport.accept(child).await;
+
+        let mut extra = Vec::new();
+        let short = Duration::from_millis(100);
+        let closed = timeout(short, spent_peer.read_to_end(&mut extra)).await;
+        assert!(matches!(refused, Err(SupervisorError::TokenSpent)));
+        assert!(matches!(closed, Ok(Ok(0))));
+    }
+
+    #[tokio::test]
+    async fn a_token_at_its_deadline_expires_when_no_peer_connects() {
+        let fixture = PrepareFixture::new();
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("the past deadline fits");
+        let mut transport = test_transport(&fixture.0, Some(past));
+
+        assert!(matches!(
+            transport.accept(std::process::id()).await,
+            Err(SupervisorError::TokenExpired)
+        ));
+        assert!(transport.token.is_none());
+    }
+
+    #[tokio::test]
+    async fn wrong_pid_peers_are_bounded_only_by_the_token_expiry() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1394,7 +1479,8 @@ mod tests {
         flood.abort();
 
         assert!(arrivals.load(Ordering::Relaxed) > 1);
-        assert!(matches!(accepted, Err(SupervisorError::ConnectTimeout)));
+        assert!(matches!(accepted, Err(SupervisorError::TokenExpired)));
+        assert!(transport.token.is_none());
     }
 
     #[test]
@@ -1490,6 +1576,26 @@ mod tests {
             prepare(Path::new(""), &spec),
             Err(SupervisorError::ExecutableNotGranted)
         ));
+    }
+
+    #[test]
+    fn names_differing_only_in_case_are_rejected() {
+        let fixture = PrepareFixture::new();
+        let spec = |name: &str| StallSpec {
+            name: name.to_owned(),
+            ..PrepareFixture::spec()
+        };
+        let first = prepare(&fixture.0, &spec("Foo")).expect("the first name");
+
+        for variant in ["foo", "FOO", "fOo"] {
+            assert!(matches!(
+                prepare(&fixture.0, &spec(variant)),
+                Err(SupervisorError::NameCollision)
+            ));
+        }
+
+        drop(first);
+        assert!(prepare(&fixture.0, &spec("Foo")).is_ok());
     }
 
     #[tokio::test]
