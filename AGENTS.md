@@ -86,6 +86,8 @@ returns at once unless `CI` is set.
 
 ## Protocol changes
 
+Until barn's first release, the stall protocol is a draft: version 1 may change in place (barn#21 Decided, supervisor 2026-11-25).
+
 `crates/barn-stall` and `docs/stall-protocol.md` change in the same commit.
 Fields are only added within a version; a rename or a removal is a new version,
 and barn speaks the current version and the one before it. Anything the plan
