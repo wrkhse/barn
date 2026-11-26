@@ -324,4 +324,72 @@ mod tests {
             Err(EngineError::InvalidResult("sparse Lua array".into()))
         );
     }
+
+    #[test]
+    fn lua_key_accepts_an_integer_key_at_its_exact_string_form() {
+        assert_eq!(lua_key(LuaValue::Integer(7)), Ok("7".to_owned()));
+    }
+
+    #[test]
+    fn lua_key_accepts_a_float_key_at_its_exact_string_form() {
+        assert_eq!(lua_key(LuaValue::Number(7.5)), Ok("7.5".to_owned()));
+    }
+
+    #[test]
+    fn json_to_lua_accepts_depth_16_and_refuses_depth_17() {
+        let lua = Lua::new();
+
+        assert_eq!(json_to_lua(&lua, &Value::Null, 16), Ok(LuaValue::Nil));
+        assert_eq!(
+            json_to_lua(&lua, &Value::Null, 17),
+            Err(EngineError::Limit(LimitCause::TooDeep { limit: 16 }))
+        );
+    }
+
+    #[test]
+    fn json_to_lua_accepts_1024_array_entries_and_refuses_1025() {
+        let lua = Lua::new();
+        let at_cap = Value::Array(vec![Value::Bool(true); 1024]);
+        let past_cap = Value::Array(vec![Value::Bool(true); 1025]);
+
+        assert!(json_to_lua(&lua, &at_cap, 0).is_ok());
+        assert_eq!(
+            json_to_lua(&lua, &past_cap, 0),
+            Err(EngineError::Limit(LimitCause::TooManyEntries {
+                limit: 1024
+            }))
+        );
+    }
+
+    #[test]
+    fn json_to_lua_accepts_1024_object_entries_and_refuses_1025() {
+        let lua = Lua::new();
+        let build = |count: usize| {
+            (0..count)
+                .map(|index| (format!("k{index}"), Value::Bool(true)))
+                .collect::<Map<String, Value>>()
+        };
+        let at_cap = Value::Object(build(1024));
+        let past_cap = Value::Object(build(1025));
+
+        assert!(json_to_lua(&lua, &at_cap, 0).is_ok());
+        assert_eq!(
+            json_to_lua(&lua, &past_cap, 0),
+            Err(EngineError::Limit(LimitCause::TooManyEntries {
+                limit: 1024
+            }))
+        );
+    }
+
+    #[test]
+    fn lua_to_json_accepts_depth_16_and_refuses_depth_17() {
+        assert_eq!(
+            lua_to_json(LuaValue::Integer(1), 16),
+            Ok(serde_json::json!(1))
+        );
+        assert_eq!(
+            lua_to_json(LuaValue::Integer(1), 17),
+            Err(EngineError::Limit(LimitCause::TooDeep { limit: 16 }))
+        );
+    }
 }

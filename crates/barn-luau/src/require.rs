@@ -338,4 +338,61 @@ mod tests {
             RequireCause::TooLarge("./over".into())
         );
     }
+
+    struct Folder {
+        path: PathBuf,
+    }
+
+    impl Folder {
+        fn new() -> Self {
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("barn-require-folder-{id}"));
+            std::fs::create_dir_all(&path).expect("create scratch folder");
+            Self { path }
+        }
+
+        fn write(&self, name: &str, bytes: Vec<u8>) {
+            std::fs::write(self.path.join(name), bytes).expect("write module");
+        }
+    }
+
+    impl Drop for Folder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn scoped_require_enforces_a_fixed_one_mib_cap() {
+        let folder = Folder::new();
+
+        // Literal sizes, so a change to MAX_MODULE_BYTES cannot move the
+        // boundary this test checks.
+        folder.write("huge.luau", vec![b'x'; 1_048_577]);
+
+        let lua = Lua::new();
+        let state = RequireState::new(&folder.path).expect("require state");
+        let loader = install(&lua, state).expect("install require");
+
+        let error = loader
+            .call::<LuaValue>(("./huge",))
+            .expect_err("a module past one MiB is refused");
+        assert_eq!(
+            error
+                .downcast_ref::<RequireCause>()
+                .expect("error carries a require cause"),
+            &RequireCause::TooLarge("./huge".into())
+        );
+
+        // A module of exactly one MiB still loads through the same path.
+        let mut at_cap = b"return {}".to_vec();
+        at_cap.push(b'\n');
+        at_cap.extend_from_slice(b"--");
+        at_cap.resize(1_048_576, b'x');
+        folder.write("exact.luau", at_cap);
+
+        loader
+            .call::<LuaValue>(("./exact",))
+            .expect("a module at one MiB loads");
+    }
 }
