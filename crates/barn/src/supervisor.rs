@@ -35,6 +35,8 @@ const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PENDING_HEALTH_FRAMES: usize = 4;
 const MAX_LATE_HEALTH_REPLIES: usize = 3;
+const MAX_EXIT_DRAIN_FRAMES: usize = 64;
+const MAX_EXIT_DRAIN_BYTES: usize = 64 * 1024;
 const MAX_REJECTED_PEERS: usize = 16;
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const TOKEN_BYTES: usize = 32;
@@ -501,7 +503,13 @@ impl RunningStall {
             };
 
             probe.pending.drain(..).for_each(&mut on_frame);
-            let Some(check) = check else { break };
+            let Some(check) = check else {
+                if let Some(mut connection) = probe.connection.take() {
+                    drain_on_exit(&mut connection, probe.id, &mut on_frame).await;
+                }
+
+                break;
+            };
 
             if self.record_health(check) == HealthDecision::Restart {
                 break;
@@ -683,9 +691,63 @@ fn classify_health_frame(line: &[u8], current: u64) -> HealthFrame {
     match reply.get("id").and_then(Value::as_u64) {
         None => HealthFrame::Invalid(InvalidHealthReply::NonNumeric),
         Some(0) => HealthFrame::Invalid(InvalidHealthReply::Zero),
-        Some(id) if id == current => HealthFrame::Matching,
         Some(id) if id < current => HealthFrame::Late,
+        Some(id) if id == current => HealthFrame::Matching,
         Some(_) => HealthFrame::Invalid(InvalidHealthReply::Future),
+    }
+}
+
+/// Why draining the connection at exit stops.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DrainStop {
+    /// The peer closed and the buffer holds no more frames.
+    Closed,
+    /// The frame cap is reached.
+    FrameLimit,
+    /// The byte cap is reached.
+    ByteLimit,
+}
+
+/// Delivers the caller frames left on the connection at exit, in arrival
+/// order. Stops at the peer's close or at a named cap, whichever comes first.
+async fn drain_on_exit(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    current: u64,
+    mut on_frame: impl FnMut(Vec<u8>),
+) -> DrainStop {
+    let mut frames = 0usize;
+    let mut bytes = 0usize;
+
+    while frames < MAX_EXIT_DRAIN_FRAMES && bytes < MAX_EXIT_DRAIN_BYTES {
+        let remaining = MAX_EXIT_DRAIN_BYTES.saturating_sub(bytes);
+        let limit = u64::try_from(remaining).unwrap_or(u64::MAX);
+        let mut line = Vec::new();
+        let read = reader
+            .take(limit)
+            .read_until(b'\n', &mut line)
+            .await
+            .unwrap_or(0);
+
+        if read == 0 {
+            return DrainStop::Closed;
+        }
+
+        if line.last() != Some(&b'\n') {
+            return DrainStop::ByteLimit;
+        }
+
+        bytes = bytes.saturating_add(read);
+        frames = frames.saturating_add(1);
+
+        if classify_health_frame(&line, current) == HealthFrame::Ordinary {
+            on_frame(line);
+        }
+    }
+
+    if frames >= MAX_EXIT_DRAIN_FRAMES {
+        DrainStop::FrameLimit
+    } else {
+        DrainStop::ByteLimit
     }
 }
 
@@ -2087,6 +2149,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reply_whose_id_equals_the_probe_id_is_the_matching_answer() {
+        let line = br#"{"jsonrpc":"2.0","id":7,"result":null}"#;
+        let mut with_newline = line.to_vec();
+        with_newline.push(b'\n');
+
+        assert_eq!(
+            classify_health_frame(&with_newline, 7),
+            HealthFrame::Matching
+        );
+
+        let mut probe = HealthProbe {
+            id: 7,
+            ..HealthProbe::default()
+        };
+        let mut reader = with_newline.as_slice();
+
+        assert_eq!(
+            probe.read_reply(&mut reader, |_| {}).await,
+            HealthCheck::Answered
+        );
+    }
+
+    #[tokio::test]
     async fn four_log_frames_before_the_matching_reply_are_answered_and_kept() {
         let count = MAX_PENDING_HEALTH_FRAMES.saturating_add(1);
         let logs: Vec<Vec<u8>> = (0..count)
@@ -2237,5 +2322,52 @@ mod tests {
             });
             assert_eq!(decision, expected);
         }
+    }
+
+    /// A caller log frame with a sequence number.
+    fn log_frame(n: usize) -> Vec<u8> {
+        format!("{{\"jsonrpc\":\"2.0\",\"method\":\"log\",\"n\":{n}}}\n").into_bytes()
+    }
+
+    #[tokio::test]
+    async fn draining_at_exit_delivers_buffered_logs_in_arrival_order() {
+        let matching = b"{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":null}\n";
+        let input = [log_frame(1), matching.to_vec(), log_frame(2), log_frame(3)].concat();
+        let mut reader = BufReader::new(input.as_slice());
+        let mut delivered = Vec::new();
+
+        assert_eq!(
+            drain_on_exit(&mut reader, 3, |frame| delivered.push(frame)).await,
+            DrainStop::Closed
+        );
+        assert_eq!(delivered, [log_frame(1), log_frame(2), log_frame(3)]);
+    }
+
+    #[tokio::test]
+    async fn draining_at_exit_stops_at_the_named_caps() {
+        let logs: Vec<Vec<u8>> = (0..MAX_EXIT_DRAIN_FRAMES.saturating_add(2))
+            .map(log_frame)
+            .collect();
+        let input = logs.concat();
+        let mut reader = BufReader::new(input.as_slice());
+        let mut delivered = Vec::new();
+
+        assert_eq!(
+            drain_on_exit(&mut reader, 1, |frame| delivered.push(frame)).await,
+            DrainStop::FrameLimit
+        );
+        assert_eq!(delivered, logs[..MAX_EXIT_DRAIN_FRAMES].to_vec());
+
+        let mut large = b"{\"jsonrpc\":\"2.0\",\"method\":\"log\",\"body\":\"".to_vec();
+        large.resize(MAX_EXIT_DRAIN_BYTES, b'x');
+        large.extend_from_slice(b"\"}\n");
+        let mut reader = BufReader::new(large.as_slice());
+        let mut delivered = Vec::new();
+
+        assert_eq!(
+            drain_on_exit(&mut reader, 1, |frame| delivered.push(frame)).await,
+            DrainStop::ByteLimit
+        );
+        assert_eq!(delivered, Vec::<Vec<u8>>::new());
     }
 }

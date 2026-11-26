@@ -13,6 +13,7 @@ use barn::Grant;
 use barn::supervisor::{HealthCheck, HealthDecision, HealthTracker};
 use barn::supervisor::{RestartDecision, RestartOutcome, RestartPolicy};
 use barn::supervisor::{StallSpec, Supervisor, SupervisorError};
+use barn_stall::Job;
 use serde_json::{Value, json};
 use tokio::time::timeout;
 
@@ -275,6 +276,34 @@ async fn supervision_replaces_an_unhealthy_child_and_checks_the_replacement() {
     assert_eq!(frames, [LOG_FRAME.as_bytes().to_vec()]);
 }
 
+#[tokio::test]
+async fn a_start_reply_exposes_the_declared_jobs() {
+    if std::env::var_os("CI").is_none() {
+        return;
+    }
+
+    let scratch = Scratch::new().expect("scratch folder");
+    let helper = scratch.dir.join("fixture-exec");
+    fs::write(&helper, "#!/bin/sh\nshift\nexec \"$@\"\n").expect("fixture helper");
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).expect("helper mode");
+    let program = std::env::current_exe().expect("fixture executable");
+    let spec = StallSpec {
+        name: "stall".to_owned(),
+        program: program.clone(),
+        args: ["--exact", "jobs_stall_fixture"].map(Into::into).to_vec(),
+        grant: Grant {
+            executable: Some(program),
+            ..Grant::default()
+        },
+    };
+    let supervisor = Supervisor::new(scratch.state(), helper);
+    let mut stall = supervisor.start(spec).await.expect("start child");
+
+    stall.accept().await.expect("authenticate child");
+
+    assert_eq!(stall.jobs(), declared_jobs().as_slice());
+}
+
 const LOG_FRAME: &str = concat!(
     r#"{"jsonrpc":"2.0","method":"log","params":{"message":"replacement ready"}}"#,
     "\n"
@@ -298,13 +327,13 @@ fn health_stall_fixture() {
     if !first {
         let old = fs::read_to_string(&marker).expect("first launch token");
         assert_ne!(old, token);
-        let mut rejected = connect_stall(&socket, &old).expect("offer the old token");
+        let mut rejected = connect_stall(&socket, &old, &[]).expect("offer the old token");
         let mut line = String::new();
 
         assert_eq!(rejected.read_line(&mut line).expect("old token refused"), 0);
     }
 
-    let mut client = connect_stall(&socket, &token).expect("offer the issued token");
+    let mut client = connect_stall(&socket, &token, &[]).expect("offer the issued token");
     assert_eq!(
         read_message(&mut client),
         Some(json!({"jsonrpc":"2.0","id":"start","result":{"state":state}}))
@@ -331,14 +360,32 @@ fn health_stall_fixture() {
     }
 }
 
-fn connect_stall(socket: &Path, token: &str) -> io::Result<BufReader<UnixStream>> {
+#[test]
+fn jobs_stall_fixture() {
+    let Some(socket) = std::env::var_os("BARN_SOCKET").map(PathBuf::from) else {
+        return;
+    };
+    let token = std::env::var("BARN_TOKEN").expect("start token");
+    let mut client =
+        connect_stall(&socket, &token, &declared_jobs()).expect("connect with declared jobs");
+
+    assert!(read_message(&mut client).is_some());
+}
+
+fn declared_jobs() -> Vec<Job> {
+    vec![Job {
+        every: "15s".to_owned(),
+    }]
+}
+
+fn connect_stall(socket: &Path, token: &str, jobs: &[Job]) -> io::Result<BufReader<UnixStream>> {
     let mut stream = UnixStream::connect(socket)?;
     let deadline = Some(Duration::from_secs(35));
     stream.set_read_timeout(deadline)?;
     stream.set_write_timeout(deadline)?;
     let start = json!({
         "jsonrpc":"2.0", "id":"start", "method":"stall.start",
-        "params":{"protocol":1,"token":token}
+        "params":{"protocol":1,"token":token,"jobs":jobs}
     });
     writeln!(stream, "{start}")?;
 
