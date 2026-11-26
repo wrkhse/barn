@@ -1598,6 +1598,41 @@ mod tests {
         assert!(prepare(&fixture.0, &spec("Foo")).is_ok());
     }
 
+    #[test]
+    fn a_case_variant_in_either_path_alone_is_rejected() {
+        let spec = |name: &str| StallSpec {
+            name: name.to_owned(),
+            ..PrepareFixture::spec()
+        };
+
+        // Only the state root holds a case-only variant of "foo".
+        let state_only = PrepareFixture::new();
+        DirBuilder::new()
+            .mode(PRIVATE_DIR)
+            .create(state_only.0.join("FOO"))
+            .expect("the state-only case variant");
+        assert!(matches!(
+            prepare(&state_only.0, &spec("foo")),
+            Err(SupervisorError::NameCollision)
+        ));
+
+        // Only the run root holds a case-only variant of "foo".
+        let run_only = PrepareFixture::new();
+        let run = run_only.0.join("run");
+        DirBuilder::new()
+            .mode(PRIVATE_DIR)
+            .create(&run)
+            .expect("the run root");
+        DirBuilder::new()
+            .mode(PRIVATE_DIR)
+            .create(run.join("FOO"))
+            .expect("the run-only case variant");
+        assert!(matches!(
+            prepare(&run_only.0, &spec("foo")),
+            Err(SupervisorError::NameCollision)
+        ));
+    }
+
     #[tokio::test]
     async fn only_complete_lines_within_the_byte_limit_are_decoded() {
         let mut exact = START.to_vec();
