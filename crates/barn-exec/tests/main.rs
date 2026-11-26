@@ -13,7 +13,7 @@ use std::time::Duration;
 use barn::Grant;
 use barn::supervisor::{RestartOutcome, StallSpec, Supervisor, SupervisorError};
 use serde_json::{Value, json};
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::time::{Instant, timeout};
 
@@ -68,22 +68,41 @@ async fn barn_accepts_a_sandboxed_child_only_once() -> TestResult {
 }
 
 #[tokio::test]
-async fn barn_refuses_the_right_uid_with_the_wrong_pid() -> TestResult {
+async fn barn_ignores_the_wrong_pid_and_authenticates_the_child() -> TestResult {
     if env::var_os("CI").is_none() {
         return Ok(());
     }
 
     let root = Scratch::new()?;
     let program = env::current_exe()?;
-    let spec = fixture(program, &["--exact", "silent_stall_fixture"]);
+    let spec = fixture(program, &["--exact", "waiting_stall_fixture"]);
     let mut stall = root.supervisor().start(spec).await?;
-    let _not_the_stall = UnixStream::connect(stall.socket_path()).await?;
+    let mut wrong = UnixStream::connect(stall.socket_path()).await?;
+    wrong.shutdown().await?;
 
-    match stall.accept().await {
-        Err(SupervisorError::PeerPidMismatch) => Ok(()),
-        Err(error) => Err(error.into()),
-        Ok(_) => Err(io::Error::other("barn accepted the wrong peer PID").into()),
+    let release_child = async {
+        let mut byte = [0];
+        if wrong.read(&mut byte).await? != 0 {
+            return Err(io::Error::other("barn replied to the wrong PID"));
+        }
+
+        fs::write(root.0.join("fixture").join("connect"), b"")
+    };
+    let (authenticated, refused) = timeout(DEADLINE, async {
+        tokio::join!(stall.accept(), release_child)
+    })
+    .await?;
+    refused?;
+    drop(authenticated?);
+
+    if !matches!(
+        timeout(DEADLINE, stall.wait_and_restart()).await??,
+        RestartOutcome::Exited
+    ) {
+        return Err(io::Error::other("authenticated child did not exit cleanly").into());
     }
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -157,10 +176,38 @@ fn sandbox_client_fixture() -> TestResult {
 }
 
 #[test]
-fn silent_stall_fixture() {
-    if env::var_os("BARN_SOCKET").is_some() {
-        std::thread::sleep(DEADLINE);
+fn waiting_stall_fixture() -> TestResult {
+    let Some(socket) = env::var_os("BARN_SOCKET").map(PathBuf::from) else {
+        return Ok(());
+    };
+    let root = socket
+        .ancestors()
+        .nth(3)
+        .ok_or_else(|| io::Error::other("missing state root"))?;
+    let state = root.join("fixture");
+    let start = state.join("connect");
+    let began = std::time::Instant::now();
+
+    while !start.try_exists()? {
+        if began.elapsed() >= DEADLINE {
+            return Err(io::Error::other("wrong peer was not closed in time").into());
+        }
+
+        std::thread::sleep(Duration::from_millis(10));
     }
+
+    let token = env::var("BARN_TOKEN")?;
+    let mut client = connect(&socket, &token, "")?;
+    let mut reply = String::new();
+    client.read_line(&mut reply)?;
+    let response: Value = serde_json::from_str(&reply)?;
+    let expected = json!({"jsonrpc":"2.0","id":"start","result":{"state":state}});
+
+    if response != expected {
+        return Err(io::Error::other("unexpected stall state response").into());
+    }
+
+    Ok(())
 }
 
 type Client = BufReader<StdUnixStream>;

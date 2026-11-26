@@ -5,7 +5,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -244,7 +244,7 @@ async fn supervision_replaces_an_unhealthy_child_and_checks_the_replacement() {
         );
     }
 
-    let outcome = timeout(Duration::from_secs(18), stall.supervise(connection))
+    let outcome = timeout(Duration::from_secs(18), stall.supervise(connection, |_| {}))
         .await
         .expect("health restart deadline")
         .expect("health restart");
@@ -253,45 +253,65 @@ async fn supervision_replaces_an_unhealthy_child_and_checks_the_replacement() {
     };
     assert_eq!(crash.signal(), Some(9));
 
+    assert!(matches!(
+        stall.accept().await,
+        Err(SupervisorError::InvalidToken)
+    ));
     let connection = stall.accept().await.expect("authenticate replacement");
-    let outcome = timeout(Duration::from_secs(25), stall.supervise(connection))
-        .await
-        .expect("replacement supervision deadline")
-        .expect("replacement supervision");
+    let mut frames = Vec::new();
+    let outcome = timeout(
+        Duration::from_secs(25),
+        stall.supervise(connection, |frame| frames.push(frame)),
+    )
+    .await
+    .expect("replacement supervision deadline")
+    .expect("replacement supervision");
     let outcome = match outcome {
         RestartOutcome::Exited => "exited",
         RestartOutcome::Failed => "failed",
         RestartOutcome::Restarted { .. } => "restarted",
     };
     assert_eq!(outcome, "exited");
+    assert_eq!(frames, [LOG_FRAME.as_bytes().to_vec()]);
 }
+
+const LOG_FRAME: &str = concat!(
+    r#"{"jsonrpc":"2.0","method":"log","params":{"message":"replacement ready"}}"#,
+    "\n"
+);
 
 #[test]
 fn health_stall_fixture() {
-    let Some(socket) = std::env::var_os("BARN_SOCKET") else {
+    let Some(socket) = std::env::var_os("BARN_SOCKET").map(PathBuf::from) else {
         return;
     };
 
-    let stream = UnixStream::connect(socket).expect("connect to barn");
-    let deadline = Some(Duration::from_secs(35));
-    stream.set_read_timeout(deadline).expect("read timeout");
-    stream.set_write_timeout(deadline).expect("write timeout");
-    let mut client = BufReader::new(stream);
+    let root = socket
+        .ancestors()
+        .nth(3)
+        .expect("state root in socket path");
+    let state = root.join("stall");
+    let marker = state.join("started");
     let token = std::env::var("BARN_TOKEN").expect("start token");
-    let start = json!({
-        "jsonrpc":"2.0", "id":"start", "method":"stall.start",
-        "params":{"protocol":1,"token":token}
-    });
-    writeln!(client.get_mut(), "{start}").expect("send start");
-    let reply = read_message(&mut client).expect("valid start reply");
-    let state = reply
-        .pointer("/result/state")
-        .and_then(Value::as_str)
-        .expect("state path");
-    let marker = PathBuf::from(state).join("started");
+    let first = !marker.exists();
 
-    if !marker.exists() {
-        fs::write(&marker, b"").expect("remember the first launch");
+    if !first {
+        let old = fs::read_to_string(&marker).expect("first launch token");
+        assert_ne!(old, token);
+        let mut rejected = connect_stall(&socket, &old).expect("offer the old token");
+        let mut line = String::new();
+
+        assert_eq!(rejected.read_line(&mut line).expect("old token refused"), 0);
+    }
+
+    let mut client = connect_stall(&socket, &token).expect("offer the issued token");
+    assert_eq!(
+        read_message(&mut client),
+        Some(json!({"jsonrpc":"2.0","id":"start","result":{"state":state}}))
+    );
+
+    if first {
+        fs::write(&marker, &token).expect("remember the first launch token");
         assert_health_request(&mut client, 1);
         writeln!(client.get_mut(), "{{").expect("send malformed reply");
         std::thread::sleep(Duration::from_secs(25));
@@ -301,9 +321,28 @@ fn health_stall_fixture() {
 
     for id in [1, 2] {
         assert_health_request(&mut client, id);
+
+        if id == 1 {
+            write!(client.get_mut(), "{LOG_FRAME}").expect("send log before reply");
+        }
+
         let reply = json!({"jsonrpc":"2.0", "id":id, "result":null});
         writeln!(client.get_mut(), "{reply}").expect("send health reply");
     }
+}
+
+fn connect_stall(socket: &Path, token: &str) -> io::Result<BufReader<UnixStream>> {
+    let mut stream = UnixStream::connect(socket)?;
+    let deadline = Some(Duration::from_secs(35));
+    stream.set_read_timeout(deadline)?;
+    stream.set_write_timeout(deadline)?;
+    let start = json!({
+        "jsonrpc":"2.0", "id":"start", "method":"stall.start",
+        "params":{"protocol":1,"token":token}
+    });
+    writeln!(stream, "{start}")?;
+
+    Ok(BufReader::new(stream))
 }
 
 fn read_message(client: &mut BufReader<UnixStream>) -> Option<Value> {

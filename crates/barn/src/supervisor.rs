@@ -33,6 +33,7 @@ const CRASH_LIMIT: usize = 5;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_PENDING_HEALTH_FRAMES: usize = 4;
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const TOKEN_BYTES: usize = 32;
 const TOKEN_TTL: Duration = Duration::from_secs(TOKEN_TTL_SECS);
@@ -49,7 +50,7 @@ const OVERSIZE_REPLY: &[u8] = concat!(
 
 /// A stall and the in-memory grant that bounds it.
 pub struct StallSpec {
-    /// The stall's name; it must be a single path component other than `run`.
+    /// A single path component; `run` is reserved in any ASCII case.
     pub name: String,
     /// The absolute path to the program to run, as allowed by the grant.
     pub program: PathBuf,
@@ -109,10 +110,12 @@ struct RunDir {
 
 type StallStream = BufReader<UnixStream>;
 
+#[derive(Default)]
 struct HealthProbe {
     connection: Option<StallStream>,
     id: u64,
     frame: Vec<u8>,
+    pending: Vec<Vec<u8>>,
 }
 
 /// What happens after a running child exits.
@@ -255,6 +258,9 @@ pub enum SupervisorError {
     /// The run root is not a private directory.
     #[error("run root is not a private directory")]
     RunRoot,
+    /// The stall state is not a private directory owned by the state root's owner.
+    #[error("stall state is not a private directory")]
+    StateDirectory,
     /// The grant cannot be converted into a sandbox policy.
     #[error("building stall grant: {0}")]
     Grant(#[from] PolicyError),
@@ -414,10 +420,10 @@ impl RunningStall {
         self.transport.run_dir.path(SOCKET_FILE)
     }
 
-    /// Accepts one connection and responds to its start request.
+    /// Accepts a connection from the child and responds to its start request.
     ///
     /// The returned reader keeps bytes the peer sent after the handshake.
-    /// A rejected connection is closed and the listener stays available.
+    /// Connections from other PIDs are dropped within the same accept deadline.
     ///
     /// # Errors
     /// Returns a named error for a timed-out, unauthenticated or invalid start.
@@ -434,20 +440,25 @@ impl RunningStall {
 
     /// Checks the accepted connection every ten seconds until the child exits or
     /// misses three checks, then applies the restart policy for this child.
+    /// Passes buffered non-health lines to `on_frame` in arrival order after
+    /// each check, including a miss, or when the child exits during a check.
     /// The caller accepts and supervises a replacement from the returned outcome.
     /// Dropping the future closes the connection and stops the owned child.
     ///
     /// # Errors
     /// Returns the stage that fails while waiting, stopping or restarting.
-    pub async fn supervise(mut self, stream: StallStream) -> Result<RestartOutcome> {
+    pub async fn supervise(
+        mut self,
+        stream: StallStream,
+        mut on_frame: impl FnMut(Vec<u8>),
+    ) -> Result<RestartOutcome> {
         let now = TokioInstant::now();
         let start = now.checked_add(HEALTH_INTERVAL).unwrap_or(now);
         let mut ticks = interval_at(start, HEALTH_INTERVAL);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut probe = HealthProbe {
             connection: Some(stream),
-            id: 0,
-            frame: Vec::new(),
+            ..HealthProbe::default()
         };
 
         loop {
@@ -456,13 +467,16 @@ impl RunningStall {
                 status = self.child.wait() => {
                     io_at("waiting for stall", status)?;
 
-                    break;
+                    None
                 }
                 check = async {
                     ticks.tick().await;
                     probe.tick().await
-                } => check,
+                } => Some(check),
             };
+
+            probe.pending.drain(..).for_each(&mut on_frame);
+            let Some(check) = check else { break };
 
             if self.record_health(check) == HealthDecision::Restart {
                 break;
@@ -564,28 +578,38 @@ impl HealthProbe {
         }
     }
 
-    async fn read_reply(&mut self, reader: &mut StallStream) -> Option<HealthCheck> {
+    async fn read_reply(
+        &mut self,
+        reader: &mut (impl AsyncBufRead + Unpin),
+    ) -> Option<HealthCheck> {
         // Allow two late answers from consecutive missed probes before this one.
         for _ in 0..3 {
-            let remaining = MAX_LINE_BYTES.saturating_sub(self.frame.len());
-            let limit = u64::try_from(remaining).ok()?;
-            reader
-                .take(limit)
-                .read_until(b'\n', &mut self.frame)
-                .await
-                .ok()?;
+            // Bound the memory used for lines the caller will receive.
+            while self.pending.len() < MAX_PENDING_HEALTH_FRAMES {
+                let remaining = MAX_LINE_BYTES.saturating_sub(self.frame.len());
+                let limit = u64::try_from(remaining).ok()?;
+                reader
+                    .take(limit)
+                    .read_until(b'\n', &mut self.frame)
+                    .await
+                    .ok()?;
 
-            if self.frame.last() != Some(&b'\n') {
-                return None;
-            }
+                if self.frame.last() != Some(&b'\n') {
+                    return None;
+                }
 
-            let id = health_reply_id(&self.frame);
-            self.frame.clear();
+                match health_reply_id(&self.frame) {
+                    Some(id) if id > 0 && id < self.id => {
+                        self.frame.clear();
+                        break;
+                    }
+                    Some(id) if id == self.id => {
+                        self.frame.clear();
 
-            match id {
-                Some(id) if id == self.id => return Some(HealthCheck::Answered),
-                Some(id) if id > 0 && id < self.id => {}
-                _ => return Some(HealthCheck::Missed),
+                        return Some(HealthCheck::Answered);
+                    }
+                    _ => self.pending.push(std::mem::take(&mut self.frame)),
+                }
             }
         }
 
@@ -609,10 +633,19 @@ fn health_reply_id(frame: &[u8]) -> Option<u64> {
 
 impl Transport {
     async fn accept(&mut self, child_pid: u32) -> Result<BufReader<UnixStream>> {
-        let accepted = self.listener.accept().await;
-        let (stream, _) = io_at("accepting stall socket", accepted)?;
-        let cred = io_at("reading stall peer credentials", stream.peer_cred())?;
-        verify_peer(cred.pid(), cred.uid(), child_pid, self.uid)?;
+        let stream = loop {
+            let accepted = self.listener.accept().await;
+            let (stream, _) = io_at("accepting stall socket", accepted)?;
+            let cred = io_at("reading stall peer credentials", stream.peer_cred())?;
+            let peer = verify_peer(cred.pid(), cred.uid(), child_pid, self.uid);
+
+            if matches!(peer, Err(SupervisorError::PeerPidMismatch)) {
+                continue;
+            }
+
+            peer?;
+            break stream;
+        };
 
         let mut reader = BufReader::new(stream);
         let (id, params) = match read_start(&mut reader).await {
@@ -769,7 +802,7 @@ fn spend_token(saved: &mut Option<Token>, offer: &str, now: Instant) -> Result<(
 fn prepare(state_dir: &Path, spec: &StallSpec) -> Result<Prepared> {
     let name = OsStr::new(&spec.name);
 
-    if name == "run" || Path::new(name).file_name() != Some(name) {
+    if spec.name.eq_ignore_ascii_case("run") || Path::new(name).file_name() != Some(name) {
         return Err(SupervisorError::InvalidName);
     }
 
@@ -836,11 +869,12 @@ fn run_paths(state_dir: &Path, name: &str) -> Result<(RunDir, String)> {
             .create(state_dir),
     )?;
     let state_dir = io_at("resolving barn state root", state_dir.canonicalize())?;
+    let owner = io_at("reading barn state root owner", fs::metadata(&state_dir))?.uid();
     let run_root = state_dir.join("run");
     io_at("creating barn run root", ensure_private_dir(&run_root))?;
     let root = io_at("checking barn run root", fs::symlink_metadata(&run_root))?;
 
-    if !root.is_dir() || root.mode() & 0o077 != 0 {
+    if !is_private_dir(&root, owner) {
         return Err(SupervisorError::RunRoot);
     }
 
@@ -858,16 +892,17 @@ fn run_paths(state_dir: &Path, name: &str) -> Result<(RunDir, String)> {
         fs::symlink_metadata(&state),
     )?;
 
-    if !meta.is_dir() {
-        return io_at(
-            "checking stall state directory",
-            Err(io::Error::from(io::ErrorKind::NotADirectory)),
-        );
+    if !is_private_dir(&meta, owner) {
+        return Err(SupervisorError::StateDirectory);
     }
 
-    let run_dir = RunDir::create(run_root.join(name), root.uid())?;
+    let run_dir = RunDir::create(run_root.join(name), owner)?;
 
     Ok((run_dir, state))
+}
+
+fn is_private_dir(meta: &fs::Metadata, owner: u32) -> bool {
+    meta.is_dir() && meta.uid() == owner && meta.mode() & 0o7777 == PRIVATE_DIR
 }
 
 fn ensure_private_dir(path: &Path) -> io::Result<()> {
@@ -920,13 +955,23 @@ fn lock_dir(path: &Path, uid: u32) -> io::Result<File> {
     let current = fs::symlink_metadata(path)?;
 
     // A competing start can replace the directory before the lock is held.
+    check_locked_dir(&meta, &locked, &current)?;
+
+    Ok(dir)
+}
+
+fn check_locked_dir(
+    meta: &fs::Metadata,
+    locked: &fs::Metadata,
+    current: &fs::Metadata,
+) -> io::Result<()> {
     if (meta.dev(), meta.ino()) != (locked.dev(), locked.ino())
         || (locked.dev(), locked.ino()) != (current.dev(), current.ino())
     {
         return Err(io::Error::from(io::ErrorKind::WouldBlock));
     }
 
-    Ok(dir)
+    Ok(())
 }
 
 fn remove_run_dir(path: &Path) -> io::Result<()> {
@@ -1105,7 +1150,7 @@ mod tests {
             grant: Grant::default(),
         };
 
-        for name in ["", ".", "..", "run", "../stall", "x/x", "x/"] {
+        for name in ["", ".", "..", "run", "RUN", "rUn", "../stall", "x/x", "x/"] {
             spec.name = name.to_owned();
             assert!(matches!(
                 prepare(Path::new(""), &spec),
@@ -1464,12 +1509,121 @@ mod tests {
         );
     }
 
+    #[test]
+    fn prepare_refuses_existing_state_without_mode_0700() {
+        let fixture = PrepareFixture::new();
+        let state = fixture.0.join("fixture");
+        let spec = PrepareFixture::spec();
+        fs::create_dir(&state).expect("existing stall state");
+
+        for mode in [0o500, 0o710, 0o701] {
+            chmod(&state, mode).expect("set existing state mode");
+
+            assert!(matches!(
+                prepare(&fixture.0, &spec),
+                Err(SupervisorError::StateDirectory)
+            ));
+        }
+
+        chmod(&state, PRIVATE_DIR).expect("make the state private");
+        let prepared = prepare(&fixture.0, &spec).expect("accept private state");
+        assert_eq!(Path::new(&prepared.state), state);
+    }
+
+    #[test]
+    fn a_private_directory_must_belong_to_the_expected_owner() {
+        let fixture = PrepareFixture::new();
+        let meta = fs::symlink_metadata(&fixture.0).expect("private directory");
+        let file = fixture.0.join("file");
+        fs::write(&file, b"").expect("regular file");
+        chmod(&file, PRIVATE_DIR).expect("match the directory mode");
+        let file = fs::symlink_metadata(file).expect("regular file metadata");
+
+        assert!(is_private_dir(&meta, meta.uid()));
+        assert!(!is_private_dir(&meta, meta.uid() ^ 1));
+        assert!(!is_private_dir(&file, meta.uid()));
+    }
+
+    #[test]
+    fn run_directory_creation_surfaces_errors_other_than_already_exists() {
+        let fixture = PrepareFixture::new();
+        let path = fixture.0.join("missing").join("run");
+        let uid = fs::metadata(&fixture.0).expect("fixture metadata").uid();
+        let failure = match RunDir::create(path, uid) {
+            Err(SupervisorError::Io { operation, source }) => Some((operation, source.kind())),
+            _ => None,
+        };
+
+        assert_eq!(
+            failure,
+            Some((
+                "creating private stall run directory",
+                io::ErrorKind::NotFound
+            ))
+        );
+    }
+
+    #[test]
+    fn locking_requires_directory_type_owner_and_private_mode_independently() {
+        let fixture = PrepareFixture::new();
+        let uid = fs::metadata(&fixture.0).expect("fixture metadata").uid();
+        let file = fixture.0.join("file");
+        fs::write(&file, b"").expect("regular file");
+        chmod(&file, PRIVATE_DIR).expect("match the directory mode");
+        let denied = Some(io::ErrorKind::PermissionDenied);
+        let error = |path: &Path, uid| lock_dir(path, uid).err().map(|err| err.kind());
+
+        assert_eq!(error(&file, uid), denied);
+        assert_eq!(error(&fixture.0, uid ^ 1), denied);
+
+        chmod(&fixture.0, 0o740).expect("add only a group read bit");
+        assert_eq!(error(&fixture.0, uid), denied);
+
+        chmod(&fixture.0, PRIVATE_DIR).expect("restore private mode");
+        assert_eq!(error(&fixture.0, uid), None);
+    }
+
+    #[test]
+    fn locking_rejects_replacement_before_or_after_opening_the_directory() {
+        let fixture = PrepareFixture::new();
+        let replacement = fixture.0.join("replacement");
+        fs::create_dir(&replacement).expect("different directory");
+        let a = fs::metadata(&fixture.0).expect("original directory");
+        let b = fs::metadata(replacement).expect("replacement metadata");
+
+        assert_eq!(
+            check_locked_dir(&a, &a, &a).err().map(|err| err.kind()),
+            None
+        );
+        for (original, locked, current) in [(&a, &b, &b), (&a, &a, &b)] {
+            assert_eq!(
+                check_locked_dir(original, locked, current)
+                    .err()
+                    .map(|err| err.kind()),
+                Some(io::ErrorKind::WouldBlock)
+            );
+        }
+    }
+
+    #[test]
+    fn removing_run_files_propagates_unlink_errors_other_than_not_found() {
+        let fixture = PrepareFixture::new();
+        let entry = fixture.0.join(SOCKET_FILE);
+        fs::create_dir(&entry).expect("an entry unlink cannot remove");
+        // Unix platforms differ on the exact error for unlinking a directory.
+        let unlink_error = fs::remove_file(entry).expect_err("cannot unlink").kind();
+
+        assert_eq!(
+            remove_run_dir(&fixture.0).err().map(|err| err.kind()),
+            Some(unlink_error)
+        );
+    }
+
     fn health_pair() -> (HealthProbe, BufReader<UnixStream>) {
         let (barn, stall) = UnixStream::pair().expect("connected sockets");
         let probe = HealthProbe {
             connection: Some(BufReader::new(barn)),
-            id: 0,
-            frame: Vec::new(),
+            ..HealthProbe::default()
         };
 
         (probe, BufReader::new(stall))
@@ -1527,15 +1681,58 @@ mod tests {
             let (mut probe, mut stall) = health_pair();
             let (decision, ()) = tokio::join!(probe.tick(), async {
                 health_request(&mut stall, 1).await;
-                let next = r#"{"jsonrpc":"2.0","id":1,"result":null}"#;
                 stall
-                    .write_all(format!("{reply}\n{next}\n").as_bytes())
+                    .write_all(format!("{reply}\n").as_bytes())
                     .await
                     .expect("reply");
+                stall.shutdown().await.expect("end of replies");
             });
 
             assert_eq!(decision, expected, "{reply}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_matching_health_reply_is_not_late_and_preserves_unexpected_lines() {
+        let mut probe = HealthProbe {
+            id: 2,
+            ..HealthProbe::default()
+        };
+        let log = b"{\"jsonrpc\":\"2.0\",\"method\":\"log\"}\n";
+        let late = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n";
+        let other = b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":null}\n";
+        let current = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}\n";
+        let input = [log.as_slice(), late, other, current].concat();
+        let mut reader = input.as_slice();
+
+        assert_eq!(
+            probe.read_reply(&mut reader).await,
+            Some(HealthCheck::Answered)
+        );
+        assert_eq!(probe.pending, [log.to_vec(), other.to_vec()]);
+        assert_eq!(reader, b"");
+    }
+
+    #[tokio::test]
+    async fn a_health_check_leaves_unread_lines_when_its_buffer_is_full() {
+        let mut probe = HealthProbe {
+            id: 1,
+            ..HealthProbe::default()
+        };
+        let log = b"{\"jsonrpc\":\"2.0\",\"method\":\"log\"}\n";
+        let current = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n";
+        let input = [log.as_slice(), log, log, log, current].concat();
+        let mut reader = input.as_slice();
+
+        assert_eq!(
+            probe.read_reply(&mut reader).await,
+            Some(HealthCheck::Missed)
+        );
+        assert_eq!(
+            probe.pending,
+            [log.to_vec(), log.to_vec(), log.to_vec(), log.to_vec()]
+        );
+        assert_eq!(reader, current);
     }
 
     #[tokio::test]

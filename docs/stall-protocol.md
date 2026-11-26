@@ -86,7 +86,8 @@ barn sends `stall.health` on the authenticated connection every 10 seconds:
 ```
 
 A successful JSON-RPC reply with the matching id within 2 seconds answers the
-check. A timeout or an invalid reply misses it. barn restarts the stall after
+check. barn buffers non-health frames on the connection during the check.
+A check without a matching success is missed. barn restarts the stall after
 three consecutive misses.
 
 A stall asks the broker:
