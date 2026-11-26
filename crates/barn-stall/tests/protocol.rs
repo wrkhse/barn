@@ -2,6 +2,10 @@
 //! limits table are read from docs/stall-protocol.md itself, so a constant or a
 //! field that drifts from the page fails here.
 
+use std::collections::BTreeMap;
+
+use barn_stall::protocol::Job;
+use barn_stall::protocol::TOKEN_TTL_SECS;
 use barn_stall::{
     BodyEncoding, DEFAULT_MAX_BODY_BYTES, DENIED_CODE, Headers, MAX_LINE_BYTES, NetAuth,
     NetRequestParams, NetResponse, PROTOCOL_VERSION, StallStartParams, StallStartResult, method,
@@ -18,6 +22,16 @@ fn lines() -> Option<Vec<Value>> {
         .filter(|line| line.starts_with("{\"jsonrpc\""))
         .map(|line| serde_json::from_str(line).ok())
         .collect()
+}
+
+/// The page's one declared job, keyed by its name.
+fn named_jobs() -> BTreeMap<String, Job> {
+    BTreeMap::from([(
+        "poll".to_owned(),
+        Job {
+            every: "15s".to_owned(),
+        },
+    )])
 }
 
 /// The page's message with this id that sends a method.
@@ -74,6 +88,15 @@ fn the_pages_table_pins_the_constants() {
         i64::try_from(DEFAULT_MAX_BODY_BYTES).expect("fits an i64")
     );
     assert_eq!(pinned("DENIED_CODE"), i64::from(DENIED_CODE));
+    assert_eq!(
+        pinned("TOKEN_TTL_SECS"),
+        i64::try_from(TOKEN_TTL_SECS).expect("fits an i64")
+    );
+}
+
+#[test]
+fn a_start_token_lasts_thirty_seconds() {
+    assert_eq!(TOKEN_TTL_SECS, 30);
 }
 
 #[test]
@@ -81,12 +104,9 @@ fn the_denied_error_carries_the_pages_code() {
     let code = lines()
         .expect("every JSON-RPC line on the page parses")
         .into_iter()
-        .find_map(|message| {
-            message
-                .get("error")
-                .and_then(|error| error.get("code"))
-                .and_then(Value::as_i64)
-        })
+        .filter_map(|message| message.get("error").cloned())
+        .find(|error| error.get("message").and_then(Value::as_str) == Some("denied"))
+        .and_then(|error| error.get("code").and_then(Value::as_i64))
         .expect("the page carries a denied error");
 
     assert_eq!(code, i64::from(DENIED_CODE));
@@ -94,39 +114,120 @@ fn the_denied_error_carries_the_pages_code() {
 
 #[test]
 fn stall_start_reads_the_pages_request() {
-    let params: StallStartParams = serde_json::from_value(
-        sent(1)
-            .expect("the page sends stall.start with id 1")
-            .get("params")
-            .cloned()
-            .expect("stall.start carries params"),
-    )
-    .expect("the page's stall.start parameters");
+    let request = sent(1);
+    let wire = request.as_ref().and_then(|message| message.get("params"));
+    let params = StallStartParams {
+        protocol: PROTOCOL_VERSION,
+        token: "…".to_owned(),
+        jobs: named_jobs(),
+    };
 
     assert_eq!(
-        params,
-        StallStartParams {
-            protocol: PROTOCOL_VERSION,
-            stall: "sourcefed".to_owned(),
-            state: "~/.local/state/sourcefed".to_owned(),
-        }
+        request
+            .as_ref()
+            .and_then(|message| message.get("method"))
+            .and_then(Value::as_str),
+        Some(method::STALL_START)
     );
+    assert_eq!(
+        wire.cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
+        Some(params.clone())
+    );
+    assert_eq!(serde_json::to_value(params).ok().as_ref(), wire);
 }
 
 #[test]
 fn stall_start_reads_the_pages_result() {
+    let reply = answered(1);
+    let wire = reply.as_ref().and_then(|message| message.get("result"));
+    let result = StallStartResult {
+        state: "/var/lib/barn/sourcefed".to_owned(),
+        jobs: named_jobs(),
+    };
+
+    assert_eq!(
+        wire.cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
+        Some(result.clone())
+    );
+    assert_eq!(serde_json::to_value(result).ok().as_ref(), wire);
+}
+
+#[test]
+fn a_start_result_keeps_jobs_under_their_names() {
+    let reply = answered(1).expect("the page answers stall.start");
     let result: StallStartResult = serde_json::from_value(
-        answered(1)
-            .expect("the page answers stall.start with id 1")
+        reply
             .get("result")
             .cloned()
-            .expect("stall.start carries a result"),
+            .expect("the start reply carries a result"),
     )
-    .expect("the page's stall.start result");
+    .expect("the page's start result");
 
-    assert!(result.ready);
-    assert_eq!(result.version, "0.6.0");
-    assert_eq!(result.jobs.len(), 1);
+    assert_eq!(
+        result.jobs.get("poll"),
+        Some(&Job {
+            every: "15s".to_owned(),
+        })
+    );
+    assert_eq!(result.jobs.get("missing"), None);
+}
+
+#[test]
+fn the_page_fixes_the_oversize_error_line() {
+    let error = lines()
+        .expect("every JSON-RPC line on the page parses")
+        .into_iter()
+        .find_map(|message| {
+            message
+                .get("error")
+                .filter(|error| error.get("code").and_then(Value::as_i64) == Some(-32600))
+                .cloned()
+        })
+        .expect("the page carries the oversize error");
+
+    assert_eq!(
+        error,
+        json!({
+            "code": -32600,
+            "message": "stall start message exceeds the protocol line limit"
+        })
+    );
+}
+
+#[test]
+fn start_parameters_keep_the_token_out_of_diagnostics() {
+    let params = StallStartParams {
+        protocol: PROTOCOL_VERSION,
+        token: "secret".to_owned(),
+        jobs: BTreeMap::new(),
+    };
+
+    assert_eq!(
+        format!("{params:?}"),
+        "StallStartParams { protocol: 1, token: \"[redacted]\", jobs: {} }"
+    );
+}
+
+#[test]
+fn a_start_without_jobs_omits_the_field_and_reads_it_as_empty() {
+    let params: StallStartParams =
+        serde_json::from_value(json!({"protocol": 1, "token": "secret"}))
+            .expect("start parameters without jobs");
+    let wire = json!({"state": "/state"});
+    let result = serde_json::from_value::<StallStartResult>(wire).expect("jobs default");
+
+    assert_eq!(params.jobs, BTreeMap::new());
+    assert_eq!(result.jobs, BTreeMap::new());
+    assert_eq!(
+        serde_json::to_value(params).expect("params serialise"),
+        json!({"protocol": 1, "token": "secret"})
+    );
+    assert_eq!(
+        serde_json::to_value(result).expect("result serialise"),
+        json!({"state": "/state"})
+    );
 }
 
 #[test]

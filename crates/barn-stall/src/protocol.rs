@@ -5,6 +5,7 @@
 //! name. A field added later is an addition inside a version, never a rename.
 
 use std::collections::BTreeMap;
+use std::fmt::{self, Debug, Formatter};
 
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +21,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// line was never parsed, and then the connection is closed, as Chauffeur v2's
 /// socket server does.
 pub const MAX_LINE_BYTES: usize = 8_388_608;
+
+/// Seconds after launch before the single-use `BARN_TOKEN` expires.
+pub const TOKEN_TTL_SECS: u64 = 30;
 
 /// The default cap on an inline body, counted in decoded bytes: 4 MiB.
 ///
@@ -42,7 +46,7 @@ pub type Headers = Vec<(String, String)>;
 
 /// The names of the protocol's methods.
 pub mod method {
-    /// barn to stall: start, which returns the stall's jobs.
+    /// Stall to barn: authenticate and get the stall's state folder.
     pub const STALL_START: &str = "stall.start";
     /// barn to stall: report health.
     pub const STALL_HEALTH: &str = "stall.health";
@@ -68,33 +72,47 @@ pub mod method {
     pub const LOG: &str = "log";
 }
 
-/// The `stall.start` parameters barn sends.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The `stall.start` parameters a stall sends when it connects.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StallStartParams {
-    /// The protocol version barn speaks.
+    /// The protocol version the stall speaks.
     pub protocol: u32,
-    /// The stall's name, as its file in `~/.config/barn/stalls` names it.
-    pub stall: String,
-    /// The stall's state folder.
-    pub state: String,
+    /// The single-use token from `BARN_TOKEN`.
+    pub token: String,
+    /// The jobs the stall declares for barn to time, keyed by name; none
+    /// when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub jobs: BTreeMap<String, Job>,
+}
+
+impl Debug for StallStartParams {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StallStartParams")
+            .field("protocol", &self.protocol)
+            .field("token", &"[redacted]")
+            .field("jobs", &self.jobs)
+            .finish()
+    }
 }
 
 /// A job a stall declares and barn keeps the timer for.
+///
+/// Its name is the key it carries in the start message's `jobs` map.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     /// How often barn runs the job, such as `15s`.
     pub every: String,
 }
 
-/// The `stall.start` result the stall answers with.
+/// The `stall.start` result barn sends after authenticating the stall.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StallStartResult {
-    /// Whether the stall is ready to take requests.
-    pub ready: bool,
-    /// The stall's own version.
-    pub version: String,
-    /// The jobs the stall declares, by name. A stall with no jobs sends none.
-    #[serde(default)]
+    /// The stall's state folder, as an absolute path.
+    pub state: String,
+    /// The declared jobs barn retains, keyed by name; none when the stall
+    /// declares no jobs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub jobs: BTreeMap<String, Job>,
 }
 

@@ -2,9 +2,10 @@
 //!
 //! A stall is a project's logic — its request handlers, its background jobs and
 //! the events it emits — in a child process barn starts and guards. A stall
-//! never opens a listener, never holds a secret and never reaches the network
-//! directly: barn owns all of that, and the two speak the stall protocol over a
-//! socket pair it passes as file descriptor 3.
+//! never opens a listener and never reaches the network directly: barn owns
+//! both. It holds only a single-use startup token, not a long-lived secret,
+//! and connects to the private Unix socket at `BARN_SOCKET`. Its first message
+//! is `stall.start`, carrying that token in `BARN_TOKEN`.
 //!
 //! This crate holds the protocol's fixed parts: its version, its limits, its
 //! method names, and the message bodies the plan already settles. Whatever is

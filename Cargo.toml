@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/barn", "crates/barn-stall"]
+members = ["crates/barn", "crates/barn-exec", "crates/barn-stall"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,6 +15,10 @@ clap = { version = "4", features = ["derive"] }
 nono = { version = "=0.82.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+thiserror = "=2.0.21"
+tokio = { version = "=1.54.1", features = [
+  "io-util", "macros", "net", "process", "rt", "time",
+] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
