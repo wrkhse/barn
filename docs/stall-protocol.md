@@ -18,7 +18,8 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
 - The stall connects and sends `stall.start` as its first message. barn checks
   that the peer PID matches the child it spawned and that the peer UID owns
   the socket. A missing peer PID fails authentication. The stall declares its
-  jobs in the message's `jobs`; barn keeps them and returns them in the result.
+  jobs by name in the message's `jobs` map; barn keeps them under those names
+  and returns the map in the result.
   barn spends the token, then returns the absolute path of the stall's state
   folder, `state_dir/<stall>`, which it creates and grants the stall read-write
   access to.
@@ -32,9 +33,8 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
   `-32600` and an `id` of `null`, because the line was never parsed, and then the
   connection closes, as Chauffeur v2's socket server does. barn's `stall.start` reply
   is held to the same limit: a reply that would be longer is never sent, and
-  the stall gets the same `-32600` line before the connection closes. _For B1
-  to confirm: the error's message, which Chauffeur v2 words "the request line is
-  over 1 MiB"._
+  the stall gets the same `-32600` line before the connection closes. The
+  error line is fixed under "The messages fixed so far".
 - Calls in flight are bounded. _For B1 to confirm: the bound, and what a stall is
   sent when its answers would exceed it._
 - Bodies are inline, and the cap counts decoded bytes: at most 4 MiB, the
@@ -75,8 +75,15 @@ encoding is a new version, never a value added inside this one.
 A stall connects and receives its state folder:
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"stall.start","params":{"protocol":1,"token":"…","jobs":[{"every":"15s"}]}}
-{"jsonrpc":"2.0","id":1,"result":{"state":"/var/lib/barn/sourcefed","jobs":[{"every":"15s"}]}}
+{"jsonrpc":"2.0","id":1,"method":"stall.start","params":{"protocol":1,"token":"…","jobs":{"poll":{"every":"15s"}}}}
+{"jsonrpc":"2.0","id":1,"result":{"state":"/var/lib/barn/sourcefed","jobs":{"poll":{"every":"15s"}}}}
+```
+
+A reply too long to fit is replaced by one error line:
+
+<!-- prettier-ignore -->
+```json
+{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"stall start message exceeds the protocol line limit"}}
 ```
 
 barn sends `stall.health` on the authenticated connection every 10 seconds:
@@ -117,15 +124,15 @@ A body that is not UTF-8, carried as base64:
 These bodies are `barn-stall`'s types, and each one is checked against the JSON
 on this page in that crate's tests, which read this file with `include_str!`:
 
-| Body                     | Type               |
-| ------------------------ | ------------------ |
-| `stall.start` parameters | `StallStartParams` |
-| `stall.start` result     | `StallStartResult` |
-| a declared job           | `Job`              |
-| `net.request` parameters | `NetRequestParams` |
-| the secret to add        | `NetAuth`          |
-| `net.request` result     | `NetResponse`      |
-| the `denied` error code  | `DENIED_CODE`      |
+| Body                     | Type                    |
+| ------------------------ | ----------------------- |
+| `stall.start` parameters | `StallStartParams`      |
+| `stall.start` result     | `StallStartResult`      |
+| the jobs by name         | `BTreeMap<String, Job>` |
+| `net.request` parameters | `NetRequestParams`      |
+| the secret to add        | `NetAuth`               |
+| `net.request` result     | `NetResponse`           |
+| the `denied` error code  | `DENIED_CODE`           |
 
 The plan's sketch shows a response's headers as one JSON object and its body as
 one string. Some things in HTTP cannot be carried that way, so these types go

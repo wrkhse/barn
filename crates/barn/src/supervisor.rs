@@ -1,6 +1,6 @@
 //! Starts a sandboxed stall, authenticates it and supervises its health.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::hint::black_box;
@@ -30,13 +30,13 @@ const FIRST_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_mins(5);
 const CRASH_WINDOW: Duration = Duration::from_mins(10);
 const CRASH_LIMIT: usize = 5;
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PENDING_HEALTH_FRAMES: usize = 4;
 const MAX_LATE_HEALTH_REPLIES: usize = 3;
 const MAX_EXIT_DRAIN_FRAMES: usize = 64;
 const MAX_EXIT_DRAIN_BYTES: usize = 64 * 1024;
+const EXIT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_REJECTED_PEERS: usize = 16;
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const TOKEN_BYTES: usize = 32;
@@ -99,7 +99,7 @@ struct Transport {
     state: String,
     uid: u32,
     token: Option<Token>,
-    jobs: Vec<Job>,
+    jobs: BTreeMap<String, Job>,
 }
 
 /// A start token and the moment it stops being accepted.
@@ -126,7 +126,6 @@ type StallStream = BufReader<UnixStream>;
 
 #[derive(Default)]
 struct HealthProbe {
-    connection: Option<StallStream>,
     id: u64,
     frame: Vec<u8>,
     pending: Vec<Vec<u8>>,
@@ -310,9 +309,6 @@ pub enum SupervisorError {
     /// The peer's UID differs from the socket owner's UID.
     #[error("stall socket peer UID does not match the socket owner")]
     PeerUidMismatch,
-    /// Too many wrong-PID peers connected in one accept call.
-    #[error("stall socket accepted too many rejected peers")]
-    TooManyRejectedPeers,
     /// The connection or its first message does not arrive before the deadline.
     #[error("stall connection timed out")]
     ConnectTimeout,
@@ -416,7 +412,7 @@ impl Supervisor {
                     secret: prepared.token,
                     expires_at,
                 }),
-                jobs: Vec::new(),
+                jobs: BTreeMap::new(),
             },
             supervisor: self,
             spec,
@@ -429,9 +425,9 @@ impl Supervisor {
 }
 
 impl RunningStall {
-    /// The jobs the stall declared in its start message.
+    /// The jobs the stall declared, keyed by name.
     #[must_use]
-    pub fn jobs(&self) -> &[Job] {
+    pub const fn jobs(&self) -> &BTreeMap<String, Job> {
         &self.transport.jobs
     }
 
@@ -450,14 +446,13 @@ impl RunningStall {
     /// Accepts a connection from the child and responds to its start request.
     ///
     /// The returned reader keeps bytes the peer sent after the handshake.
-    /// Connections from other PIDs are dropped within the same accept deadline.
+    /// Connections from other PIDs are dropped until the token deadline, so
+    /// one peer cannot end this handshake.
     ///
     /// # Errors
     /// Returns a named error for a timed-out, unauthenticated or invalid start.
     pub async fn accept(&mut self) -> Result<BufReader<UnixStream>> {
-        timeout(CONNECT_TIMEOUT, self.transport.accept(self.pid))
-            .await
-            .map_err(|_| SupervisorError::ConnectTimeout)?
+        self.transport.accept(self.pid).await
     }
 
     /// Records one health check and returns the decision for this child.
@@ -483,10 +478,8 @@ impl RunningStall {
         let start = now.checked_add(HEALTH_INTERVAL).unwrap_or(now);
         let mut ticks = interval_at(start, HEALTH_INTERVAL);
         ticks.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut probe = HealthProbe {
-            connection: Some(stream),
-            ..HealthProbe::default()
-        };
+        let mut probe = HealthProbe::default();
+        let mut connection = stream;
 
         loop {
             let check = tokio::select! {
@@ -498,15 +491,13 @@ impl RunningStall {
                 }
                 check = async {
                     ticks.tick().await;
-                    probe.tick(&mut on_frame).await
+                    probe.tick(&mut connection, &mut on_frame).await
                 } => Some(check),
             };
 
             probe.pending.drain(..).for_each(&mut on_frame);
             let Some(check) = check else {
-                if let Some(mut connection) = probe.connection.take() {
-                    drain_on_exit(&mut connection, probe.id, &mut on_frame).await;
-                }
+                drain_on_exit(&mut connection, probe.id, &mut on_frame).await;
 
                 break;
             };
@@ -516,7 +507,9 @@ impl RunningStall {
             }
         }
 
-        drop(probe);
+        // Close the connection before the child is stopped or replaced.
+        drop(connection);
+
         self.wait_and_restart().await
     }
 
@@ -569,10 +562,11 @@ impl RunningStall {
 }
 
 impl HealthProbe {
-    async fn tick(&mut self, on_frame: impl FnMut(Vec<u8>)) -> HealthCheck {
-        let Some(mut connection) = self.connection.take() else {
-            return HealthCheck::Missed;
-        };
+    async fn tick(
+        &mut self,
+        connection: &mut StallStream,
+        on_frame: impl FnMut(Vec<u8>),
+    ) -> HealthCheck {
         let Some(id) = self.id.checked_add(1) else {
             return HealthCheck::Missed;
         };
@@ -586,17 +580,16 @@ impl HealthProbe {
             return HealthCheck::Missed;
         };
 
-        // A cancelled write may leave a partial frame; close that connection.
+        // A cancelled write may leave a partial frame; this check is missed.
         let sent = timeout_at(deadline, connection.write_all(&line)).await;
 
         if !matches!(sent, Ok(Ok(()))) {
             return HealthCheck::Missed;
         }
 
-        let reading = self.read_reply(&mut connection, on_frame);
+        // The caller owns the connection, so a cancelled tick leaves it open.
+        let reading = self.read_reply(connection, on_frame);
         let reply = timeout_at(deadline, reading).await;
-        // Keep the bytes already read so the next tick stays framed.
-        self.connection = Some(connection);
 
         reply.unwrap_or(HealthCheck::Missed)
     }
@@ -706,10 +699,13 @@ enum DrainStop {
     FrameLimit,
     /// The byte cap is reached.
     ByteLimit,
+    /// A read did not finish before the deadline.
+    Deadline,
 }
 
 /// Delivers the caller frames left on the connection at exit, in arrival
-/// order. Stops at the peer's close or at a named cap, whichever comes first.
+/// order. Stops at the peer's close, a named cap or the read deadline,
+/// whichever comes first.
 async fn drain_on_exit(
     reader: &mut (impl AsyncBufRead + Unpin),
     current: u64,
@@ -722,11 +718,16 @@ async fn drain_on_exit(
         let remaining = MAX_EXIT_DRAIN_BYTES.saturating_sub(bytes);
         let limit = u64::try_from(remaining).unwrap_or(u64::MAX);
         let mut line = Vec::new();
-        let read = reader
-            .take(limit)
-            .read_until(b'\n', &mut line)
-            .await
-            .unwrap_or(0);
+        let read = timeout(
+            EXIT_DRAIN_TIMEOUT,
+            reader.take(limit).read_until(b'\n', &mut line),
+        )
+        .await;
+
+        let Ok(read) = read else {
+            return DrainStop::Deadline;
+        };
+        let read = read.unwrap_or(0);
 
         if read == 0 {
             return DrainStop::Closed;
@@ -767,16 +768,13 @@ impl PeerChecks {
         }
     }
 
-    /// Accepts the child; a wrong PID is rejected up to the bound.
+    /// Accepts the child; wrong peers are dropped up to the bound and
+    /// skipped after it, so peer misbehaviour never ends a handshake.
     fn check(&mut self, pid: Option<i32>, uid: u32) -> Result<bool> {
         match verify_peer(pid, uid, self.child, self.owner) {
             Ok(()) => Ok(true),
             Err(SupervisorError::PeerPidMismatch) => {
-                self.rejected = self.rejected.saturating_add(1);
-
-                if self.rejected >= MAX_REJECTED_PEERS {
-                    return Err(SupervisorError::TooManyRejectedPeers);
-                }
+                self.rejected = self.rejected.saturating_add(1).min(MAX_REJECTED_PEERS);
 
                 Ok(false)
             }
@@ -786,7 +784,18 @@ impl PeerChecks {
 }
 
 impl Transport {
+    /// Holds the listener open until the token expires. Wrong peers are
+    /// dropped; only the child can end the wait with its handshake.
     async fn accept(&mut self, child_pid: u32) -> Result<BufReader<UnixStream>> {
+        let deadline = self.token.as_ref().map_or_else(TokioInstant::now, |token| {
+            TokioInstant::from_std(token.expires_at)
+        });
+        timeout_at(deadline, self.handshake(child_pid))
+            .await
+            .map_err(|_| SupervisorError::ConnectTimeout)?
+    }
+
+    async fn handshake(&mut self, child_pid: u32) -> Result<BufReader<UnixStream>> {
         let mut checks = PeerChecks::new(child_pid, self.uid);
         let stream = loop {
             let accepted = self.listener.accept().await;
@@ -819,8 +828,8 @@ async fn send_reply<W>(
     out: &mut W,
     id: &Value,
     dir: &str, // the state folder
-    jobs: &[Job],
-) -> Result<Vec<Job>>
+    jobs: &BTreeMap<String, Job>,
+) -> Result<BTreeMap<String, Job>>
 where
     W: AsyncWrite + Unpin,
 {
@@ -839,7 +848,7 @@ where
 }
 
 /// Reads the jobs barn declared in the start reply it sent.
-fn declared_jobs(frame: &[u8]) -> Vec<Job> {
+fn declared_jobs(frame: &[u8]) -> BTreeMap<String, Job> {
     serde_json::from_slice::<Value>(frame)
         .ok()
         .and_then(|reply| reply.get("result").cloned())
@@ -855,10 +864,10 @@ async fn refuse_oversize(writer: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
 }
 
 /// The `stall.start` reply as one newline-terminated line within the limit.
-fn reply_frame(id: &Value, state: &str, jobs: &[Job]) -> Result<Vec<u8>> {
+fn reply_frame(id: &Value, state: &str, jobs: &BTreeMap<String, Job>) -> Result<Vec<u8>> {
     let reply = StallStartResult {
         state: state.to_owned(),
-        jobs: jobs.to_vec(),
+        jobs: jobs.clone(),
     };
     let response = json!({"jsonrpc":"2.0","id":id,"result":reply});
 
@@ -1279,27 +1288,15 @@ mod tests {
     }
 
     #[test]
-    fn wrong_pid_peers_are_bounded_but_a_later_child_is_accepted() {
+    fn wrong_pid_peers_never_end_the_handshake_and_a_later_child_is_accepted() {
         let wrong = Some(18);
         let mut checks = PeerChecks::new(17, 42);
 
-        for _ in 0..MAX_REJECTED_PEERS.saturating_sub(1) {
+        for _ in 0..MAX_REJECTED_PEERS.saturating_mul(4) {
             assert_eq!(checks.check(wrong, 42).ok(), Some(false));
         }
+        assert_eq!(checks.rejected, MAX_REJECTED_PEERS);
         assert_eq!(checks.check(Some(17), 42).ok(), Some(true));
-
-        let mut checks = PeerChecks::new(17, 42);
-        for _ in 0..MAX_REJECTED_PEERS.saturating_sub(1) {
-            assert_eq!(checks.check(wrong, 42).ok(), Some(false));
-        }
-        assert!(matches!(
-            checks.check(wrong, 42),
-            Err(SupervisorError::TooManyRejectedPeers)
-        ));
-        assert_eq!(
-            SupervisorError::TooManyRejectedPeers.to_string(),
-            "stall socket accepted too many rejected peers"
-        );
     }
 
     fn issued(expires_at: Instant) -> Token {
@@ -1417,7 +1414,7 @@ mod tests {
                 StallStartParams {
                     protocol: 1,
                     token: "secret".to_owned(),
-                    jobs: Vec::new()
+                    jobs: BTreeMap::new()
                 }
             ))
         );
@@ -1496,7 +1493,7 @@ mod tests {
                 StallStartParams {
                     protocol: 1,
                     token: "secret".to_owned(),
-                    jobs: Vec::new()
+                    jobs: BTreeMap::new()
                 }
             ))
         );
@@ -1518,7 +1515,7 @@ mod tests {
     #[test]
     fn a_reply_fills_the_line_limit_and_no_more() {
         assert_eq!(
-            reply_frame(&json!(1), "", &[]).ok(),
+            reply_frame(&json!(1), "", &BTreeMap::new()).ok(),
             Some(EMPTY_REPLY.to_vec())
         );
 
@@ -1526,7 +1523,7 @@ mod tests {
         let below = exact.get(1..).unwrap_or_default().to_owned();
         let above = format!("{exact}a");
         let length = |state: &str| {
-            let frame = reply_frame(&json!(1), state, &[]);
+            let frame = reply_frame(&json!(1), state, &BTreeMap::new());
 
             frame.map(|frame| frame.len())
         };
@@ -1546,7 +1543,7 @@ mod tests {
         let mut written = Vec::new();
 
         assert!(matches!(
-            send_reply(&mut written, &json!(1), "", &[]).await,
+            send_reply(&mut written, &json!(1), "", &BTreeMap::new()).await,
             Ok(jobs) if jobs.is_empty()
         ));
         assert_eq!(written, EMPTY_REPLY);
@@ -1556,7 +1553,7 @@ mod tests {
         let mut written = Vec::new();
 
         assert!(matches!(
-            send_reply(&mut written, &json!(1), &exact, &[]).await,
+            send_reply(&mut written, &json!(1), &exact, &BTreeMap::new()).await,
             Ok(jobs) if jobs.is_empty()
         ));
         assert_eq!(written, format!("{line}\n").into_bytes());
@@ -1564,21 +1561,43 @@ mod tests {
 
     #[tokio::test]
     async fn an_oversized_reply_is_answered_with_the_line_limit_error() {
+        let expected = concat!(
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"#,
+            r#""message":"stall start message exceeds the protocol line limit"}}"#,
+            "\n"
+        )
+        .as_bytes();
         let above = format!("{}a", filling_state());
         let mut written = Vec::new();
 
         assert!(matches!(
-            send_reply(&mut written, &json!(1), &above, &[]).await,
+            send_reply(&mut written, &json!(1), &above, &BTreeMap::new()).await,
             Err(SupervisorError::FrameTooLarge)
         ));
-        assert_eq!(written, OVERSIZE_REPLY);
+        assert_eq!(written, expected);
+    }
+
+    #[test]
+    fn the_oversize_reply_uses_the_message_fixed_on_the_page() {
+        const PAGE: &str = include_str!("../../../docs/stall-protocol.md");
+        let line = PAGE
+            .lines()
+            .find(|line| line.starts_with(r#"{"jsonrpc":"2.0","id":null,"error""#))
+            .expect("the page fixes the oversize error line");
+        let page: Value = serde_json::from_str(line).expect("the page's error JSON");
+        let reply: Value = serde_json::from_slice(OVERSIZE_REPLY).expect("barn's error JSON");
+
+        assert_eq!(reply, page);
     }
 
     #[test]
     fn a_start_reply_declares_the_jobs_the_stall_sent() {
-        let jobs = vec![Job {
-            every: "15s".to_owned(),
-        }];
+        let jobs = BTreeMap::from([(
+            "poll".to_owned(),
+            Job {
+                every: "15s".to_owned(),
+            },
+        )]);
         let frame = reply_frame(&json!(1), "", &jobs).expect("reply with jobs");
         let reply: Value = serde_json::from_slice(&frame).expect("reply JSON");
 
@@ -1586,11 +1605,11 @@ mod tests {
             reply,
             json!({
                 "jsonrpc": "2.0", "id": 1,
-                "result": {"state": "", "jobs": [{"every": "15s"}]}
+                "result": {"state": "", "jobs": {"poll": {"every": "15s"}}}
             })
         );
         assert_eq!(declared_jobs(&frame), jobs);
-        assert_eq!(declared_jobs(b"not JSON"), []);
+        assert_eq!(declared_jobs(b"not JSON"), BTreeMap::new());
     }
 
     #[test]
@@ -2054,14 +2073,11 @@ mod tests {
         );
     }
 
-    fn health_pair() -> (HealthProbe, BufReader<UnixStream>) {
+    fn health_pair() -> (HealthProbe, StallStream, BufReader<UnixStream>) {
         let (barn, stall) = UnixStream::pair().expect("connected sockets");
-        let probe = HealthProbe {
-            connection: Some(BufReader::new(barn)),
-            ..HealthProbe::default()
-        };
+        let probe = HealthProbe::default();
 
-        (probe, BufReader::new(stall))
+        (probe, BufReader::new(barn), BufReader::new(stall))
     }
 
     async fn health_request(stall: &mut BufReader<UnixStream>, id: u64) {
@@ -2113,8 +2129,8 @@ mod tests {
         ];
 
         for (reply, expected) in cases {
-            let (mut probe, mut stall) = health_pair();
-            let (decision, ()) = tokio::join!(probe.tick(|_| {}), async {
+            let (mut probe, mut connection, mut stall) = health_pair();
+            let (decision, ()) = tokio::join!(probe.tick(&mut connection, |_| {}), async {
                 health_request(&mut stall, 1).await;
                 stall
                     .write_all(format!("{reply}\n").as_bytes())
@@ -2186,11 +2202,11 @@ mod tests {
         let reply = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n";
         let mut frames = logs.concat();
         frames.extend_from_slice(reply);
-        let (mut probe, mut stall) = health_pair();
+        let (mut probe, mut connection, mut stall) = health_pair();
         let mut delivered = Vec::new();
         let mut sink = |frame: Vec<u8>| delivered.push(frame);
 
-        let (check, ()) = tokio::join!(probe.tick(&mut sink), async {
+        let (check, ()) = tokio::join!(probe.tick(&mut connection, &mut sink), async {
             health_request(&mut stall, 1).await;
             stall
                 .write_all(&frames)
@@ -2206,10 +2222,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_check_without_a_reply_misses_and_three_misses_restart() {
-        let (mut probe, mut stall) = health_pair();
+        let (mut probe, mut connection, mut stall) = health_pair();
         let mut tracker = HealthTracker::default();
 
-        let (check, ()) = tokio::join!(probe.tick(|_| {}), async {
+        let (check, ()) = tokio::join!(probe.tick(&mut connection, |_| {}), async {
             health_request(&mut stall, 1).await;
             stall.shutdown().await.expect("end of frames");
         });
@@ -2262,13 +2278,13 @@ mod tests {
         use HealthCheck::{Answered, Missed};
 
         for (late, expected) in [(2, Answered), (3, Missed)] {
-            let (mut probe, mut stall) = health_pair();
+            let (mut probe, mut connection, mut stall) = health_pair();
             probe.id = 2;
             let old = concat!(r#"{"jsonrpc":"2.0","id":2,"result":null}"#, "\n");
             let current = "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":null}\n";
             let replies = format!("{}{current}", old.repeat(late));
 
-            let (decision, ()) = tokio::join!(probe.tick(|_| {}), async {
+            let (decision, ()) = tokio::join!(probe.tick(&mut connection, |_| {}), async {
                 health_request(&mut stall, 3).await;
                 stall
                     .write_all(replies.as_bytes())
@@ -2281,8 +2297,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_health_timeout_keeps_the_partial_reply_for_the_next_tick() {
-        let (mut probe, mut stall) = health_pair();
-        let (missed, ()) = tokio::join!(probe.tick(|_| {}), async {
+        let (mut probe, mut connection, mut stall) = health_pair();
+        let (missed, ()) = tokio::join!(probe.tick(&mut connection, |_| {}), async {
             health_request(&mut stall, 1).await;
             stall
                 .write_all(b"{\"jsonrpc\":\"2.0\",")
@@ -2291,7 +2307,7 @@ mod tests {
         });
         assert_eq!(missed, HealthCheck::Missed);
 
-        let (answered, ()) = tokio::join!(probe.tick(|_| {}), async {
+        let (answered, ()) = tokio::join!(probe.tick(&mut connection, |_| {}), async {
             health_request(&mut stall, 2).await;
             let replies = concat!(
                 "\"id\":1,\"result\":null}\n",
@@ -2311,17 +2327,57 @@ mod tests {
             (MAX_LINE_BYTES, HealthCheck::Answered),
             (MAX_LINE_BYTES.saturating_add(1), HealthCheck::Missed),
         ] {
-            let (mut probe, mut stall) = health_pair();
+            let (mut probe, mut connection, mut stall) = health_pair();
             let mut reply = br#"{"jsonrpc":"2.0","id":1,"result":null}"#.to_vec();
             reply.resize(size.saturating_sub(1), b' ');
             reply.push(b'\n');
 
-            let (decision, ()) = tokio::join!(probe.tick(|_| {}), async {
+            let (decision, ()) = tokio::join!(probe.tick(&mut connection, |_| {}), async {
                 health_request(&mut stall, 1).await;
                 let _ = timeout(HEALTH_TIMEOUT, stall.write_all(&reply)).await;
             });
             assert_eq!(decision, expected);
         }
+    }
+
+    #[tokio::test]
+    async fn an_exit_during_a_check_keeps_the_connection_for_the_drain() {
+        let (mut probe, mut connection, mut stall) = health_pair();
+        let mut delivered = Vec::new();
+
+        tokio::join!(
+            async {
+                let checking = probe.tick(&mut connection, |frame| delivered.push(frame));
+                let cancelled = timeout(Duration::from_millis(500), checking).await;
+
+                assert!(cancelled.is_err(), "the child wins the select mid-check");
+            },
+            async {
+                health_request(&mut stall, 1).await;
+                stall
+                    .write_all(&[log_frame(1), log_frame(2)].concat())
+                    .await
+                    .expect("buffered logs before the exit");
+            }
+        );
+
+        probe
+            .pending
+            .drain(..)
+            .for_each(|frame| delivered.push(frame));
+        stall
+            .write_all(&log_frame(3))
+            .await
+            .expect("a frame still on the socket");
+        drop(stall);
+        let drained = timeout(
+            EXIT_DRAIN_TIMEOUT.saturating_mul(4),
+            drain_on_exit(&mut connection, probe.id, |frame| delivered.push(frame)),
+        )
+        .await;
+
+        assert_eq!(drained, Ok(DrainStop::Closed));
+        assert_eq!(delivered, [log_frame(1), log_frame(2), log_frame(3)]);
     }
 
     /// A caller log frame with a sequence number.
@@ -2341,6 +2397,45 @@ mod tests {
             DrainStop::Closed
         );
         assert_eq!(delivered, [log_frame(1), log_frame(2), log_frame(3)]);
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_exit_line_is_abandoned_at_the_deadline() {
+        let (barn, mut stall) = UnixStream::pair().expect("connected sockets");
+        let mut reader = BufReader::new(barn);
+        stall
+            .write_all(&log_frame(1))
+            .await
+            .expect("a complete log frame");
+        stall
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"log\"")
+            .await
+            .expect("an incomplete line");
+
+        let mut delivered = Vec::new();
+        let drained = timeout(
+            EXIT_DRAIN_TIMEOUT.saturating_mul(4),
+            drain_on_exit(&mut reader, 1, |frame| delivered.push(frame)),
+        )
+        .await;
+
+        assert_eq!(drained, Ok(DrainStop::Deadline));
+        assert_eq!(delivered, [log_frame(1)]);
+
+        stall
+            .write_all(&log_frame(2))
+            .await
+            .expect("a frame after the deadline");
+        drop(stall);
+        let mut delivered = Vec::new();
+        let drained = timeout(
+            EXIT_DRAIN_TIMEOUT.saturating_mul(4),
+            drain_on_exit(&mut reader, 1, |frame| delivered.push(frame)),
+        )
+        .await;
+
+        assert_eq!(drained, Ok(DrainStop::Closed));
+        assert_eq!(delivered, [log_frame(2)]);
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 //! Restart, health and run root decisions. The process fixture runs in CI only.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -301,7 +302,13 @@ async fn a_start_reply_exposes_the_declared_jobs() {
 
     stall.accept().await.expect("authenticate child");
 
-    assert_eq!(stall.jobs(), declared_jobs().as_slice());
+    assert_eq!(stall.jobs(), &declared_jobs());
+    assert_eq!(
+        stall.jobs().get("poll"),
+        Some(&Job {
+            every: "15s".to_owned(),
+        })
+    );
 }
 
 const LOG_FRAME: &str = concat!(
@@ -327,13 +334,15 @@ fn health_stall_fixture() {
     if !first {
         let old = fs::read_to_string(&marker).expect("first launch token");
         assert_ne!(old, token);
-        let mut rejected = connect_stall(&socket, &old, &[]).expect("offer the old token");
+        let mut rejected =
+            connect_stall(&socket, &old, &BTreeMap::new()).expect("offer the old token");
         let mut line = String::new();
 
         assert_eq!(rejected.read_line(&mut line).expect("old token refused"), 0);
     }
 
-    let mut client = connect_stall(&socket, &token, &[]).expect("offer the issued token");
+    let mut client =
+        connect_stall(&socket, &token, &BTreeMap::new()).expect("offer the issued token");
     assert_eq!(
         read_message(&mut client),
         Some(json!({"jsonrpc":"2.0","id":"start","result":{"state":state}}))
@@ -372,13 +381,20 @@ fn jobs_stall_fixture() {
     assert!(read_message(&mut client).is_some());
 }
 
-fn declared_jobs() -> Vec<Job> {
-    vec![Job {
-        every: "15s".to_owned(),
-    }]
+fn declared_jobs() -> BTreeMap<String, Job> {
+    BTreeMap::from([(
+        "poll".to_owned(),
+        Job {
+            every: "15s".to_owned(),
+        },
+    )])
 }
 
-fn connect_stall(socket: &Path, token: &str, jobs: &[Job]) -> io::Result<BufReader<UnixStream>> {
+fn connect_stall(
+    socket: &Path,
+    token: &str,
+    jobs: &BTreeMap<String, Job>,
+) -> io::Result<BufReader<UnixStream>> {
     let mut stream = UnixStream::connect(socket)?;
     let deadline = Some(Duration::from_secs(35));
     stream.set_read_timeout(deadline)?;

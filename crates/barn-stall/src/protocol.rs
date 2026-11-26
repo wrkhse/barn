@@ -4,6 +4,7 @@
 //! Every message is one line of JSON, so each field's name here is its wire
 //! name. A field added later is an addition inside a version, never a rename.
 
+use std::collections::BTreeMap;
 use std::fmt::{self, Debug, Formatter};
 
 use serde::{Deserialize, Serialize};
@@ -78,9 +79,10 @@ pub struct StallStartParams {
     pub protocol: u32,
     /// The single-use token from `BARN_TOKEN`.
     pub token: String,
-    /// The jobs the stall declares for barn to time; none when empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub jobs: Vec<Job>,
+    /// The jobs the stall declares for barn to time, keyed by name; none
+    /// when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub jobs: BTreeMap<String, Job>,
 }
 
 impl Debug for StallStartParams {
@@ -95,6 +97,8 @@ impl Debug for StallStartParams {
 }
 
 /// A job a stall declares and barn keeps the timer for.
+///
+/// Its name is the key it carries in the start message's `jobs` map.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     /// How often barn runs the job, such as `15s`.
@@ -106,9 +110,10 @@ pub struct Job {
 pub struct StallStartResult {
     /// The stall's state folder, as an absolute path.
     pub state: String,
-    /// The declared jobs barn retains; none when the stall declares no jobs.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub jobs: Vec<Job>,
+    /// The declared jobs barn retains, keyed by name; none when the stall
+    /// declares no jobs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub jobs: BTreeMap<String, Job>,
 }
 
 /// The secret a `net.request` names, and how barn adds it.
