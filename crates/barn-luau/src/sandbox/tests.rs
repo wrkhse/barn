@@ -1124,4 +1124,13 @@ fn clippy_configs_share_the_sandbox_thresholds() {
             "{key} is missing from barn-luau's clippy.toml"
         );
     }
+
+    assert!(
+        crate_local.contains("std::time::Instant::now"),
+        "std::time::Instant::now is missing from barn-luau's clippy.toml"
+    );
+    assert!(
+        crate_local.contains("std::time::SystemTime::now"),
+        "std::time::SystemTime::now is missing from barn-luau's clippy.toml"
+    );
 }
