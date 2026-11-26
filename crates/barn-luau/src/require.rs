@@ -596,6 +596,18 @@ mod tests {
                 .expect("error carries a require cause"),
             &RequireCause::HardLink("./original".into())
         );
+
+        // The refusal happens before the loading marker is taken, so a second
+        // call reaches the same check instead of reporting a cycle.
+        let second = loader
+            .call::<LuaValue>(("./original",))
+            .expect_err("a second require is refused for the same reason");
+        assert_eq!(
+            second
+                .downcast_ref::<RequireCause>()
+                .expect("error carries a require cause"),
+            &RequireCause::HardLink("./original".into())
+        );
     }
 
     /// A loader plus a handle on its state, so a test can arm a setup failure

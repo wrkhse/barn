@@ -6,7 +6,7 @@ use serde_json::{Map, Value};
 use super::errors::{EngineError, LimitCause, MAX_DEPTH, MAX_ENTRIES, MAX_OUTPUT_BYTES};
 
 /// Error text for a table currently on the conversion path.
-const SHARED_TABLE: &str = "shared or cyclic Lua table in result";
+const SHARED_TABLE: &str = "cyclic Lua table in result";
 
 /// The conversion-wide budget for converted entry visits: `MAX_DEPTH` times
 /// `MAX_ENTRIES`, or 16384 visits. Each table entry converted spends one
@@ -17,6 +17,19 @@ const SHARED_TABLE: &str = "shared or cyclic Lua table in result";
 /// `MAX_ENTRIES` per table and `MAX_DEPTH` in depth yet exceed the budget and
 /// be refused.
 const MAX_NODES: usize = MAX_DEPTH.saturating_mul(MAX_ENTRIES);
+
+/// Bytes charged for the colon and comma separating a converted table entry.
+const ENTRY_OVERHEAD: usize = 2;
+
+/// Bytes charged for the braces surrounding a converted table.
+const TABLE_OVERHEAD: usize = 2;
+
+/// Length of a value once serialized as JSON, quotes and escapes included.
+fn serialized_len(value: &Value) -> Result<usize, EngineError> {
+    serde_json::to_string(value)
+        .map(|text| text.len())
+        .map_err(|error| EngineError::InvalidResult(error.to_string()))
+}
 
 pub(super) fn tool_name(table: &Table, key: &str) -> Result<String, EngineError> {
     Ok(table
@@ -199,7 +212,7 @@ impl Conversion {
                 limit: MAX_NODES,
             }));
         }
-        Ok(())
+        self.charge_bytes(ENTRY_OVERHEAD)
     }
 
     fn value(&mut self, value: LuaValue, depth: usize) -> Result<Value, EngineError> {
@@ -212,6 +225,7 @@ impl Conversion {
             return Err(EngineError::Limit(LimitCause::TooDeep { limit: MAX_DEPTH }));
         }
         if let LuaValue::Table(table) = &value {
+            self.charge_bytes(TABLE_OVERHEAD)?;
             self.path.push(table.to_pointer());
             let result = self.table(table, depth);
             self.path.pop();
@@ -227,8 +241,9 @@ impl Conversion {
                 .ok_or_else(|| EngineError::InvalidResult("non-finite Lua number".into())),
             LuaValue::String(value) => {
                 let text = value.to_str()?;
-                self.charge_bytes(text.len())?;
-                Ok(Value::String(text.to_string()))
+                let string = Value::String(text.to_string());
+                self.charge_bytes(serialized_len(&string)?)?;
+                Ok(string)
             }
             _ => Err(EngineError::InvalidResult("unsupported Lua value".into())),
         }
@@ -254,9 +269,10 @@ impl Conversion {
                     }
                     array_mode = Some(false);
                     let converted = self.value(value, depth.saturating_add(1))?;
-                    let text = key.to_str()?;
-                    self.charge_bytes(text.len())?;
-                    object.insert(text.to_string(), converted);
+                    let text = key.to_str()?.to_string();
+                    let key_value = Value::String(text.clone());
+                    self.charge_bytes(serialized_len(&key_value)?)?;
+                    object.insert(text, converted);
                 }
                 LuaValue::Integer(index) => {
                     let position = array_position(index)?;
@@ -630,6 +646,36 @@ mod tests {
 
         let root = lua.create_table().unwrap();
         for child in 0..16 {
+            let holder = lua.create_table().unwrap();
+            holder.set("shared", shared.clone()).unwrap();
+            root.set(format!("k{child}"), holder).unwrap();
+        }
+
+        assert_eq!(
+            lua_to_json(LuaValue::Table(root), 0),
+            Err(EngineError::Limit(LimitCause::TooLarge {
+                limit: MAX_OUTPUT_BYTES
+            }))
+        );
+    }
+
+    #[test]
+    fn lua_to_json_refuses_an_escaped_shared_string_past_the_output_budget() {
+        const ONE_MIB: usize = 1024 * 1024;
+        let lua = Lua::new();
+
+        // Byte 1 serializes as a six-byte escape, so the 1 MiB blob becomes
+        // 6 MiB of JSON while its raw Lua length is only 1 MiB. Two holders
+        // convert it twice, which overshoots the 8 MiB output budget only
+        // when escaped lengths are charged.
+        let blob = vec![1u8; ONE_MIB];
+        let shared = lua.create_table().unwrap();
+        shared
+            .set("blob", lua.create_string(blob.as_slice()).unwrap())
+            .unwrap();
+
+        let root = lua.create_table().unwrap();
+        for child in 0..2 {
             let holder = lua.create_table().unwrap();
             holder.set("shared", shared.clone()).unwrap();
             root.set(format!("k{child}"), holder).unwrap();
