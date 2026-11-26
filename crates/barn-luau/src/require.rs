@@ -65,10 +65,23 @@ impl fmt::Display for RequireCause {
 
 impl std::error::Error for RequireCause {}
 
+/// Test-only failure points between taking the loading marker and evaluating
+/// the chunk. Each is checked after the `LoadingGuard` owns the marker, so
+/// failing there must still release it before a later require can proceed.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupFailure {
+    RequireCreation,
+    ModuleEnvironment,
+    ChunkSetup,
+}
+
 pub struct RequireState {
     root: PathBuf,
     cache: HashMap<PathBuf, LuaValue>,
     loading: Vec<PathBuf>,
+    #[cfg(test)]
+    setup_failure: Option<SetupFailure>,
 }
 
 enum Resolved {
@@ -113,6 +126,8 @@ impl RequireState {
             root,
             cache: HashMap::new(),
             loading: Vec::new(),
+            #[cfg(test)]
+            setup_failure: None,
         })
     }
 
@@ -232,6 +247,21 @@ pub fn confine_global_require(lua: &Lua) -> LuaResult<()> {
     lua.globals().set("require", refuser)
 }
 
+/// Return an injected runtime error when the step is armed on the state.
+#[cfg(test)]
+fn fail_setup(state: &Arc<Mutex<RequireState>>, step: SetupFailure) -> LuaResult<()> {
+    let held = state
+        .lock()
+        .map_err(|_| mlua::Error::external(RequireCause::Poisoned))?;
+    if held.setup_failure == Some(step) {
+        return Err(mlua::Error::runtime(format!(
+            "injected setup failure: {step:?}"
+        )));
+    }
+    drop(held);
+    Ok(())
+}
+
 /// Build a require whose relative specs resolve against one fixed folder.
 fn scoped_require(
     lua: &Lua,
@@ -259,11 +289,17 @@ fn scoped_require(
             } => {
                 // Own the loading marker from here: every step below can fail.
                 let _guard = LoadingGuard::new(&state, canonical.clone());
+                #[cfg(test)]
+                fail_setup(&state, SetupFailure::RequireCreation)?;
                 let module_base = canonical
                     .parent()
                     .map_or_else(|| base.clone(), Path::to_path_buf);
                 let require = scoped_require(lua, Arc::clone(&state), module_base)?;
+                #[cfg(test)]
+                fail_setup(&state, SetupFailure::ModuleEnvironment)?;
                 let env = module_env(lua, require)?;
+                #[cfg(test)]
+                fail_setup(&state, SetupFailure::ChunkSetup)?;
                 // The mutex guard is dropped before entering Lua: a module
                 // may call require again for its own siblings.
                 let outcome = lua
@@ -560,5 +596,57 @@ mod tests {
                 .expect("error carries a require cause"),
             &RequireCause::HardLink("./original".into())
         );
+    }
+
+    /// A loader plus a handle on its state, so a test can arm a setup failure
+    /// and inspect the loading markers left behind by a failed load.
+    fn loader_with_state(lua: &Lua, folder: &Folder) -> (Function, Arc<Mutex<RequireState>>) {
+        let state = RequireState::new(&folder.path).expect("require state");
+        let root = state.root.clone();
+        let state = Arc::new(Mutex::new(state));
+        let loader = scoped_require(lua, Arc::clone(&state), root).expect("scoped require");
+        (loader, state)
+    }
+
+    fn assert_early_failure_releases_loading_marker(step: SetupFailure) {
+        let folder = Folder::new();
+        folder.write("mod.luau", b"return {}".to_vec());
+
+        let lua = Lua::new();
+        let (loader, state) = loader_with_state(&lua, &folder);
+        state.lock().expect("lock state").setup_failure = Some(step);
+
+        let first = loader
+            .call::<LuaValue>(("./mod",))
+            .expect_err("an injected setup failure stops the load");
+        assert_eq!(first.downcast_ref::<RequireCause>(), None);
+        assert_eq!(
+            state.lock().expect("lock state").loading,
+            Vec::<PathBuf>::new()
+        );
+
+        let second = loader
+            .call::<LuaValue>(("./mod",))
+            .expect_err("a second require reaches setup again instead of cycling");
+        assert_eq!(
+            second.downcast_ref::<RequireCause>(),
+            None,
+            "the second failure is the injected runtime error, not RequireCause::Cycle"
+        );
+    }
+
+    #[test]
+    fn a_failed_require_creation_can_be_required_again() {
+        assert_early_failure_releases_loading_marker(SetupFailure::RequireCreation);
+    }
+
+    #[test]
+    fn a_failed_module_environment_can_be_required_again() {
+        assert_early_failure_releases_loading_marker(SetupFailure::ModuleEnvironment);
+    }
+
+    #[test]
+    fn a_failed_chunk_setup_can_be_required_again() {
+        assert_early_failure_releases_loading_marker(SetupFailure::ChunkSetup);
     }
 }

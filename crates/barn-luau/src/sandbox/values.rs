@@ -3,7 +3,7 @@ use std::ffi::c_void;
 use mlua::{Lua, Table, Value as LuaValue};
 use serde_json::{Map, Value};
 
-use super::errors::{EngineError, LimitCause, MAX_DEPTH, MAX_ENTRIES};
+use super::errors::{EngineError, LimitCause, MAX_DEPTH, MAX_ENTRIES, MAX_OUTPUT_BYTES};
 
 /// Error text for a table currently on the conversion path.
 const SHARED_TABLE: &str = "shared or cyclic Lua table in result";
@@ -25,7 +25,12 @@ pub(super) fn tool_name(table: &Table, key: &str) -> Result<String, EngineError>
 }
 
 pub(super) fn tool_named(tools: &Table, name: &str) -> Result<Option<Table>, EngineError> {
-    for pair in tools.pairs::<LuaValue, LuaValue>() {
+    // The tools table is bounded by the manifest entry cap, so per-run lookup
+    // work stays bounded even if a plugin populates it at runtime.
+    for (index, pair) in tools.pairs::<LuaValue, LuaValue>().enumerate() {
+        if index >= MAX_ENTRIES {
+            break;
+        }
         let (key, value) = pair?;
         let LuaValue::String(key) = key else {
             continue;
@@ -98,13 +103,12 @@ fn lua_index(index: usize) -> Result<i64, EngineError> {
 }
 
 /// Accept only positive integers inside the entry ceiling as array keys.
-fn array_position(index: impl TryInto<usize>) -> Result<usize, EngineError> {
-    let position = index
-        .try_into()
-        .map_err(|_| EngineError::InvalidResult("unsupported table key".into()))?;
-    if position == 0 {
+fn array_position(index: i64) -> Result<usize, EngineError> {
+    if index <= 0 {
         return Err(EngineError::InvalidResult("unsupported table key".into()));
     }
+    let position = usize::try_from(index)
+        .map_err(|_| EngineError::Limit(LimitCause::TooManyEntries { limit: MAX_ENTRIES }))?;
     if position > MAX_ENTRIES {
         return Err(EngineError::Limit(LimitCause::TooManyEntries {
             limit: MAX_ENTRIES,
@@ -160,10 +164,11 @@ pub(super) fn json_to_lua(lua: &Lua, value: &Value, depth: usize) -> Result<LuaV
     }
 }
 
-/// Tables on the current path and node count for one Lua-to-JSON conversion.
+/// Path, node visits and output bytes spent by one Lua-to-JSON conversion.
 struct Conversion {
     path: Vec<*const c_void>,
     nodes: usize,
+    bytes: usize,
 }
 
 impl Conversion {
@@ -171,7 +176,19 @@ impl Conversion {
         Self {
             path: Vec::new(),
             nodes: 0,
+            bytes: 0,
         }
+    }
+
+    /// Charge the byte length of a converted string against the output budget.
+    const fn charge_bytes(&mut self, len: usize) -> Result<(), EngineError> {
+        self.bytes = self.bytes.saturating_add(len);
+        if self.bytes > MAX_OUTPUT_BYTES {
+            return Err(EngineError::Limit(LimitCause::TooLarge {
+                limit: MAX_OUTPUT_BYTES,
+            }));
+        }
+        Ok(())
     }
 
     /// Charge one table entry against the conversion-wide node budget.
@@ -208,7 +225,11 @@ impl Conversion {
             LuaValue::Number(value) => serde_json::Number::from_f64(value)
                 .map(Value::Number)
                 .ok_or_else(|| EngineError::InvalidResult("non-finite Lua number".into())),
-            LuaValue::String(value) => Ok(Value::String(value.to_str()?.to_string())),
+            LuaValue::String(value) => {
+                let text = value.to_str()?;
+                self.charge_bytes(text.len())?;
+                Ok(Value::String(text.to_string()))
+            }
             _ => Err(EngineError::InvalidResult("unsupported Lua value".into())),
         }
     }
@@ -233,7 +254,9 @@ impl Conversion {
                     }
                     array_mode = Some(false);
                     let converted = self.value(value, depth.saturating_add(1))?;
-                    object.insert(key.to_str()?.to_string(), converted);
+                    let text = key.to_str()?;
+                    self.charge_bytes(text.len())?;
+                    object.insert(text.to_string(), converted);
                 }
                 LuaValue::Integer(index) => {
                     let position = array_position(index)?;
@@ -345,7 +368,17 @@ mod tests {
         assert_eq!(array_position(0i64), Err(unsupported()));
         assert_eq!(array_position(-1i64), Err(unsupported()));
         assert_eq!(
-            array_position(2000i64),
+            array_position(i64::try_from(MAX_ENTRIES.saturating_add(1)).unwrap()),
+            Err(EngineError::Limit(LimitCause::TooManyEntries {
+                limit: MAX_ENTRIES
+            }))
+        );
+    }
+
+    #[test]
+    fn array_position_refuses_i64_max_as_an_entry_limit() {
+        assert_eq!(
+            array_position(i64::MAX),
             Err(EngineError::Limit(LimitCause::TooManyEntries {
                 limit: MAX_ENTRIES
             }))
@@ -356,7 +389,8 @@ mod tests {
     fn lua_table_to_json_refuses_an_out_of_ceiling_array_key() {
         let lua = Lua::new();
         let table = lua.create_table().unwrap();
-        table.set(2000i64, "a").unwrap();
+        let past_cap = i64::try_from(MAX_ENTRIES.saturating_add(1)).unwrap();
+        table.set(past_cap, "a").unwrap();
         assert_eq!(
             lua_table_to_json(&table, 0),
             Err(EngineError::Limit(LimitCause::TooManyEntries {
@@ -554,29 +588,57 @@ mod tests {
     #[test]
     fn lua_to_json_refuses_a_shared_table_dag() {
         let lua = Lua::new();
-        let mut tables = Vec::with_capacity(16);
-        for _ in 0..16 {
+        let depth = MAX_DEPTH;
+        let mut tables = Vec::with_capacity(depth);
+        for _ in 0..depth {
             tables.push(lua.create_table().unwrap());
         }
 
         // Each table's entries all point at the next one. A path stack allows
-        // sibling reuse, so this 16-table, 1024-way DAG expands until the
-        // conversion-wide node budget stops it instead of a shared-table
-        // error.
-        for index in 0..15usize {
+        // sibling reuse, so this MAX_DEPTH-table, MAX_ENTRIES-way DAG expands
+        // until the conversion-wide node budget stops it instead of a shared
+        // table error.
+        for index in 0..depth.saturating_sub(1) {
             let child = tables[index.saturating_add(1)].clone();
             for key in 0..MAX_ENTRIES {
                 tables[index].set(format!("k{key}"), child.clone()).unwrap();
             }
         }
+        let leaf = depth.saturating_sub(1);
         for key in 0..MAX_ENTRIES {
-            tables[15].set(format!("k{key}"), 1i64).unwrap();
+            tables[leaf].set(format!("k{key}"), 1i64).unwrap();
         }
 
         assert_eq!(
             lua_to_json(LuaValue::Table(tables[0].clone()), 0),
             Err(EngineError::Limit(LimitCause::TooManyEntries {
                 limit: MAX_NODES
+            }))
+        );
+    }
+
+    #[test]
+    fn lua_to_json_refuses_a_shared_large_string_past_the_output_budget() {
+        const ONE_MIB: usize = 1024 * 1024;
+        let lua = Lua::new();
+
+        let blob = vec![b'x'; ONE_MIB];
+        let shared = lua.create_table().unwrap();
+        shared
+            .set("blob", lua.create_string(blob.as_slice()).unwrap())
+            .unwrap();
+
+        let root = lua.create_table().unwrap();
+        for child in 0..16 {
+            let holder = lua.create_table().unwrap();
+            holder.set("shared", shared.clone()).unwrap();
+            root.set(format!("k{child}"), holder).unwrap();
+        }
+
+        assert_eq!(
+            lua_to_json(LuaValue::Table(root), 0),
+            Err(EngineError::Limit(LimitCause::TooLarge {
+                limit: MAX_OUTPUT_BYTES
             }))
         );
     }
