@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Read as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -34,6 +35,7 @@ pub enum RequireCause {
     Absolute(String),
     Parent(String),
     Escape(String),
+    HardLink(String),
     Cycle(String),
     Missing(String),
     TooLarge(String),
@@ -49,6 +51,7 @@ impl fmt::Display for RequireCause {
             }
             Self::Parent(spec) => write!(f, "require rejects parent path: {spec}"),
             Self::Escape(spec) => write!(f, "require escapes plugin folder: {spec}"),
+            Self::HardLink(spec) => write!(f, "require rejects hard-linked module: {spec}"),
             Self::Cycle(spec) => write!(f, "require cycle detected: {spec}"),
             Self::Missing(spec) => write!(f, "require module not found: {spec}"),
             Self::TooLarge(spec) => write!(f, "require module too large: {spec}"),
@@ -143,6 +146,14 @@ impl RequireState {
                 })?;
             if !canonical.starts_with(&self.root) {
                 return Err(RequireCause::Escape(spec.to_owned()));
+            }
+            let metadata =
+                std::fs::metadata(&canonical).map_err(|error| RequireCause::Unreadable {
+                    spec: spec.to_owned(),
+                    detail: error.to_string(),
+                })?;
+            if metadata.nlink() > 1 {
+                return Err(RequireCause::HardLink(spec.to_owned()));
             }
             return Ok(canonical);
         }
@@ -301,6 +312,10 @@ mod tests {
                 "require cycle detected: ./a".to_owned(),
             ),
             (
+                RequireCause::HardLink("./linked".into()),
+                "require rejects hard-linked module: ./linked".to_owned(),
+            ),
+            (
                 RequireCause::Missing("./nope".into()),
                 "require module not found: ./nope".to_owned(),
             ),
@@ -394,5 +409,27 @@ mod tests {
         loader
             .call::<LuaValue>(("./exact",))
             .expect("a module at one MiB loads");
+    }
+
+    #[test]
+    fn scoped_require_refuses_a_hard_link_into_the_folder() {
+        let folder = Folder::new();
+        let outside = Source::new(0);
+        std::fs::hard_link(&outside.path, folder.path.join("linked.luau"))
+            .expect("hard link into the scratch folder");
+
+        let lua = Lua::new();
+        let state = RequireState::new(&folder.path).expect("require state");
+        let loader = install(&lua, state).expect("install require");
+
+        let error = loader
+            .call::<LuaValue>(("./linked",))
+            .expect_err("a hard link into the folder is refused");
+        assert_eq!(
+            error
+                .downcast_ref::<RequireCause>()
+                .expect("error carries a require cause"),
+            &RequireCause::HardLink("./linked".into())
+        );
     }
 }
