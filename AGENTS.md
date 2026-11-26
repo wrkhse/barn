@@ -58,8 +58,9 @@ npm ci && npm run check
 
 `cargo nextest run` needs `cargo-nextest`; `cargo test --workspace` runs the
 same tests without it. `npm run check` is prettier and markdownlint over the
-markdown, from `package.json`. Mutation testing runs on a pull request's
-changed lines only, and only in CI: dispatch the Check workflow on your branch
+markdown, from `package.json`. Mutation testing runs in CI only: on a pull
+request's changed lines in four shards behind the `mutants` aggregate, and on
+pushes to `main` on the full tree. Dispatch the Check workflow on your branch
 (`gh workflow run check.yml --ref <branch>`) and read its `mutants` job. Never
 run it here.
 
@@ -70,12 +71,12 @@ run it here.
 | test    | a failing test or doc test                                                                                   | `test`                               |
 | msrv    | anything the pinned toolchain accepts and 1.100.0 does not                                                   | `msrv`                               |
 | deny    | a licence off the allow-list, a banned crate, an advisory, a yanked crate, an unknown registry or git source | `deny`                               |
-| mutants | a viable mutant in a pull request's changed lines that no test catches                                       | `mutants`                            |
+| mutants | a viable mutant in a pull request's changed lines or, on main, in the whole tree, that no test catches       | `mutants`                            |
 | docs    | markdown that prettier or markdownlint would change                                                          | `docs`                               |
 
-Every gate runs in CI, one job each, and a deliberate break fails the job it
-targets. Never weaken a gate to make a change pass: fix the change, or say why
-the gate is wrong.
+Every gate runs in CI; the mutants gate uses four shards plus an aggregate,
+and a deliberate break fails the gate it targets. Never weaken a gate to make
+a change pass: fix the change, or say why the gate is wrong.
 
 ## Tests that touch processes
 
