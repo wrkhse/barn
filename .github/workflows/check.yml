@@ -48,6 +48,10 @@ jobs:
         run: |
           channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
@@ -61,6 +65,10 @@ jobs:
         run: |
           channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: cargo-nextest@0.9.152
@@ -79,6 +87,10 @@ jobs:
         run: |
           channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: cargo-nextest@0.9.152
@@ -104,6 +116,10 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install 1.100.0 --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo +1.100.0 check --workspace --all-targets --locked
 
   deny:
@@ -118,6 +134,10 @@ jobs:
         run: |
           channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The pin matches the version installed locally.
       - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
@@ -125,13 +145,16 @@ jobs:
       # Licences, advisories, sources and bans, as deny.toml sets them.
       - run: cargo deny check
 
-  # Every viable mutant in the lines a pull request changes must be caught; an
-  # equivalent one is excluded in .cargo/mutants.toml, with why. A dispatched
-  # run repeats it on a branch, diffed against main, to check the gate itself.
-  mutants:
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+  # Every viable mutant in a pull request's changed Rust lines must be caught;
+  # an equivalent one is excluded in .cargo/mutants.toml, with why. The diff is
+  # split across four shards; a push to main mutates the whole tree instead.
+  mutants-shard:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -141,33 +164,106 @@ jobs:
         run: |
           channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: cargo-mutants@27.1.0,cargo-nextest@0.9.152
       - name: The diff to mutate
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
-        run: git diff "${BASE:-origin/main}"...HEAD -- '*.rs' > pr.diff
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" != push ]; then
+            git diff "${BASE:-origin/main}"...HEAD -- '*.rs' > pr.diff
+          fi
+          touch pr.diff
       # A missed mutant or a timeout fails. One that truly hangs the tests is
       # excluded by name in .cargo/mutants.toml, with its reason.
-      - run: cargo mutants --in-diff pr.diff --no-shuffle -j 2 -vV
+      - name: Run mutants
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          zero() {
+            mkdir -p mutants.out
+            jq -n '{total_mutants: 0, caught: 0, missed: 0, timeout: 0, unviable: 0}' > mutants.out/outcomes.json
+          }
+          args="--shard ${{ matrix.shard }}/4 --no-shuffle -j 2 -vV"
+          if [ "$EVENT_NAME" != push ] && [ ! -s pr.diff ]; then
+            zero
+            exit 0
+          fi
+          if [ "$EVENT_NAME" != push ]; then
+            args="$args --in-diff pr.diff"
+          fi
+          cargo mutants $args
+          [ -f mutants.out/outcomes.json ] || zero
+      - name: Check outcomes
+        run: |
+          if ! jq -e '.missed == 0 and .timeout == 0' mutants.out/outcomes.json > /dev/null; then
+            echo "::error::shard ${{ matrix.shard }} has a missed or timed-out mutant"
+            exit 1
+          fi
       - name: What was tested
         if: always()
         run: |
           {
-            echo "### Mutants"
+            echo "### Mutants, shard ${{ matrix.shard }}"
             if [ -f mutants.out/outcomes.json ]; then
               jq -r '"- tested: \(.total_mutants)", "- caught: \(.caught)", "- missed: \(.missed)", "- timeouts: \(.timeout)", "- unviable: \(.unviable)"' mutants.out/outcomes.json
             else
-              echo "- none in this diff"
+              echo "- no outcomes"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: mutants.out
-          path: mutants.out
-          if-no-files-found: ignore
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out/outcomes.json
+          if-no-files-found: error
+
+  # The required check: every shard succeeded and every outcome is clean. An
+  # absent shard or a missed or timed-out mutant fails the gate.
+  mutants:
+    needs: [mutants-shard]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: mutants-shard-*
+          path: outcomes
+      - name: Verify shards
+        run: |
+          failed=0
+          if [ "${{ needs.mutants-shard.result }}" != success ]; then
+            echo "::error::one or more mutants shards failed"
+            failed=1
+          fi
+          mapfile -t files < <(find outcomes -name outcomes.json -type f)
+          if [ "${#files[@]}" -ne 4 ]; then
+            echo "::error::expected 4 shard outcomes, found ${#files[@]}"
+            failed=1
+          fi
+          for f in "${files[@]}"; do
+            if ! jq -e '.missed == 0 and .timeout == 0' "$f" > /dev/null; then
+              echo "::error::$f has a missed or timed-out mutant"
+              failed=1
+            fi
+          done
+          exit "$failed"
+      - name: What was tested
+        if: always()
+        run: |
+          {
+            echo "### Mutants"
+            mapfile -t files < <(find outcomes -name outcomes.json -type f)
+            if [ "${#files[@]}" -gt 0 ]; then
+              jq -s -r '"- tested: \(map(.total_mutants)|add)", "- caught: \(map(.caught)|add)", "- missed: \(map(.missed)|add)", "- timeouts: \(map(.timeout)|add)", "- unviable: \(map(.unviable)|add)"' "${files[@]}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # The markdown a change adds: prettier and markdownlint, both pinned in
   # package-lock.json, installed with npm ci so CI runs what a person runs.
