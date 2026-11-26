@@ -6,8 +6,8 @@ its background jobs such as polling, and the events it emits. barn starts each
 stall in its own sandboxed child process, holds every listener and speaks its
 protocol, and brokers the network, secrets, webhooks, MCP and upgrades.
 
-The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1). Slice B0,
-this repository and its gates, is what exists today; B1 builds the supervisor.
+The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1). Slices B0
+(the repository and its gates) and B1 (the supervisor) are in place.
 
 ## Vocabulary
 
