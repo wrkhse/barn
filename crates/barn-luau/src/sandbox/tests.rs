@@ -315,6 +315,7 @@ fn a_deadline_uses_the_injected_clock() {
     let clock: Arc<dyn Clock> = Arc::<FakeClock>::clone(&fake);
     let scratch = Scratch::new();
     scratch.write("plugin.luau", PLUGIN);
+    scratch.write("helper.luau", HELPER);
     let sandbox = Sandbox::new(
         scratch.path(),
         default_limits(),
