@@ -28,7 +28,10 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
   `TOKEN_TTL_SECS`, is a named deny: barn answers with the deny and closes
   the connection, issuing no new token without a restart. Failures at this
   boundary are named denies, each in `data.reason` on a `DENIED_CODE`
-  error; `barn-stall`'s `deny` module names every reason.
+  error; `barn-stall`'s `deny` module names every reason. The socket path and
+  token reach the embedding host in-process, as the `HostEndpoint` value that
+  `Supervisor::start_for_host` returns; no environment variable or file carries
+  them to tack.
 - The stall connects and sends `stall.start` as its first message. barn checks
   that the peer PID matches the child it spawned and that the peer UID owns
   the socket. A missing peer PID fails authentication. The stall declares its

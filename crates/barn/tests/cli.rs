@@ -1,4 +1,5 @@
 //! The command line's surface, as the plan writes it.
+#![cfg(feature = "cli")]
 
 use barn::cli::{Cli, CliCommand, StallsCommand};
 use clap::Parser;
