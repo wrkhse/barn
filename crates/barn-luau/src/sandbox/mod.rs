@@ -17,6 +17,7 @@ use crate::require;
 
 mod call;
 mod capabilities;
+mod clock;
 mod deadline;
 mod errors;
 mod loading;
@@ -26,6 +27,7 @@ mod tests;
 mod values;
 
 pub use capabilities::Capabilities;
+pub use clock::Clock;
 pub use errors::{EngineError, LimitCause, LoadCause};
 
 use deadline::Deadline;
@@ -75,7 +77,7 @@ pub struct Sandbox {
 }
 
 impl Sandbox {
-    /// Build a sandbox rooted at `folder` under the given bounds.
+    /// Build a sandbox rooted at `folder` under the given bounds, timed by `clock`.
     ///
     /// # Errors
     ///
@@ -86,6 +88,7 @@ impl Sandbox {
         folder: &Path,
         limits: Limits,
         capabilities: Capabilities,
+        clock: Arc<dyn Clock>,
     ) -> Result<Self, EngineError> {
         capabilities.validate()?;
         let lua = Lua::new();
@@ -96,7 +99,7 @@ impl Sandbox {
         require::confine_global_require(&lua)?;
         lua.sandbox(true)?;
 
-        let deadline = Arc::new(Deadline::new());
+        let deadline = Arc::new(Deadline::with_clock(clock));
         let watchdog = Arc::clone(&deadline);
         lua.set_interrupt(move |_| {
             if watchdog.expired() {

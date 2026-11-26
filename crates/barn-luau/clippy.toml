@@ -1,0 +1,15 @@
+# Mirrors the root clippy.toml keys so barn-luau keeps the same thresholds and
+# test allowances; keep both files in sync until PR C deletes this file.
+too-many-lines-threshold = 70
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+# B2 scopes the wall-clock lint to barn-luau; PR C deletes this file when the
+# lint moves to the root clippy.toml for all runtime crates.
+# barn-luau takes time from the host-supplied clock seam, not the wall clock.
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "barn-luau reads time from the host-supplied clock seam; engine code must not call Instant::now" },
+    { path = "std::time::SystemTime::now", reason = "barn-luau reads time from the host-supplied clock seam; engine code must not call SystemTime::now" },
+]

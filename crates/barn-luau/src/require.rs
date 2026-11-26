@@ -340,12 +340,11 @@ mod tests {
 
     /// A path component unique across processes and concurrent test threads.
     fn unique_token() -> String {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock is after the epoch")
-            .as_nanos();
-        let counter = NEXT.fetch_add(1, Ordering::Relaxed);
-        format!("{}-{nanos}-{counter}", std::process::id())
+        format!(
+            "{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     struct Source {

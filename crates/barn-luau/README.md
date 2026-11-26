@@ -12,11 +12,23 @@ This plugin denies a request when the host context marks it read-only. Its
 ```rust
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-use serde_json::json;
 use barn_luau::api::{Invocation, Outcome};
-use barn_luau::{Capabilities, Limits, Sandbox};
+use barn_luau::{Capabilities, Clock, Limits, Sandbox};
+use serde_json::json;
+
+static NEXT: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+struct HostClock(AtomicU64);
+
+impl Clock for HostClock {
+    fn micros(&self) -> u128 {
+        u128::from(self.0.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 struct PluginDir(PathBuf);
 
@@ -27,9 +39,18 @@ impl Drop for PluginDir {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let path = std::env::temp_dir().join(format!("luau-{}-{nonce}", std::process::id()));
-    fs::create_dir(&path)?;
+    let prefix = format!("luau-{}-", std::process::id());
+    let path = loop {
+        let candidate = std::env::temp_dir().join(format!(
+            "{prefix}{}",
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    };
     let plugin = PluginDir(path);
     fs::write(
         plugin.0.join("plugin.luau"),
@@ -51,7 +72,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let limits = Limits::new(16 * 1024 * 1024, 100)?;
-    let sandbox = Sandbox::new(&plugin.0, limits, Capabilities::default())?;
+    let clock = Arc::new(HostClock(AtomicU64::new(0)));
+    let sandbox = Sandbox::new(&plugin.0, limits, Capabilities::default(), clock)?;
 
     let invocation = Invocation {
         hook: "beforeWrite".into(),
@@ -67,6 +89,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+The host owns the clock: it supplies an `Arc<dyn Clock>`, and barn-luau
+reads no wall clock. `Clock::micros` returns the host's monotonic microsecond
+count; this example advances a counter so it stays deterministic.
 
 Hooks take `(payload, ctx)`. The fields of a host context object appear
 directly on `ctx`; another value appears as `ctx.host`. Verdict helpers

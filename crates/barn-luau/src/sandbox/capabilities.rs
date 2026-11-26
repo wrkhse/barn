@@ -96,6 +96,7 @@ fn check_deadline(deadline: &Deadline) -> mlua::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::clock::FakeClock;
 
     #[test]
     fn debug_reports_only_the_callback_count() {
@@ -109,7 +110,7 @@ mod tests {
     fn a_capability_refuses_an_expired_deadline() {
         let lua = Lua::new();
         let ctx = lua.create_table().expect("create context");
-        let deadline = Arc::new(Deadline::new());
+        let deadline = Arc::new(Deadline::with_clock(Arc::new(FakeClock::new())));
         let mut capabilities = Capabilities::default();
         capabilities.insert("lookup", |_| Ok(Value::Bool(true)));
         capabilities

@@ -15,5 +15,7 @@ mlua = { workspace = true, features = ["send"] }
 serde.workspace = true
 serde_json.workspace = true
 
+# The crate-local clippy.toml carries the wall-clock method list; this
+# duplicate ends in PR C when the lint moves to the root clippy.toml.
 [lints]
 workspace = true
