@@ -273,14 +273,25 @@ mod tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
+    /// A path component unique across processes and concurrent test threads.
+    fn unique_token() -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is after the epoch")
+            .as_nanos();
+        let counter = NEXT.fetch_add(1, Ordering::Relaxed);
+        format!("{}-{nanos}-{counter}", std::process::id())
+    }
+
     struct Source {
         path: PathBuf,
     }
 
     impl Source {
         fn new(bytes: usize) -> Self {
-            let id = NEXT.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!("barn-require-source-{id}-{bytes}.luau"));
+            let token = unique_token();
+            let path =
+                std::env::temp_dir().join(format!("barn-require-source-{token}-{bytes}.luau"));
             std::fs::write(&path, "x".repeat(bytes)).expect("write source");
             Self { path }
         }
@@ -360,8 +371,8 @@ mod tests {
 
     impl Folder {
         fn new() -> Self {
-            let id = NEXT.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!("barn-require-folder-{id}"));
+            let token = unique_token();
+            let path = std::env::temp_dir().join(format!("barn-require-folder-{token}"));
             std::fs::create_dir_all(&path).expect("create scratch folder");
             Self { path }
         }
