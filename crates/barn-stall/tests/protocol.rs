@@ -2,6 +2,7 @@
 //! limits table are read from docs/stall-protocol.md itself, so a constant or a
 //! field that drifts from the page fails here.
 
+use barn_stall::protocol::Job;
 use barn_stall::protocol::TOKEN_TTL_SECS;
 use barn_stall::{
     BodyEncoding, DEFAULT_MAX_BODY_BYTES, DENIED_CODE, Headers, MAX_LINE_BYTES, NetAuth,
@@ -109,6 +110,9 @@ fn stall_start_reads_the_pages_request() {
     let params = StallStartParams {
         protocol: PROTOCOL_VERSION,
         token: "…".to_owned(),
+        jobs: vec![Job {
+            every: "15s".to_owned(),
+        }],
     };
 
     assert_eq!(
@@ -132,6 +136,9 @@ fn stall_start_reads_the_pages_result() {
     let wire = reply.as_ref().and_then(|message| message.get("result"));
     let result = StallStartResult {
         state: "/var/lib/barn/sourcefed".to_owned(),
+        jobs: vec![Job {
+            every: "15s".to_owned(),
+        }],
     };
 
     assert_eq!(
@@ -147,11 +154,32 @@ fn start_parameters_keep_the_token_out_of_diagnostics() {
     let params = StallStartParams {
         protocol: PROTOCOL_VERSION,
         token: "secret".to_owned(),
+        jobs: Vec::new(),
     };
 
     assert_eq!(
         format!("{params:?}"),
-        "StallStartParams { protocol: 1, token: \"[redacted]\" }"
+        "StallStartParams { protocol: 1, token: \"[redacted]\", jobs: [] }"
+    );
+}
+
+#[test]
+fn a_start_without_jobs_omits_the_field_and_reads_it_as_empty() {
+    let params: StallStartParams =
+        serde_json::from_value(json!({"protocol": 1, "token": "secret"}))
+            .expect("start parameters without jobs");
+    let wire = json!({"state": "/state"});
+    let result = serde_json::from_value::<StallStartResult>(wire).expect("jobs default");
+
+    assert_eq!(params.jobs, []);
+    assert_eq!(result.jobs, []);
+    assert_eq!(
+        serde_json::to_value(params).expect("params serialise"),
+        json!({"protocol": 1, "token": "secret"})
+    );
+    assert_eq!(
+        serde_json::to_value(result).expect("result serialise"),
+        json!({"state": "/state"})
     );
 }
 

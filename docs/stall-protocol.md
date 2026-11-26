@@ -17,9 +17,11 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
   socket, leaving the stall's state folder intact.
 - The stall connects and sends `stall.start` as its first message. barn checks
   that the peer PID matches the child it spawned and that the peer UID owns
-  the socket. A missing peer PID fails authentication. barn checks and spends
-  the token, then returns the absolute path of the stall's state folder,
-  `state_dir/<stall>`, which barn creates and grants the stall read-write access to.
+  the socket. A missing peer PID fails authentication. The stall declares its
+  jobs in the message's `jobs`; barn keeps them and returns them in the result.
+  barn spends the token, then returns the absolute path of the stall's state
+  folder, `state_dir/<stall>`, which it creates and grants the stall read-write
+  access to.
 - The token expires `TOKEN_TTL_SECS` (30 seconds) after barn spawns the stall.
   A `stall.start` at or after that deadline is refused as `TokenExpired`: barn
   drops the token unspent and closes the connection without a reply, so only a
@@ -73,8 +75,8 @@ encoding is a new version, never a value added inside this one.
 A stall connects and receives its state folder:
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"stall.start","params":{"protocol":1,"token":"…"}}
-{"jsonrpc":"2.0","id":1,"result":{"state":"/var/lib/barn/sourcefed"}}
+{"jsonrpc":"2.0","id":1,"method":"stall.start","params":{"protocol":1,"token":"…","jobs":[{"every":"15s"}]}}
+{"jsonrpc":"2.0","id":1,"result":{"state":"/var/lib/barn/sourcefed","jobs":[{"every":"15s"}]}}
 ```
 
 barn sends `stall.health` on the authenticated connection every 10 seconds:

@@ -12,8 +12,8 @@ use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use barn_stall::protocol::TOKEN_TTL_SECS;
+use barn_stall::{Job, StallStartParams, StallStartResult};
 use barn_stall::{MAX_LINE_BYTES, PROTOCOL_VERSION, method};
-use barn_stall::{StallStartParams, StallStartResult};
 use nono::{AccessMode, CapabilitySet, NonoError, SandboxState, UnixSocketMode};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -34,6 +34,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PENDING_HEALTH_FRAMES: usize = 4;
+const MAX_LATE_HEALTH_REPLIES: usize = 3;
+const MAX_REJECTED_PEERS: usize = 16;
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const TOKEN_BYTES: usize = 32;
 const TOKEN_TTL: Duration = Duration::from_secs(TOKEN_TTL_SECS);
@@ -95,6 +97,7 @@ struct Transport {
     state: String,
     uid: u32,
     token: Option<Token>,
+    jobs: Vec<Job>,
 }
 
 /// A start token and the moment it stops being accepted.
@@ -305,6 +308,9 @@ pub enum SupervisorError {
     /// The peer's UID differs from the socket owner's UID.
     #[error("stall socket peer UID does not match the socket owner")]
     PeerUidMismatch,
+    /// Too many wrong-PID peers connected in one accept call.
+    #[error("stall socket accepted too many rejected peers")]
+    TooManyRejectedPeers,
     /// The connection or its first message does not arrive before the deadline.
     #[error("stall connection timed out")]
     ConnectTimeout,
@@ -408,6 +414,7 @@ impl Supervisor {
                     secret: prepared.token,
                     expires_at,
                 }),
+                jobs: Vec::new(),
             },
             supervisor: self,
             spec,
@@ -420,6 +427,12 @@ impl Supervisor {
 }
 
 impl RunningStall {
+    /// The jobs the stall declared in its start message.
+    #[must_use]
+    pub fn jobs(&self) -> &[Job] {
+        &self.transport.jobs
+    }
+
     /// The PID shared by the helper and the program it executes.
     #[must_use]
     pub const fn pid(&self) -> u32 {
@@ -483,7 +496,7 @@ impl RunningStall {
                 }
                 check = async {
                     ticks.tick().await;
-                    probe.tick().await
+                    probe.tick(&mut on_frame).await
                 } => Some(check),
             };
 
@@ -548,7 +561,7 @@ impl RunningStall {
 }
 
 impl HealthProbe {
-    async fn tick(&mut self) -> HealthCheck {
+    async fn tick(&mut self, on_frame: impl FnMut(Vec<u8>)) -> HealthCheck {
         let Some(mut connection) = self.connection.take() else {
             return HealthCheck::Missed;
         };
@@ -572,91 +585,155 @@ impl HealthProbe {
             return HealthCheck::Missed;
         }
 
-        let reply = timeout_at(deadline, self.read_reply(&mut connection)).await;
+        let reading = self.read_reply(&mut connection, on_frame);
+        let reply = timeout_at(deadline, reading).await;
+        // Keep the bytes already read so the next tick stays framed.
+        self.connection = Some(connection);
 
-        match reply {
-            Ok(None) => HealthCheck::Missed,
-            Ok(Some(check)) => {
-                self.connection = Some(connection);
-
-                check
-            }
-            Err(_) => {
-                // Keep the bytes already read so the next tick stays framed.
-                self.connection = Some(connection);
-
-                HealthCheck::Missed
-            }
-        }
+        reply.unwrap_or(HealthCheck::Missed)
     }
 
     async fn read_reply(
         &mut self,
         reader: &mut (impl AsyncBufRead + Unpin),
-    ) -> Option<HealthCheck> {
+        mut on_frame: impl FnMut(Vec<u8>),
+    ) -> HealthCheck {
         // Allow two late answers from consecutive missed probes before this one.
-        for _ in 0..3 {
-            // Bound the memory used for lines the caller will receive.
-            while self.pending.len() < MAX_PENDING_HEALTH_FRAMES {
+        for _ in 0..MAX_LATE_HEALTH_REPLIES {
+            loop {
                 let remaining = MAX_LINE_BYTES.saturating_sub(self.frame.len());
-                let limit = u64::try_from(remaining).ok()?;
-                reader
+                let limit = u64::try_from(remaining).unwrap_or(u64::MAX);
+                if reader
                     .take(limit)
                     .read_until(b'\n', &mut self.frame)
                     .await
-                    .ok()?;
-
-                if self.frame.last() != Some(&b'\n') {
-                    return None;
+                    .is_err()
+                {
+                    return HealthCheck::Missed;
                 }
 
-                match health_reply_id(&self.frame) {
-                    Some(id) if id > 0 && id < self.id => {
-                        self.frame.clear();
-                        break;
-                    }
-                    Some(id) if id == self.id => {
-                        self.frame.clear();
+                if self.frame.last() != Some(&b'\n') {
+                    return HealthCheck::Missed;
+                }
 
-                        return Some(HealthCheck::Answered);
-                    }
-                    _ => self.pending.push(std::mem::take(&mut self.frame)),
+                let line = std::mem::take(&mut self.frame);
+                match classify_health_frame(&line, self.id) {
+                    HealthFrame::Late => break,
+                    HealthFrame::Matching => return HealthCheck::Answered,
+                    HealthFrame::Invalid(_) => return HealthCheck::Missed,
+                    HealthFrame::Ordinary => self.keep_frame(line, &mut on_frame),
                 }
             }
         }
 
-        Some(HealthCheck::Missed)
+        HealthCheck::Missed
+    }
+
+    /// Holds at most the cap of caller frames; older ones go to the caller.
+    fn keep_frame(&mut self, line: Vec<u8>, mut on_frame: impl FnMut(Vec<u8>)) {
+        if self.pending.len() >= MAX_PENDING_HEALTH_FRAMES {
+            for frame in self.pending.drain(..) {
+                on_frame(frame);
+            }
+        }
+
+        self.pending.push(line);
     }
 }
 
-fn health_reply_id(frame: &[u8]) -> Option<u64> {
-    let reply: Value = serde_json::from_slice(frame).ok()?;
+/// Why a success reply cannot answer the current health check.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InvalidHealthReply {
+    /// Zero cannot name a check.
+    Zero,
+    /// An id ahead of the probe cannot answer an earlier check.
+    Future,
+    /// An id that is not a number cannot name a check.
+    NonNumeric,
+}
+
+/// How a line on the health connection relates to the current probe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HealthFrame {
+    /// A line for the caller, such as a log.
+    Ordinary,
+    /// The success reply to an earlier check.
+    Late,
+    /// The success reply to this check.
+    Matching,
+    /// A success reply that cannot name a check, with its reason.
+    Invalid(InvalidHealthReply),
+}
+
+/// Classifies one line by its JSON-RPC success reply id.
+fn classify_health_frame(line: &[u8], current: u64) -> HealthFrame {
+    let reply: Value = match serde_json::from_slice(line) {
+        Ok(reply) => reply,
+        Err(_) => return HealthFrame::Ordinary,
+    };
 
     if reply.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
         || reply.get("result").is_none()
         || reply.get("error").is_some()
         || reply.get("method").is_some()
     {
-        return None;
+        return HealthFrame::Ordinary;
     }
 
-    reply.get("id").and_then(Value::as_u64)
+    match reply.get("id").and_then(Value::as_u64) {
+        None => HealthFrame::Invalid(InvalidHealthReply::NonNumeric),
+        Some(0) => HealthFrame::Invalid(InvalidHealthReply::Zero),
+        Some(id) if id == current => HealthFrame::Matching,
+        Some(id) if id < current => HealthFrame::Late,
+        Some(_) => HealthFrame::Invalid(InvalidHealthReply::Future),
+    }
+}
+
+/// Bounds the wrong-PID peers one accept call tolerates.
+struct PeerChecks {
+    child: u32,
+    owner: u32,
+    rejected: usize,
+}
+
+impl PeerChecks {
+    const fn new(child: u32, owner: u32) -> Self {
+        Self {
+            child,
+            owner,
+            rejected: 0,
+        }
+    }
+
+    /// Accepts the child; a wrong PID is rejected up to the bound.
+    fn check(&mut self, pid: Option<i32>, uid: u32) -> Result<bool> {
+        match verify_peer(pid, uid, self.child, self.owner) {
+            Ok(()) => Ok(true),
+            Err(SupervisorError::PeerPidMismatch) => {
+                self.rejected = self.rejected.saturating_add(1);
+
+                if self.rejected >= MAX_REJECTED_PEERS {
+                    return Err(SupervisorError::TooManyRejectedPeers);
+                }
+
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
 }
 
 impl Transport {
     async fn accept(&mut self, child_pid: u32) -> Result<BufReader<UnixStream>> {
+        let mut checks = PeerChecks::new(child_pid, self.uid);
         let stream = loop {
             let accepted = self.listener.accept().await;
             let (stream, _) = io_at("accepting stall socket", accepted)?;
             let cred = io_at("reading stall peer credentials", stream.peer_cred())?;
-            let peer = verify_peer(cred.pid(), cred.uid(), child_pid, self.uid);
 
-            if matches!(peer, Err(SupervisorError::PeerPidMismatch)) {
-                continue;
+            if checks.check(cred.pid(), cred.uid())? {
+                break stream;
             }
-
-            peer?;
-            break stream;
         };
 
         let mut reader = BufReader::new(stream);
@@ -669,26 +746,43 @@ impl Transport {
             result => result?,
         };
         spend_token(&mut self.token, &params.token, Instant::now())?;
-        send_reply(&mut reader, &id, &self.state).await?;
+        self.jobs = send_reply(&mut reader, &id, &self.state, &params.jobs).await?;
 
         Ok(reader)
     }
 }
 
 /// Writes the `stall.start` reply, or the oversize error when it cannot fit.
-async fn send_reply<W>(writer: &mut W, id: &Value, state: &str) -> Result<()>
+async fn send_reply<W>(
+    out: &mut W,
+    id: &Value,
+    dir: &str, // the state folder
+    jobs: &[Job],
+) -> Result<Vec<Job>>
 where
     W: AsyncWrite + Unpin,
 {
-    match reply_frame(id, state) {
-        Ok(frame) => io_at("answering stall start", writer.write_all(&frame).await),
+    let frame = match reply_frame(id, dir, jobs) {
+        Ok(frame) => frame,
         Err(SupervisorError::FrameTooLarge) => {
-            refuse_oversize(writer).await?;
+            refuse_oversize(out).await?;
 
-            Err(SupervisorError::FrameTooLarge)
+            return Err(SupervisorError::FrameTooLarge);
         }
-        Err(error) => Err(error),
-    }
+        Err(error) => return Err(error),
+    };
+    io_at("answering stall start", out.write_all(&frame).await)?;
+
+    Ok(declared_jobs(&frame))
+}
+
+/// Reads the jobs barn declared in the start reply it sent.
+fn declared_jobs(frame: &[u8]) -> Vec<Job> {
+    serde_json::from_slice::<Value>(frame)
+        .ok()
+        .and_then(|reply| reply.get("result").cloned())
+        .and_then(|result| serde_json::from_value::<StallStartResult>(result).ok())
+        .map_or_default(|result| result.jobs)
 }
 
 async fn refuse_oversize(writer: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
@@ -699,9 +793,10 @@ async fn refuse_oversize(writer: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
 }
 
 /// The `stall.start` reply as one newline-terminated line within the limit.
-fn reply_frame(id: &Value, state: &str) -> Result<Vec<u8>> {
+fn reply_frame(id: &Value, state: &str, jobs: &[Job]) -> Result<Vec<u8>> {
     let reply = StallStartResult {
         state: state.to_owned(),
+        jobs: jobs.to_vec(),
     };
     let response = json!({"jsonrpc":"2.0","id":id,"result":reply});
 
@@ -1121,6 +1216,30 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn wrong_pid_peers_are_bounded_but_a_later_child_is_accepted() {
+        let wrong = Some(18);
+        let mut checks = PeerChecks::new(17, 42);
+
+        for _ in 0..MAX_REJECTED_PEERS.saturating_sub(1) {
+            assert_eq!(checks.check(wrong, 42).ok(), Some(false));
+        }
+        assert_eq!(checks.check(Some(17), 42).ok(), Some(true));
+
+        let mut checks = PeerChecks::new(17, 42);
+        for _ in 0..MAX_REJECTED_PEERS.saturating_sub(1) {
+            assert_eq!(checks.check(wrong, 42).ok(), Some(false));
+        }
+        assert!(matches!(
+            checks.check(wrong, 42),
+            Err(SupervisorError::TooManyRejectedPeers)
+        ));
+        assert_eq!(
+            SupervisorError::TooManyRejectedPeers.to_string(),
+            "stall socket accepted too many rejected peers"
+        );
+    }
+
     fn issued(expires_at: Instant) -> Token {
         Token {
             secret: "secret".to_owned(),
@@ -1235,7 +1354,8 @@ mod tests {
                 json!(1),
                 StallStartParams {
                     protocol: 1,
-                    token: "secret".to_owned()
+                    token: "secret".to_owned(),
+                    jobs: Vec::new()
                 }
             ))
         );
@@ -1313,7 +1433,8 @@ mod tests {
                 json!(u64::MAX),
                 StallStartParams {
                     protocol: 1,
-                    token: "secret".to_owned()
+                    token: "secret".to_owned(),
+                    jobs: Vec::new()
                 }
             ))
         );
@@ -1334,13 +1455,16 @@ mod tests {
 
     #[test]
     fn a_reply_fills_the_line_limit_and_no_more() {
-        assert_eq!(reply_frame(&json!(1), "").ok(), Some(EMPTY_REPLY.to_vec()));
+        assert_eq!(
+            reply_frame(&json!(1), "", &[]).ok(),
+            Some(EMPTY_REPLY.to_vec())
+        );
 
         let exact = filling_state();
         let below = exact.get(1..).unwrap_or_default().to_owned();
         let above = format!("{exact}a");
         let length = |state: &str| {
-            let frame = reply_frame(&json!(1), state);
+            let frame = reply_frame(&json!(1), state, &[]);
 
             frame.map(|frame| frame.len())
         };
@@ -1360,8 +1484,8 @@ mod tests {
         let mut written = Vec::new();
 
         assert!(matches!(
-            send_reply(&mut written, &json!(1), "").await,
-            Ok(())
+            send_reply(&mut written, &json!(1), "", &[]).await,
+            Ok(jobs) if jobs.is_empty()
         ));
         assert_eq!(written, EMPTY_REPLY);
 
@@ -1370,8 +1494,8 @@ mod tests {
         let mut written = Vec::new();
 
         assert!(matches!(
-            send_reply(&mut written, &json!(1), &exact).await,
-            Ok(())
+            send_reply(&mut written, &json!(1), &exact, &[]).await,
+            Ok(jobs) if jobs.is_empty()
         ));
         assert_eq!(written, format!("{line}\n").into_bytes());
     }
@@ -1382,10 +1506,29 @@ mod tests {
         let mut written = Vec::new();
 
         assert!(matches!(
-            send_reply(&mut written, &json!(1), &above).await,
+            send_reply(&mut written, &json!(1), &above, &[]).await,
             Err(SupervisorError::FrameTooLarge)
         ));
         assert_eq!(written, OVERSIZE_REPLY);
+    }
+
+    #[test]
+    fn a_start_reply_declares_the_jobs_the_stall_sent() {
+        let jobs = vec![Job {
+            every: "15s".to_owned(),
+        }];
+        let frame = reply_frame(&json!(1), "", &jobs).expect("reply with jobs");
+        let reply: Value = serde_json::from_slice(&frame).expect("reply JSON");
+
+        assert_eq!(
+            reply,
+            json!({
+                "jsonrpc": "2.0", "id": 1,
+                "result": {"state": "", "jobs": [{"every": "15s"}]}
+            })
+        );
+        assert_eq!(declared_jobs(&frame), jobs);
+        assert_eq!(declared_jobs(b"not JSON"), []);
     }
 
     #[test]
@@ -1909,7 +2052,7 @@ mod tests {
 
         for (reply, expected) in cases {
             let (mut probe, mut stall) = health_pair();
-            let (decision, ()) = tokio::join!(probe.tick(), async {
+            let (decision, ()) = tokio::join!(probe.tick(|_| {}), async {
                 health_request(&mut stall, 1).await;
                 stall
                     .write_all(format!("{reply}\n").as_bytes())
@@ -1928,41 +2071,105 @@ mod tests {
             id: 2,
             ..HealthProbe::default()
         };
-        let log = b"{\"jsonrpc\":\"2.0\",\"method\":\"log\"}\n";
+        let log = b"{\"jsonrpc\":\"2.0\",\"method\":\"log\",\"n\":1}\n";
+        let other = b"{\"jsonrpc\":\"2.0\",\"method\":\"log\",\"n\":2}\n";
         let late = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n";
-        let other = b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":null}\n";
         let current = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}\n";
         let input = [log.as_slice(), late, other, current].concat();
         let mut reader = input.as_slice();
 
         assert_eq!(
-            probe.read_reply(&mut reader).await,
-            Some(HealthCheck::Answered)
+            probe.read_reply(&mut reader, |_| {}).await,
+            HealthCheck::Answered
         );
         assert_eq!(probe.pending, [log.to_vec(), other.to_vec()]);
         assert_eq!(reader, b"");
     }
 
     #[tokio::test]
-    async fn a_health_check_leaves_unread_lines_when_its_buffer_is_full() {
-        let mut probe = HealthProbe {
-            id: 1,
-            ..HealthProbe::default()
-        };
-        let log = b"{\"jsonrpc\":\"2.0\",\"method\":\"log\"}\n";
-        let current = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n";
-        let input = [log.as_slice(), log, log, log, current].concat();
-        let mut reader = input.as_slice();
+    async fn four_log_frames_before_the_matching_reply_are_answered_and_kept() {
+        let count = MAX_PENDING_HEALTH_FRAMES.saturating_add(1);
+        let logs: Vec<Vec<u8>> = (0..count)
+            .map(|n| {
+                let tail = format!(r#""method":"log","n":{n}"#);
+                let mut line = format!(r#"{{"jsonrpc":"2.0",{tail}}}"#);
+                line.push('\n');
 
-        assert_eq!(
-            probe.read_reply(&mut reader).await,
-            Some(HealthCheck::Missed)
-        );
-        assert_eq!(
-            probe.pending,
-            [log.to_vec(), log.to_vec(), log.to_vec(), log.to_vec()]
-        );
-        assert_eq!(reader, current);
+                line.into_bytes()
+            })
+            .collect();
+        let reply = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n";
+        let mut frames = logs.concat();
+        frames.extend_from_slice(reply);
+        let (mut probe, mut stall) = health_pair();
+        let mut delivered = Vec::new();
+        let mut sink = |frame: Vec<u8>| delivered.push(frame);
+
+        let (check, ()) = tokio::join!(probe.tick(&mut sink), async {
+            health_request(&mut stall, 1).await;
+            stall
+                .write_all(&frames)
+                .await
+                .expect("health reply after the log frames");
+        });
+
+        // supervise drains what a tick leaves pending after the check.
+        probe.pending.drain(..).for_each(&mut sink);
+        assert_eq!(check, HealthCheck::Answered);
+        assert_eq!(delivered, logs);
+    }
+
+    #[tokio::test]
+    async fn a_check_without_a_reply_misses_and_three_misses_restart() {
+        let (mut probe, mut stall) = health_pair();
+        let mut tracker = HealthTracker::default();
+
+        let (check, ()) = tokio::join!(probe.tick(|_| {}), async {
+            health_request(&mut stall, 1).await;
+            stall.shutdown().await.expect("end of frames");
+        });
+
+        assert_eq!(check, HealthCheck::Missed);
+
+        for expected in [
+            HealthDecision::Continue,
+            HealthDecision::Continue,
+            HealthDecision::Restart,
+        ] {
+            assert_eq!(tracker.record(check), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_invalid_health_reply_is_a_named_miss_not_a_caller_frame() {
+        for (id, reason) in [
+            (json!(0), InvalidHealthReply::Zero),
+            (json!(2), InvalidHealthReply::Future),
+            (json!("1"), InvalidHealthReply::NonNumeric),
+        ] {
+            let mut probe = HealthProbe {
+                id: 1,
+                ..HealthProbe::default()
+            };
+            let reply = json!({"jsonrpc": "2.0", "id": id, "result": null});
+            let line = format!("{reply}\n");
+
+            assert_eq!(
+                classify_health_frame(line.as_bytes(), 1),
+                HealthFrame::Invalid(reason)
+            );
+
+            let mut reader = line.as_bytes();
+            let mut delivered = Vec::new();
+            assert_eq!(
+                probe
+                    .read_reply(&mut reader, |frame| delivered.push(frame))
+                    .await,
+                HealthCheck::Missed
+            );
+            assert_eq!(probe.pending, Vec::<Vec<u8>>::new());
+            assert_eq!(delivered, Vec::<Vec<u8>>::new());
+        }
     }
 
     #[tokio::test]
@@ -1976,7 +2183,7 @@ mod tests {
             let current = "{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":null}\n";
             let replies = format!("{}{current}", old.repeat(late));
 
-            let (decision, ()) = tokio::join!(probe.tick(), async {
+            let (decision, ()) = tokio::join!(probe.tick(|_| {}), async {
                 health_request(&mut stall, 3).await;
                 stall
                     .write_all(replies.as_bytes())
@@ -1990,7 +2197,7 @@ mod tests {
     #[tokio::test]
     async fn a_health_timeout_keeps_the_partial_reply_for_the_next_tick() {
         let (mut probe, mut stall) = health_pair();
-        let (missed, ()) = tokio::join!(probe.tick(), async {
+        let (missed, ()) = tokio::join!(probe.tick(|_| {}), async {
             health_request(&mut stall, 1).await;
             stall
                 .write_all(b"{\"jsonrpc\":\"2.0\",")
@@ -1999,7 +2206,7 @@ mod tests {
         });
         assert_eq!(missed, HealthCheck::Missed);
 
-        let (answered, ()) = tokio::join!(probe.tick(), async {
+        let (answered, ()) = tokio::join!(probe.tick(|_| {}), async {
             health_request(&mut stall, 2).await;
             let replies = concat!(
                 "\"id\":1,\"result\":null}\n",
@@ -2024,7 +2231,7 @@ mod tests {
             reply.resize(size.saturating_sub(1), b' ');
             reply.push(b'\n');
 
-            let (decision, ()) = tokio::join!(probe.tick(), async {
+            let (decision, ()) = tokio::join!(probe.tick(|_| {}), async {
                 health_request(&mut stall, 1).await;
                 let _ = timeout(HEALTH_TIMEOUT, stall.write_all(&reply)).await;
             });

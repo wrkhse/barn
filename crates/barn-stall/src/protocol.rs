@@ -78,6 +78,9 @@ pub struct StallStartParams {
     pub protocol: u32,
     /// The single-use token from `BARN_TOKEN`.
     pub token: String,
+    /// The jobs the stall declares for barn to time; none when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jobs: Vec<Job>,
 }
 
 impl Debug for StallStartParams {
@@ -86,6 +89,7 @@ impl Debug for StallStartParams {
             .debug_struct("StallStartParams")
             .field("protocol", &self.protocol)
             .field("token", &"[redacted]")
+            .field("jobs", &self.jobs)
             .finish()
     }
 }
@@ -102,6 +106,9 @@ pub struct Job {
 pub struct StallStartResult {
     /// The stall's state folder, as an absolute path.
     pub state: String,
+    /// The declared jobs barn retains; none when the stall declares no jobs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jobs: Vec<Job>,
 }
 
 /// The secret a `net.request` names, and how barn adds it.
