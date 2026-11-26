@@ -772,4 +772,21 @@ mod tests {
 
         assert!(lua_to_json(LuaValue::Table(root), 0).is_ok());
     }
+
+    #[test]
+    fn lua_to_json_accepts_exactly_the_output_budget() {
+        let lua = Lua::new();
+
+        // One root entry serializes to exactly 8 MiB: 2 table braces, 2 entry
+        // separators, a 3-byte quoted key ("k"), and an 8_388_601-byte quoted
+        // value (8_388_599 'x' bytes plus 2 quotes). Literal counts keep this
+        // boundary independent of the named limit.
+        let blob = vec![b'x'; 8_388_599];
+        let root = lua.create_table().unwrap();
+        root.set("k", lua.create_string(blob.as_slice()).unwrap())
+            .unwrap();
+
+        let expected = serde_json::json!({ "k": String::from_utf8(blob).unwrap() });
+        assert_eq!(lua_to_json(LuaValue::Table(root), 0), Ok(expected));
+    }
 }
