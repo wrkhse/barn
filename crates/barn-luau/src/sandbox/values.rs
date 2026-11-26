@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::ffi::c_void;
 
 use mlua::{Lua, Table, Value as LuaValue};
@@ -6,19 +5,39 @@ use serde_json::{Map, Value};
 
 use super::errors::{EngineError, LimitCause, MAX_DEPTH, MAX_ENTRIES};
 
-/// Error text for a table reached twice in one conversion.
+/// Error text for a table currently on the conversion path.
 const SHARED_TABLE: &str = "shared or cyclic Lua table in result";
 
 /// The conversion-wide budget for converted entry visits: `MAX_DEPTH` times
-/// `MAX_ENTRIES`, or 16384 visits across the whole conversion. A tree whose
-/// total visits exceed that is refused even when each table stays within
-/// `MAX_ENTRIES` and depth stays within `MAX_DEPTH`.
+/// `MAX_ENTRIES`, or 16384 visits. With a path stack, a shared acyclic table
+/// is traversed once per path that reaches it, so this budget is the bound on
+/// DAG expansion. A tree at the per-table caps fits exactly.
 const MAX_NODES: usize = MAX_DEPTH.saturating_mul(MAX_ENTRIES);
 
-pub(super) fn read_tool(table: &Table, key: &str) -> Result<(String, Value), EngineError> {
-    let name = table
+pub(super) fn tool_name(table: &Table, key: &str) -> Result<String, EngineError> {
+    Ok(table
         .raw_get::<Option<String>>("name")?
-        .unwrap_or_else(|| key.to_owned());
+        .unwrap_or_else(|| key.to_owned()))
+}
+
+pub(super) fn tool_named(tools: &Table, name: &str) -> Result<Option<Table>, EngineError> {
+    for pair in tools.pairs::<LuaValue, LuaValue>() {
+        let (key, value) = pair?;
+        let LuaValue::String(key) = key else {
+            continue;
+        };
+        let LuaValue::Table(table) = value else {
+            continue;
+        };
+        if tool_name(&table, &key.to_str()?)? == name {
+            return Ok(Some(table));
+        }
+    }
+    Ok(None)
+}
+
+pub(super) fn read_tool(table: &Table, key: &str) -> Result<(String, Value), EngineError> {
+    let name = tool_name(table, key)?;
     let description = table
         .raw_get::<Option<String>>("description")?
         .unwrap_or_default();
@@ -79,11 +98,15 @@ fn array_position(index: impl TryInto<usize>) -> Result<usize, EngineError> {
     let position = index
         .try_into()
         .map_err(|_| EngineError::InvalidResult("unsupported table key".into()))?;
-    if (1..=MAX_ENTRIES).contains(&position) {
-        Ok(position)
-    } else {
-        Err(EngineError::InvalidResult("unsupported table key".into()))
+    if position == 0 {
+        return Err(EngineError::InvalidResult("unsupported table key".into()));
     }
+    if position > MAX_ENTRIES {
+        return Err(EngineError::Limit(LimitCause::TooManyEntries {
+            limit: MAX_ENTRIES,
+        }));
+    }
+    Ok(position)
 }
 
 pub(super) fn json_to_lua(lua: &Lua, value: &Value, depth: usize) -> Result<LuaValue, EngineError> {
@@ -91,7 +114,7 @@ pub(super) fn json_to_lua(lua: &Lua, value: &Value, depth: usize) -> Result<LuaV
         return Err(EngineError::Limit(LimitCause::TooDeep { limit: MAX_DEPTH }));
     }
     match value {
-        Value::Null => Ok(LuaValue::Nil),
+        Value::Null => Ok(LuaValue::NULL),
         Value::Bool(value) => Ok(LuaValue::Boolean(*value)),
         Value::Number(value) => value.as_i64().map_or_else(
             || {
@@ -133,16 +156,16 @@ pub(super) fn json_to_lua(lua: &Lua, value: &Value, depth: usize) -> Result<LuaV
     }
 }
 
-/// Table identities and node count for one Lua-to-JSON conversion.
+/// Tables on the current path and node count for one Lua-to-JSON conversion.
 struct Conversion {
-    visited: HashSet<*const c_void>,
+    path: Vec<*const c_void>,
     nodes: usize,
 }
 
 impl Conversion {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
-            visited: HashSet::new(),
+            path: Vec::new(),
             nodes: 0,
         }
     }
@@ -160,15 +183,20 @@ impl Conversion {
 
     fn value(&mut self, value: LuaValue, depth: usize) -> Result<Value, EngineError> {
         if let LuaValue::Table(table) = &value
-            && !self.visited.insert(table.to_pointer())
+            && self.path.contains(&table.to_pointer())
         {
             return Err(EngineError::InvalidResult(SHARED_TABLE.into()));
         }
         if depth > MAX_DEPTH {
             return Err(EngineError::Limit(LimitCause::TooDeep { limit: MAX_DEPTH }));
         }
+        if let LuaValue::Table(table) = &value {
+            self.path.push(table.to_pointer());
+            let result = self.table(table, depth);
+            self.path.pop();
+            return result;
+        }
         match value {
-            LuaValue::Table(table) => self.table(&table, depth),
             LuaValue::Nil => Ok(Value::Null),
             LuaValue::LightUserData(value) if value.0.is_null() => Ok(Value::Null),
             LuaValue::Boolean(value) => Ok(Value::Bool(value)),
@@ -259,6 +287,34 @@ mod tests {
     }
 
     #[test]
+    fn tool_name_uses_the_key_unless_the_table_names_itself() {
+        let lua = Lua::new();
+        let table = lua.create_table().unwrap();
+        assert_eq!(tool_name(&table, "key").unwrap(), "key");
+        table.set("name", "named").unwrap();
+        assert_eq!(tool_name(&table, "key").unwrap(), "named");
+    }
+
+    #[test]
+    fn tool_named_finds_a_table_by_its_name_and_skips_other_entries() {
+        let lua = Lua::new();
+        let tools = lua.create_table().unwrap();
+
+        let numbered = lua.create_table().unwrap();
+        numbered.set("name", "wanted").unwrap();
+        tools.set(1i64, numbered).unwrap();
+        tools.set("plain", "wanted").unwrap();
+
+        let wanted = lua.create_table().unwrap();
+        wanted.set("name", "wanted").unwrap();
+        tools.set("fallback", wanted.clone()).unwrap();
+
+        let found = tool_named(&tools, "wanted").unwrap().unwrap();
+        assert_eq!(found.to_pointer(), wanted.to_pointer());
+        assert!(tool_named(&tools, "absent").unwrap().is_none());
+    }
+
+    #[test]
     fn lua_index_converts_the_position_exactly() {
         assert_eq!(lua_index(0), Ok(0));
         assert_eq!(lua_index(1), Ok(1));
@@ -282,10 +338,27 @@ mod tests {
             Ok(MAX_ENTRIES)
         );
 
-        let over = i64::try_from(MAX_ENTRIES + 1).unwrap();
-        for bad in [0i64, -1, over] {
-            assert_eq!(array_position(bad), Err(unsupported()), "key {bad}");
-        }
+        assert_eq!(array_position(0i64), Err(unsupported()));
+        assert_eq!(array_position(-1i64), Err(unsupported()));
+        assert_eq!(
+            array_position(2000i64),
+            Err(EngineError::Limit(LimitCause::TooManyEntries {
+                limit: MAX_ENTRIES
+            }))
+        );
+    }
+
+    #[test]
+    fn lua_table_to_json_refuses_an_out_of_ceiling_array_key() {
+        let lua = Lua::new();
+        let table = lua.create_table().unwrap();
+        table.set(2000i64, "a").unwrap();
+        assert_eq!(
+            lua_table_to_json(&table, 0),
+            Err(EngineError::Limit(LimitCause::TooManyEntries {
+                limit: MAX_ENTRIES
+            }))
+        );
     }
 
     #[test]
@@ -400,11 +473,27 @@ mod tests {
     fn json_to_lua_accepts_depth_16_and_refuses_depth_17() {
         let lua = Lua::new();
 
-        assert_eq!(json_to_lua(&lua, &Value::Null, 16), Ok(LuaValue::Nil));
+        assert_eq!(json_to_lua(&lua, &Value::Null, 16), Ok(LuaValue::NULL));
         assert_eq!(
             json_to_lua(&lua, &Value::Null, 17),
             Err(EngineError::Limit(LimitCause::TooDeep { limit: 16 }))
         );
+    }
+
+    #[test]
+    fn json_to_lua_round_trips_an_object_with_a_null_field() {
+        let lua = Lua::new();
+        let input = serde_json::json!({ "keep": null, "value": 1 });
+        let converted = json_to_lua(&lua, &input, 0).unwrap();
+        assert_eq!(lua_to_json(converted, 0).unwrap(), input);
+    }
+
+    #[test]
+    fn json_to_lua_round_trips_an_array_with_a_null_slot() {
+        let lua = Lua::new();
+        let input = serde_json::json!([1, null, 3]);
+        let converted = json_to_lua(&lua, &input, 0).unwrap();
+        assert_eq!(lua_to_json(converted, 0).unwrap(), input);
     }
 
     #[test]
@@ -466,11 +555,10 @@ mod tests {
             tables.push(lua.create_table().unwrap());
         }
 
-        // Each table's entries all point at the next one, so without the
-        // visited set this 16-table, 1024-way shape expands to 1024^15
-        // visits. The leaf integers sit at depth 16, within MAX_DEPTH, so
-        // they convert; the revisit of a table is caught by table identity
-        // rather than the depth limit reporting TooDeep.
+        // Each table's entries all point at the next one. A path stack allows
+        // sibling reuse, so this 16-table, 1024-way DAG expands until the
+        // conversion-wide node budget stops it instead of a shared-table
+        // error.
         for index in 0..15usize {
             let child = tables[index.saturating_add(1)].clone();
             for key in 0..MAX_ENTRIES {
@@ -483,7 +571,24 @@ mod tests {
 
         assert_eq!(
             lua_to_json(LuaValue::Table(tables[0].clone()), 0),
-            Err(shared_table())
+            Err(EngineError::Limit(LimitCause::TooManyEntries {
+                limit: MAX_NODES
+            }))
+        );
+    }
+
+    #[test]
+    fn lua_to_json_converts_a_table_shared_by_siblings() {
+        let lua = Lua::new();
+        let child = lua.create_table().unwrap();
+        child.set("v", 1i64).unwrap();
+        let root = lua.create_table().unwrap();
+        root.set("a", child.clone()).unwrap();
+        root.set("b", child).unwrap();
+
+        assert_eq!(
+            lua_to_json(LuaValue::Table(root), 0),
+            Ok(serde_json::json!({ "a": { "v": 1 }, "b": { "v": 1 } }))
         );
     }
 

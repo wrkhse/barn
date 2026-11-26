@@ -80,6 +80,31 @@ enum Resolved {
     },
 }
 
+/// Clears one loading marker on scope exit. `resolve` pushes the path; the
+/// fallible work between that push and `finish` can return early, so cleanup
+/// lives in `Drop` rather than only on the success path.
+struct LoadingGuard {
+    state: Arc<Mutex<RequireState>>,
+    path: PathBuf,
+}
+
+impl LoadingGuard {
+    fn new(state: &Arc<Mutex<RequireState>>, path: PathBuf) -> Self {
+        Self {
+            state: Arc::clone(state),
+            path,
+        }
+    }
+}
+
+impl Drop for LoadingGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.loading.retain(|loading| loading != &self.path);
+        }
+    }
+}
+
 impl RequireState {
     pub fn new(folder: &Path) -> Result<Self, String> {
         let root = std::fs::canonicalize(folder)
@@ -160,8 +185,8 @@ impl RequireState {
         Err(RequireCause::Missing(spec.to_owned()))
     }
 
+    /// Cache a completed module. Its loading marker is cleared by the guard.
     fn finish(&mut self, canonical: PathBuf, outcome: LuaResult<LuaValue>) -> LuaResult<LuaValue> {
-        self.loading.pop();
         let value = outcome?;
         self.cache.insert(canonical, value.clone());
         Ok(value)
@@ -232,6 +257,8 @@ fn scoped_require(
                 source,
                 name,
             } => {
+                // Own the loading marker from here: every step below can fail.
+                let _guard = LoadingGuard::new(&state, canonical.clone());
                 let module_base = canonical
                     .parent()
                     .map_or_else(|| base.clone(), Path::to_path_buf);
@@ -245,10 +272,12 @@ fn scoped_require(
                     .set_name(name)
                     .set_environment(env)
                     .eval::<LuaValue>();
-                state
-                    .lock()
-                    .map_err(|_| mlua::Error::external(RequireCause::Poisoned))?
-                    .finish(canonical, outcome)
+                {
+                    let mut loaded = state
+                        .lock()
+                        .map_err(|_| mlua::Error::external(RequireCause::Poisoned))?;
+                    loaded.finish(canonical, outcome)
+                }
             }
         }
     })
@@ -462,6 +491,54 @@ mod tests {
                 .downcast_ref::<RequireCause>()
                 .expect("error carries a require cause"),
             &RequireCause::Missing("./package".into())
+        );
+    }
+
+    #[test]
+    fn loading_guard_removes_only_its_path_on_drop() {
+        let folder = Folder::new();
+        let state = RequireState::new(&folder.path).expect("require state");
+        let guarded = folder.path.join("guarded.luau");
+        let unrelated = folder.path.join("unrelated.luau");
+
+        let shared = Arc::new(Mutex::new(state));
+        {
+            let mut state = shared.lock().expect("lock state");
+            state.loading.push(guarded.clone());
+            state.loading.push(unrelated.clone());
+        }
+
+        {
+            let _guard = LoadingGuard::new(&shared, guarded);
+        }
+
+        assert_eq!(shared.lock().expect("lock state").loading, vec![unrelated]);
+    }
+
+    #[test]
+    fn scoped_require_refuses_a_hard_link_within_the_folder() {
+        let folder = Folder::new();
+        folder.write("original.luau", b"return {}".to_vec());
+        std::fs::hard_link(
+            folder.path.join("original.luau"),
+            folder.path.join("alias.luau"),
+        )
+        .expect("hard link within the scratch folder");
+
+        let lua = Lua::new();
+        let state = RequireState::new(&folder.path).expect("require state");
+        let loader = install(&lua, state).expect("install require");
+
+        // Both links live inside the plugin folder, yet the blanket rule still
+        // refuses regular files with more than one link: no link may escape.
+        let error = loader
+            .call::<LuaValue>(("./original",))
+            .expect_err("a hard link within the folder is refused");
+        assert_eq!(
+            error
+                .downcast_ref::<RequireCause>()
+                .expect("error carries a require cause"),
+            &RequireCause::HardLink("./original".into())
         );
     }
 }
