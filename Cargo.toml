@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/barn", "crates/barn-exec", "crates/barn-stall"]
+members = [
+  "crates/barn",
+  "crates/barn-exec",
+  "crates/barn-luau",
+  "crates/barn-stall",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,6 +17,7 @@ repository = "https://github.com/wrkhse/barn"
 
 [workspace.dependencies]
 clap = { version = "4", features = ["derive"] }
+mlua = { version = "=0.12.2", features = ["luau"] }
 nono = { version = "=0.82.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

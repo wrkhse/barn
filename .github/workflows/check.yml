@@ -187,11 +187,14 @@ jobs:
           touch pr.diff
       # A missed mutant or a timeout fails. One that truly hangs the tests is
       # excluded by name in .cargo/mutants.toml, with its reason.
+      # The workspace mutant suite takes 34s in CI, so the auto 20s timeout
+      # killed every mutant; 60s is measured headroom. Every viable mutant is
+      # still required to be caught.
       - name: Run mutants
         env:
           IS_MAIN: ${{ github.ref == 'refs/heads/main' || inputs.full_tree }}
         run: |
-          args="--shard ${{ matrix.shard }}/4 --no-shuffle -j 2 -vV"
+          args="--shard ${{ matrix.shard }}/4 --no-shuffle -j 2 -vV --minimum-test-timeout 60"
           list_args="--shard ${{ matrix.shard }}/4"
           if [ "$IS_MAIN" != true ] && [ ! -s pr.diff ]; then
             mkdir -p mutants.out
