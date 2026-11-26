@@ -9,8 +9,10 @@ use super::errors::{EngineError, LimitCause, MAX_DEPTH, MAX_ENTRIES};
 /// Error text for a table reached twice in one conversion.
 const SHARED_TABLE: &str = "shared or cyclic Lua table in result";
 
-/// The most entries one conversion may produce: a tree at the depth and entry
-/// caps fits exactly, while a shared DAG does not.
+/// The conversion-wide budget for converted entry visits: `MAX_DEPTH` times
+/// `MAX_ENTRIES`, or 16384 visits across the whole conversion. A tree whose
+/// total visits exceed that is refused even when each table stays within
+/// `MAX_ENTRIES` and depth stays within `MAX_DEPTH`.
 const MAX_NODES: usize = MAX_DEPTH.saturating_mul(MAX_ENTRIES);
 
 pub(super) fn read_tool(table: &Table, key: &str) -> Result<(String, Value), EngineError> {
@@ -463,16 +465,17 @@ mod tests {
             tables.push(lua.create_table().unwrap());
         }
 
-        // Each table's entries all point at the next one, so a walk that
-        // revisited tables would expand into 1024^16 host nodes.
+        // Each table's entries all point at the next one, so without the
+        // visited set this 17-table, 1024-way shape expands to 1024^16 host
+        // nodes. The leaf is deliberately left empty: populating it would
+        // convert its values at depth 17, where the depth limit fires TooDeep
+        // before the walk revisits a table and identity detection can report
+        // the shared table this test asserts.
         for index in 0..16usize {
             let child = tables[index.saturating_add(1)].clone();
             for key in 0..MAX_ENTRIES {
                 tables[index].set(format!("k{key}"), child.clone()).unwrap();
             }
-        }
-        for key in 0..MAX_ENTRIES {
-            tables[16].set(format!("k{key}"), 1i64).unwrap();
         }
 
         assert_eq!(
