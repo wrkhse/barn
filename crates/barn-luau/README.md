@@ -39,13 +39,18 @@ impl Drop for PluginDir {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let token = format!(
-        "{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    );
-    let path = std::env::temp_dir().join(format!("luau-{token}"));
-    fs::create_dir(&path)?;
+    let prefix = format!("luau-{}-", std::process::id());
+    let path = loop {
+        let candidate = std::env::temp_dir().join(format!(
+            "{prefix}{}",
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::create_dir(&candidate) {
+            Ok(()) => break candidate,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    };
     let plugin = PluginDir(path);
     fs::write(
         plugin.0.join("plugin.luau"),

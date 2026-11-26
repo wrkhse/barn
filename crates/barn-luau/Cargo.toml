@@ -15,9 +15,11 @@ mlua = { workspace = true, features = ["send"] }
 serde.workspace = true
 serde_json.workspace = true
 
-# Cargo cannot combine `lints.workspace = true` with a package-specific lint,
-# so barn-luau restates the workspace lints and adds the wall-clock lint. The
-# crate-local clippy.toml carries the method list; the duplicate ends in PR C.
+# Cargo forbids combining `lints.workspace = true` with a package-specific
+# lint, so barn-luau restates the workspace lints and adds the wall-clock lint.
+# The crate-local clippy.toml carries the disallowed-method list; a config-parity
+# test checks the mirrored keys stay in sync. The duplicate ends in PR C when
+# the wall-clock lint moves to the root clippy.toml.
 [lints.rust]
 unsafe_code = "forbid"
 

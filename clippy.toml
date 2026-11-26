@@ -1,8 +1,8 @@
+# The five keys below are mirrored in barn-luau's crate-local clippy.toml and
+# must stay in sync until PR C deletes that file and moves the wall-clock lint
+# to this root clippy.toml.
 too-many-lines-threshold = 70
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
-
-# The wall-clock lint is duplicated in barn-luau's crate-local clippy.toml for B2.
-# Keep both files in sync until PR C deletes the duplicate and moves the lint here.

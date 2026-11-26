@@ -9,7 +9,7 @@ use crate::require::{REQUIRE_CONFINED, RequireCause};
 
 use super::*;
 
-use super::clock::FakeClock;
+use super::clock::{FakeClock, TickingClock};
 use super::errors::MAX_DEPTH;
 
 const DEFAULT_DEADLINE_MS: u64 = 100;
@@ -120,7 +120,7 @@ tools = {
 "#;
 
 fn test_clock() -> Arc<dyn Clock> {
-    Arc::new(FakeClock::new())
+    Arc::new(TickingClock::new())
 }
 
 fn default_limits() -> Limits {
@@ -330,7 +330,13 @@ fn a_deadline_uses_the_injected_clock() {
         "the injected clock has not advanced"
     );
 
-    fake.advance(Duration::from_millis(6));
+    fake.advance(Duration::from_micros(4_999));
+    assert!(
+        !sandbox.deadline.expired(),
+        "a sub-millisecond advance is measured in microseconds"
+    );
+
+    fake.advance(Duration::from_micros(2));
     assert!(
         sandbox.deadline.expired(),
         "the injected clock passed the budget"
@@ -348,6 +354,37 @@ fn a_deadline_uses_the_injected_clock() {
         sandbox.hook(&invocation("toolBefore", "loop"), 0),
         Err(EngineError::Limit(LimitCause::Deadline))
     );
+}
+
+#[test]
+fn each_sandbox_applies_its_own_call_deadline() {
+    for (budget_ms, lower_us, upper_us) in [(20, 20_000_u64, 30_000), (40, 40_000, 50_000)] {
+        let clock = Arc::new(TickingClock::new());
+        let scratch = Scratch::new();
+        scratch.write("plugin.luau", PLUGIN);
+        scratch.write("helper.luau", HELPER);
+        let sandbox = Sandbox::new(
+            scratch.path(),
+            Limits::new(DEFAULT_MEMORY_BYTES, budget_ms).expect("valid limits"),
+            Capabilities::default(),
+            Arc::<TickingClock>::clone(&clock),
+        )
+        .expect("fixture loads");
+
+        let before = clock.read_micros();
+        assert_eq!(
+            sandbox.hook(&invocation("toolBefore", "loop"), 5000),
+            Err(EngineError::Limit(LimitCause::Deadline)),
+            "a 5000 ms request is clamped to the {budget_ms} ms sandbox budget"
+        );
+        let after = clock.read_micros();
+        let lower = before.saturating_add(lower_us);
+        let upper = before.saturating_add(upper_us);
+        assert!(
+            after >= lower && after < upper,
+            "{budget_ms} ms budget: clock at {after} us, expected {lower}..{upper} us"
+        );
+    }
 }
 
 #[test]
@@ -1065,4 +1102,26 @@ fn a_poisoned_call_lock_fails_closed() {
         Err(EngineError::Poisoned)
     );
     assert_eq!(sandbox.manifest(), Err(EngineError::Poisoned));
+}
+
+#[test]
+fn clippy_configs_share_the_sandbox_thresholds() {
+    let workspace = include_str!("../../../../clippy.toml");
+    let crate_local = include_str!("../../clippy.toml");
+    for key in [
+        "too-many-lines-threshold",
+        "allow-unwrap-in-tests",
+        "allow-expect-in-tests",
+        "allow-panic-in-tests",
+        "allow-indexing-slicing-in-tests",
+    ] {
+        assert!(
+            workspace.contains(key),
+            "{key} is missing from the workspace clippy.toml"
+        );
+        assert!(
+            crate_local.contains(key),
+            "{key} is missing from barn-luau's clippy.toml"
+        );
+    }
 }
