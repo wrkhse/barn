@@ -199,7 +199,7 @@ jobs:
           fi
           cargo mutants $args
           if [ ! -f mutants.out/outcomes.json ]; then
-            listed=$(cargo mutants $list_args --list 2>/dev/null || true)
+            listed=$(cargo mutants $list_args --list)
             count=$(printf '%s\n' "$listed" | grep -c . || true)
             if [ "$count" -eq 0 ]; then
               mkdir -p mutants.out
