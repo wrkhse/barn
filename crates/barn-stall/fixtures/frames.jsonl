@@ -12,3 +12,7 @@
 {"type":"tool","id":6,"content":{"kind":"text","text":"buy milk"}}
 {"type":"hook","id":7,"version":1,"hook":"PreToolUse","call":{"tool":"bash","name":"run","input":{"command":"rm -rf /tmp/x"}}}
 {"type":"error","id":7,"error":"stall_unavailable","message":"the stall did not answer"}
+{"type":"hook","id":8,"version":1,"hook":"PreToolUse","call":{"tool":"bash","name":"run","input":{"command":"echo traced"}},"_meta":{"traceparent":"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}}
+{"type":"hook","id":8,"outcome":"allow"}
+{"type":"hook","id":9,"version":1,"hook":"PreToolUse","call":{"tool":"bash","name":"run","input":{"command":"echo state"}},"_meta":{"tracestate":"congo=t61rcWkgMzE"}}
+{"type":"hook","id":9,"outcome":"allow"}

@@ -38,7 +38,7 @@ fn replies() -> Option<Vec<Reply>> {
 #[test]
 fn every_fixture_line_round_trips() {
     let wires = wires().expect("fixture frames");
-    assert_eq!(wires.len(), 14);
+    assert_eq!(wires.len(), 18);
 
     for (index, wire) in wires.iter().enumerate() {
         if index % 2 == 0 {
@@ -109,6 +109,32 @@ fn the_rewrite_request_carries_trace_context() {
             tracestate: Some("congo=t61rcWkgMzE".to_owned()),
         }
     );
+}
+
+/// A trace parent travels alone without a trace state.
+#[test]
+fn a_hook_with_only_a_traceparent_keeps_it() {
+    let requests = requests().expect("request frames");
+    let Request::Hook { _meta: meta, .. } = &requests[7] else {
+        panic!("the trace-parent frame is a hook request");
+    };
+
+    let meta = meta.as_ref().expect("the trace-parent frame carries meta");
+    assert_eq!(meta.traceparent.as_deref(), Some(TRACEPARENT));
+    assert_eq!(meta.tracestate, None);
+}
+
+/// A trace state travels alone without a trace parent.
+#[test]
+fn a_hook_with_only_a_tracestate_keeps_it() {
+    let requests = requests().expect("request frames");
+    let Request::Hook { _meta: meta, .. } = &requests[8] else {
+        panic!("the trace-state frame is a hook request");
+    };
+
+    let meta = meta.as_ref().expect("the trace-state frame carries meta");
+    assert_eq!(meta.traceparent, None);
+    assert_eq!(meta.tracestate.as_deref(), Some("congo=t61rcWkgMzE"));
 }
 
 #[test]
