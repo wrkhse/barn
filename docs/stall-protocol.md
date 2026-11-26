@@ -13,8 +13,10 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
 - barn listens at `state_dir/run/<stall>/proto.sock`, a Unix socket with mode
   `0600` in a directory with mode `0700`. The stall's environment holds only
   `PATH`, `HOME`, `LANG`, the socket path in `BARN_SOCKET`, and the single-use
-  token in `BARN_TOKEN`. barn clears a stale run directory before binding the
-  socket, leaving the stall's state folder intact.
+  token in `BARN_TOKEN`. Before binding the socket, barn removes only
+  `proto.sock` and `policy.json` from a stale run directory, leaving the
+  stall's state folder intact. Any other entry in that directory makes the
+  start fail with `removing stale stall run directory` (`DirectoryNotEmpty`).
 - The stall connects and sends `stall.start` as its first message. barn checks
   that the peer PID matches the child it spawned and that the peer UID owns
   the socket. A missing peer PID fails authentication. The stall declares its

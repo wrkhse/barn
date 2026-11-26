@@ -500,7 +500,9 @@ impl RunningStall {
 
             probe.pending.drain(..).for_each(&mut on_frame);
             let Some(check) = check else {
-                drain_on_exit(&mut connection, probe.id, &mut on_frame).await;
+                let partial = std::mem::take(&mut probe.frame);
+                let id = probe.id;
+                drain_on_exit(&mut connection, id, partial, &mut on_frame).await;
 
                 break;
             };
@@ -707,18 +709,21 @@ enum DrainStop {
 }
 
 /// Delivers the caller frames left on the connection at exit, in arrival
-/// order. One deadline bounds the whole drain, so a peer that trickles frames
-/// cannot hold up a restart by spending the timeout again on each line.
+/// order. A partial frame from the health read resumes before later frames,
+/// so a line split by the exit is delivered whole. One deadline bounds the
+/// whole drain, so a peer that trickles frames cannot hold up a restart by
+/// spending the timeout again on each line.
 async fn drain_on_exit(
     reader: &mut (impl AsyncBufRead + Unpin),
     current: u64,
+    partial: Vec<u8>,
     mut on_frame: impl FnMut(Vec<u8>),
 ) -> DrainStop {
     let started = TokioInstant::now();
     let Some(deadline) = started.checked_add(EXIT_DRAIN_TIMEOUT) else {
         return DrainStop::Deadline;
     };
-    let draining = collect_exit_frames(reader, current, &mut on_frame);
+    let draining = collect_exit_frames(reader, current, partial, &mut on_frame);
 
     timeout_at(deadline, draining)
         .await
@@ -726,19 +731,21 @@ async fn drain_on_exit(
 }
 
 /// Collects frames until the peer closes or a frame or byte cap is reached.
-/// The caller's deadline cancels a slow read as well as a slow run of frames.
+/// The first line resumes `partial`, the bytes a health read left without a
+/// newline. The caller's deadline cancels a slow read as well as a slow run
+/// of frames.
 async fn collect_exit_frames(
     reader: &mut (impl AsyncBufRead + Unpin),
     current: u64,
+    mut line: Vec<u8>,
     on_frame: &mut impl FnMut(Vec<u8>),
 ) -> DrainStop {
     let mut frames = 0usize;
-    let mut bytes = 0usize;
+    let mut bytes = line.len();
 
     while frames < MAX_EXIT_DRAIN_FRAMES && bytes < MAX_EXIT_DRAIN_BYTES {
         let remaining = MAX_EXIT_DRAIN_BYTES.saturating_sub(bytes);
         let limit = u64::try_from(remaining).unwrap_or(u64::MAX);
-        let mut line = Vec::new();
         let read = reader
             .take(limit)
             .read_until(b'\n', &mut line)
@@ -755,9 +762,10 @@ async fn collect_exit_frames(
 
         bytes = bytes.saturating_add(read);
         frames = frames.saturating_add(1);
+        let frame = std::mem::take(&mut line);
 
-        if classify_health_frame(&line, current) == HealthFrame::Ordinary {
-            on_frame(line);
+        if classify_health_frame(&frame, current) == HealthFrame::Ordinary {
+            on_frame(frame);
         }
     }
 
@@ -1463,6 +1471,7 @@ mod tests {
         let counted = Arc::clone(&arrivals);
 
         // This process is never the expected child, so every peer is wrong.
+        // Peers arrive without a pause, keeping the listener's backlog full.
         let wrong_child = std::process::id().wrapping_add(1);
         let flood = tokio::spawn(async move {
             loop {
@@ -1471,7 +1480,6 @@ mod tests {
                 };
                 counted.fetch_add(1, Ordering::Relaxed);
                 let _ = peer.write_all(START).await;
-                sleep(Duration::from_millis(5)).await;
             }
         });
 
@@ -2604,7 +2612,9 @@ mod tests {
         drop(stall);
         let drained = timeout(
             EXIT_DRAIN_TIMEOUT.saturating_mul(4),
-            drain_on_exit(&mut connection, probe.id, |frame| delivered.push(frame)),
+            drain_on_exit(&mut connection, probe.id, Vec::new(), |frame| {
+                delivered.push(frame);
+            }),
         )
         .await;
 
@@ -2625,10 +2635,42 @@ mod tests {
         let mut delivered = Vec::new();
 
         assert_eq!(
-            drain_on_exit(&mut reader, 3, |frame| delivered.push(frame)).await,
+            drain_on_exit(&mut reader, 3, Vec::new(), |frame| delivered.push(frame)).await,
             DrainStop::Closed
         );
         assert_eq!(delivered, [log_frame(1), log_frame(2), log_frame(3)]);
+    }
+
+    #[tokio::test]
+    async fn a_partial_frame_buffered_at_exit_survives_in_order() {
+        let first = log_frame(1);
+        let partial = br#"{"jsonrpc":"2.0","method":"log","n":2"#;
+        let tail = b",\"done\":true}\n";
+        let completed = [partial.as_slice(), tail].concat();
+        let mut input = tail.to_vec();
+        input.extend_from_slice(&log_frame(3));
+        let mut reader = BufReader::new(input.as_slice());
+        let mut probe = HealthProbe {
+            frame: partial.to_vec(),
+            pending: vec![first.clone()],
+            ..HealthProbe::default()
+        };
+        let mut delivered = Vec::new();
+
+        probe
+            .pending
+            .drain(..)
+            .for_each(|frame| delivered.push(frame));
+        let drained = drain_on_exit(
+            &mut reader,
+            probe.id,
+            std::mem::take(&mut probe.frame),
+            |frame| delivered.push(frame),
+        )
+        .await;
+
+        assert_eq!(drained, DrainStop::Closed);
+        assert_eq!(delivered, [first, completed, log_frame(3)]);
     }
 
     #[tokio::test]
@@ -2647,7 +2689,7 @@ mod tests {
 
         let started = TokioInstant::now();
         let mut delivered = Vec::new();
-        let stop = drain_on_exit(&mut reader, 1, |f| delivered.push(f)).await;
+        let stop = drain_on_exit(&mut reader, 1, Vec::new(), |f| delivered.push(f)).await;
         let elapsed = started.elapsed();
         writer.abort();
 
@@ -2672,7 +2714,7 @@ mod tests {
         let mut delivered = Vec::new();
         let drained = timeout(
             EXIT_DRAIN_TIMEOUT.saturating_mul(4),
-            drain_on_exit(&mut reader, 1, |frame| delivered.push(frame)),
+            drain_on_exit(&mut reader, 1, Vec::new(), |frame| delivered.push(frame)),
         )
         .await;
 
@@ -2687,7 +2729,7 @@ mod tests {
         let mut delivered = Vec::new();
         let drained = timeout(
             EXIT_DRAIN_TIMEOUT.saturating_mul(4),
-            drain_on_exit(&mut reader, 1, |frame| delivered.push(frame)),
+            drain_on_exit(&mut reader, 1, Vec::new(), |frame| delivered.push(frame)),
         )
         .await;
 
@@ -2705,7 +2747,7 @@ mod tests {
         let mut delivered = Vec::new();
 
         assert_eq!(
-            drain_on_exit(&mut reader, 1, |frame| delivered.push(frame)).await,
+            drain_on_exit(&mut reader, 1, Vec::new(), |frame| delivered.push(frame)).await,
             DrainStop::FrameLimit
         );
         assert_eq!(delivered, logs[..MAX_EXIT_DRAIN_FRAMES].to_vec());
@@ -2717,7 +2759,7 @@ mod tests {
         let mut delivered = Vec::new();
 
         assert_eq!(
-            drain_on_exit(&mut reader, 1, |frame| delivered.push(frame)).await,
+            drain_on_exit(&mut reader, 1, Vec::new(), |frame| delivered.push(frame)).await,
             DrainStop::ByteLimit
         );
         assert_eq!(delivered, Vec::<Vec<u8>>::new());
@@ -2738,7 +2780,7 @@ mod tests {
         input.extend_from_slice(&log_frame(99));
         let mut reader = BufReader::new(input.as_slice());
         let mut delivered = Vec::new();
-        let stop = drain_on_exit(&mut reader, 1, |frame| delivered.push(frame)).await;
+        let stop = drain_on_exit(&mut reader, 1, Vec::new(), |frame| delivered.push(frame)).await;
         let total: usize = delivered.iter().map(Vec::len).sum();
 
         assert_eq!(stop, DrainStop::ByteLimit);
