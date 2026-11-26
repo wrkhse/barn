@@ -154,6 +154,33 @@ past the sketch and B1 confirms them:
 _For B1 to confirm: whether a JSON-RPC id is an integer, a string or both, and
 whether `net.request`'s `auth.as` has values beyond `bearer`._
 
+## The framed hook and tool contract
+
+tack sends a stall one JSON frame per line over the connection barn brokers: a
+hook frame asks the stall to decide a tool call, and a tool frame asks it to run
+one. The stall answers a hook with an outcome and a tool with content, or an
+error with a reason. `barn-stall`'s `frames` module defines the types, and the
+fixture `frames.jsonl` holds the shared examples.
+
+This contract has its own version, `FRAMED_VERSION` (`1`). It is separate from
+barn's stall-start protocol: `PROTOCOL_VERSION` versions the JSON-RPC messages
+on `proto.sock`, and `FRAMED_VERSION` versions these frames.
+
+A request carries `type`, `id` and `version`. A hook adds `hook` and `call`; a
+tool adds `call` only. A reply repeats the `id` and carries one of `outcome`,
+`content` or `error`. The `call` holds `tool`, `name`, a JSON `input` and an
+optional `session_id`.
+
+A hook's `outcome` is `allow`, `deny`, `rewrite`, `annotate` or `drop` (tack#89).
+`deny` carries a `reason`. `rewrite` carries an `input`, JSON of any shape, that
+replaces a call's input for any tool. `annotate` carries `fields`, a JSON object
+keyed by name, such as `{"chauffeurTriaged": true}`, that travels with the
+delivered event. `allow` and `drop` carry no payload.
+
+A hook request may carry `_meta` with a W3C `traceparent` and `tracestate`. It is
+data only: the stall learns where the call came from, and no field there grants
+access to a tool or a session.
+
 ## Limits and constants
 
 | Constant                 | Value     | Meaning                                  |

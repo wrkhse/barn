@@ -1,6 +1,6 @@
-//! The framed request and reply contract between tack and a plugin stall.
+//! The framed request and reply contract between tack and a stall.
 //!
-//! tack holds no VM. It writes one JSON frame per line to a plugin stall and
+//! tack holds no VM. It writes one JSON frame per line to a stall and
 //! reads one framed reply. A hook frame carries a tool call for the stall to
 //! decide; a tool frame asks the stall to run one. The stall answers a hook
 //! with an outcome, a tool with content, and either with an error.
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 /// The version of this framed contract carried in a request's `version`.
 pub const FRAMED_VERSION: u32 = 1;
 
-/// A frame tack sends to a plugin stall.
+/// A frame tack sends to a stall.
 ///
 /// The `type` tag picks the variant. A hook asks the stall to decide a tool
 /// call; a tool asks it to run one. Both carry a version and an id, and a reply
@@ -51,7 +51,7 @@ pub enum Request {
     },
 }
 
-/// The frame a plugin stall sends back.
+/// The frame a stall sends back.
 ///
 /// The `type` tag picks the variant, and every variant repeats the request's
 /// id. A hook carries the decision, a tool its result, and an error the reason
@@ -124,15 +124,15 @@ pub enum Outcome {
         /// Why the call is refused.
         reason: String,
     },
-    /// Replace the call before it runs.
+    /// Replace the input of a tool call before it runs.
     Rewrite {
-        /// The rewritten tool command.
-        command: String,
+        /// The replacement input, of any shape the tool takes.
+        input: serde_json::Value,
     },
-    /// Add a note for the caller without changing the call.
+    /// Add fields that travel with the delivered event.
     Annotate {
-        /// The note the stall adds.
-        text: String,
+        /// Fields keyed by name, such as `{"chauffeurTriaged": true}`.
+        fields: serde_json::Map<String, serde_json::Value>,
     },
     /// Remove the call from the run.
     Drop,

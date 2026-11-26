@@ -1,6 +1,8 @@
-//! The shared frames are the contract tack and a plugin stall build against.
+//! The shared frames are the contract tack and a stall build against.
 //! Every line in `fixtures/frames.jsonl` is read here and round-tripped through
 //! its type, so a changed field or tag fails these tests.
+
+use std::collections::BTreeSet;
 
 use barn_stall::{Content, FRAMED_VERSION, Meta, Outcome, Reply, Request};
 use serde_json::Value;
@@ -78,13 +80,14 @@ fn the_denied_call_answers_with_a_deny_reason() {
     assert_eq!(reason.as_str(), "push blocked");
 }
 
-/// The rewrite request carries trace context and the framed version.
+/// The rewrite request names a tool and carries trace context and the version.
 #[test]
 fn the_rewrite_request_carries_trace_context() {
     let requests = requests().expect("request frames");
     let Request::Hook {
         id,
         version,
+        call,
         _meta: meta,
         ..
     } = &requests[1]
@@ -94,6 +97,9 @@ fn the_rewrite_request_carries_trace_context() {
 
     assert_eq!(*id, 2);
     assert_eq!(*version, FRAMED_VERSION);
+    assert_eq!(call.tool, "github");
+    assert_eq!(call.name, "create_issue");
+    assert_eq!(call.input, serde_json::json!({"title": "Fix flaky test"}));
 
     let meta = meta.as_ref().expect("the rewrite request carries meta");
     assert_eq!(
@@ -106,17 +112,21 @@ fn the_rewrite_request_carries_trace_context() {
 }
 
 #[test]
-fn the_rewrite_pair_carries_the_rewritten_command() {
+fn the_rewrite_pair_carries_the_replacement_input() {
     let replies = replies().expect("reply frames");
     let Reply::Hook { id, outcome } = &replies[1] else {
         panic!("the rewrite is a hook reply");
     };
-    let Outcome::Rewrite { command } = outcome else {
-        panic!("the rewrite carries a command");
+    let Outcome::Rewrite { input } = outcome else {
+        panic!("the rewrite carries an input");
     };
 
     assert_eq!(*id, 2);
-    assert_eq!(command.as_str(), "git status --short");
+    let expected = serde_json::json!({
+        "title": "Fix flaky test",
+        "labels": ["bug", "p1"]
+    });
+    assert_eq!(input, &expected);
 }
 
 #[test]
@@ -142,7 +152,7 @@ fn the_allowed_call_answers_with_allow() {
 }
 
 #[test]
-fn the_annotated_call_carries_the_note() {
+fn the_annotated_call_carries_fields() {
     let requests = requests().expect("request frames");
     let replies = replies().expect("reply frames");
 
@@ -156,14 +166,15 @@ fn the_annotated_call_carries_the_note() {
     else {
         panic!("the annotation is a hook reply");
     };
-    let Outcome::Annotate { text } = outcome else {
-        panic!("the annotation carries text");
+    let Outcome::Annotate { fields } = outcome else {
+        panic!("the annotation carries fields");
     };
 
     assert_eq!(hook, "PostToolUse");
     assert_eq!(*id, 4);
     assert_eq!(reply_id, id);
-    assert_eq!(text.as_str(), "review before merge");
+    let expected = serde_json::json!({"chauffeurTriaged": true});
+    assert_eq!(fields, expected.as_object().expect("a JSON object"));
 }
 
 #[test]
@@ -227,7 +238,7 @@ fn the_error_pair_names_the_failure() {
 
     assert_eq!(*id, 7);
     assert_eq!(error, "stall_unavailable");
-    assert_eq!(message, "the plugin stall did not answer");
+    assert_eq!(message, "the stall did not answer");
 }
 
 /// Absence of trace context and of a session id is valid.
@@ -269,4 +280,28 @@ fn every_request_carries_the_framed_version() {
             }
         }
     }
+}
+
+/// Every outcome variant has a fixture, so a new variant fails this test.
+#[test]
+fn every_outcome_variant_has_a_fixture() {
+    let replies = replies().expect("reply frames");
+    let mut seen = BTreeSet::new();
+
+    for reply in &replies {
+        let Reply::Hook { outcome, .. } = reply else {
+            continue;
+        };
+        let name = match outcome {
+            Outcome::Allow => "allow",
+            Outcome::Deny { .. } => "deny",
+            Outcome::Rewrite { .. } => "rewrite",
+            Outcome::Annotate { .. } => "annotate",
+            Outcome::Drop => "drop",
+        };
+        seen.insert(name);
+    }
+
+    let expected = BTreeSet::from(["allow", "annotate", "deny", "drop", "rewrite"]);
+    assert_eq!(seen, expected);
 }
