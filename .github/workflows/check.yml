@@ -187,6 +187,7 @@ jobs:
           IS_MAIN: ${{ github.ref == 'refs/heads/main' }}
         run: |
           args="--shard ${{ matrix.shard }}/4 --no-shuffle -j 2 -vV"
+          list_args="--shard ${{ matrix.shard }}/4"
           if [ "$IS_MAIN" != true ] && [ ! -s pr.diff ]; then
             mkdir -p mutants.out
             jq -n '{total_mutants: 0, caught: 0, missed: 0, timeout: 0, unviable: 0}' > mutants.out/outcomes.json
@@ -194,11 +195,19 @@ jobs:
           fi
           if [ "$IS_MAIN" != true ]; then
             args="$args --in-diff pr.diff"
+            list_args="$list_args --in-diff pr.diff"
           fi
           cargo mutants $args
           if [ ! -f mutants.out/outcomes.json ]; then
-            echo "::error::cargo mutants did not write mutants.out/outcomes.json"
-            exit 1
+            listed=$(cargo mutants $list_args --list 2>/dev/null || true)
+            count=$(printf '%s\n' "$listed" | grep -c . || true)
+            if [ "$count" -eq 0 ]; then
+              mkdir -p mutants.out
+              jq -n '{total_mutants: 0, caught: 0, missed: 0, timeout: 0, unviable: 0}' > mutants.out/outcomes.json
+            else
+              echo "::error::cargo mutants did not write mutants.out/outcomes.json"
+              exit 1
+            fi
           fi
       - name: Check outcomes
         run: |

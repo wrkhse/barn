@@ -74,9 +74,9 @@ run it here.
 | mutants | a viable mutant in a pull request's changed lines that no test catches                                       | `mutants`                            |
 | docs    | markdown that prettier or markdownlint would change                                                          | `docs`                               |
 
-Every gate runs in CI, one job each, and a deliberate break fails the job it
-targets. Never weaken a gate to make a change pass: fix the change, or say why
-the gate is wrong.
+Every gate runs in CI; the mutants gate uses four shards plus an aggregate,
+and a deliberate break fails the gate it targets. Never weaken a gate to make
+a change pass: fix the change, or say why the gate is wrong.
 
 ## Tests that touch processes
 
