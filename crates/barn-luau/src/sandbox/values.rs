@@ -159,10 +159,17 @@ impl Conversion {
     }
 
     fn value(&mut self, value: LuaValue, depth: usize) -> Result<Value, EngineError> {
-        if depth > MAX_DEPTH {
-            return Err(EngineError::Limit(LimitCause::TooDeep { limit: MAX_DEPTH }));
-        }
         match value {
+            LuaValue::Table(table) => {
+                if !self.visited.insert(table.to_pointer()) {
+                    return Err(EngineError::InvalidResult(SHARED_TABLE.into()));
+                }
+                if depth > MAX_DEPTH {
+                    let cause = LimitCause::TooDeep { limit: MAX_DEPTH };
+                    return Err(EngineError::Limit(cause));
+                }
+                self.table(&table, depth)
+            }
             LuaValue::Nil => Ok(Value::Null),
             LuaValue::LightUserData(value) if value.0.is_null() => Ok(Value::Null),
             LuaValue::Boolean(value) => Ok(Value::Bool(value)),
@@ -171,16 +178,11 @@ impl Conversion {
                 .map(Value::Number)
                 .ok_or_else(|| EngineError::InvalidResult("non-finite Lua number".into())),
             LuaValue::String(value) => Ok(Value::String(value.to_str()?.to_string())),
-            LuaValue::Table(table) => self.table(&table, depth),
             _ => Err(EngineError::InvalidResult("unsupported Lua value".into())),
         }
     }
 
     fn table(&mut self, table: &Table, depth: usize) -> Result<Value, EngineError> {
-        if !self.visited.insert(table.to_pointer()) {
-            return Err(EngineError::InvalidResult(SHARED_TABLE.into()));
-        }
-
         let mut object = Map::new();
         let mut array = Vec::new();
         let mut array_mode: Option<bool> = None;
@@ -241,6 +243,9 @@ impl Conversion {
 }
 
 pub(super) fn lua_to_json(value: LuaValue, depth: usize) -> Result<Value, EngineError> {
+    if depth > MAX_DEPTH {
+        return Err(EngineError::Limit(LimitCause::TooDeep { limit: MAX_DEPTH }));
+    }
     let mut conversion = Conversion::new();
     conversion.value(value, depth)
 }
@@ -466,17 +471,39 @@ mod tests {
         }
 
         // Each table's entries all point at the next one, so without the
-        // visited set this 17-table, 1024-way shape expands to 1024^16 host
-        // nodes. The leaf is deliberately left empty: populating it would
-        // convert its values at depth 17, where the depth limit fires TooDeep
-        // before the walk revisits a table and identity detection can report
-        // the shared table this test asserts.
+        // visited set this 17-table, 1024-way shape expands to 1024^16
+        // visits. The revisit past depth 16 is caught by table identity
+        // before the depth limit can report TooDeep.
         for index in 0..16usize {
             let child = tables[index.saturating_add(1)].clone();
             for key in 0..MAX_ENTRIES {
                 tables[index].set(format!("k{key}"), child.clone()).unwrap();
             }
         }
+        for key in 0..MAX_ENTRIES {
+            tables[16].set(format!("k{key}"), 1i64).unwrap();
+        }
+
+        assert_eq!(
+            lua_to_json(LuaValue::Table(tables[0].clone()), 0),
+            Err(shared_table())
+        );
+    }
+
+    #[test]
+    fn lua_to_json_reports_a_revisited_table_past_the_depth_limit_as_shared() {
+        let lua = Lua::new();
+        let mut tables = Vec::with_capacity(17);
+        for _ in 0..17 {
+            tables.push(lua.create_table().unwrap());
+        }
+
+        for index in 0..16usize {
+            tables[index]
+                .set("next", tables[index.saturating_add(1)].clone())
+                .unwrap();
+        }
+        tables[16].set("back", tables[0].clone()).unwrap();
 
         assert_eq!(
             lua_to_json(LuaValue::Table(tables[0].clone()), 0),
@@ -511,5 +538,24 @@ mod tests {
                 limit: MAX_NODES
             }))
         );
+    }
+
+    #[test]
+    fn lua_to_json_accepts_exactly_the_node_budget() {
+        let lua = Lua::new();
+        let root = lua.create_table().unwrap();
+
+        // 16 root entries plus 16 * 1023 child entries make exactly 16384
+        // visits, the conversion budget. Literal counts keep this boundary
+        // independent of the named limits.
+        for child in 0..16 {
+            let table = lua.create_table().unwrap();
+            for field in 0..1023 {
+                table.set(format!("f{field}"), 1i64).unwrap();
+            }
+            root.set(format!("k{child}"), table).unwrap();
+        }
+
+        assert!(lua_to_json(LuaValue::Table(root), 0).is_ok());
     }
 }

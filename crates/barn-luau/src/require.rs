@@ -152,7 +152,7 @@ impl RequireState {
                     spec: spec.to_owned(),
                     detail: error.to_string(),
                 })?;
-            if metadata.nlink() > 1 {
+            if metadata.is_file() && metadata.nlink() > 1 {
                 return Err(RequireCause::HardLink(spec.to_owned()));
             }
             return Ok(canonical);
@@ -441,6 +441,27 @@ mod tests {
                 .downcast_ref::<RequireCause>()
                 .expect("error carries a require cause"),
             &RequireCause::HardLink("./linked".into())
+        );
+    }
+
+    #[test]
+    fn scoped_require_reports_a_directory_as_missing_not_a_hard_link() {
+        let folder = Folder::new();
+        std::fs::create_dir(folder.path.join("package"))
+            .expect("create a directory in the scratch folder");
+
+        let lua = Lua::new();
+        let state = RequireState::new(&folder.path).expect("require state");
+        let loader = install(&lua, state).expect("install require");
+
+        let error = loader
+            .call::<LuaValue>(("./package",))
+            .expect_err("a directory is not a module");
+        assert_eq!(
+            error
+                .downcast_ref::<RequireCause>()
+                .expect("error carries a require cause"),
+            &RequireCause::Missing("./package".into())
         );
     }
 }
