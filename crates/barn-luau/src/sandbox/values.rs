@@ -9,9 +9,13 @@ use super::errors::{EngineError, LimitCause, MAX_DEPTH, MAX_ENTRIES};
 const SHARED_TABLE: &str = "shared or cyclic Lua table in result";
 
 /// The conversion-wide budget for converted entry visits: `MAX_DEPTH` times
-/// `MAX_ENTRIES`, or 16384 visits. With a path stack, a shared acyclic table
-/// is traversed once per path that reaches it, so this budget is the bound on
-/// DAG expansion. A tree at the per-table caps fits exactly.
+/// `MAX_ENTRIES`, or 16384 visits. Each table entry converted spends one
+/// visit, so the budget bounds work across the whole conversion, not just a
+/// single table. A shared acyclic table is visited once per path that reaches
+/// it, since the path stack only rules out cycles. A linear chain at the
+/// per-table caps uses exactly this budget; a branching tree can stay under
+/// `MAX_ENTRIES` per table and `MAX_DEPTH` in depth yet exceed the budget and
+/// be refused.
 const MAX_NODES: usize = MAX_DEPTH.saturating_mul(MAX_ENTRIES);
 
 pub(super) fn tool_name(table: &Table, key: &str) -> Result<String, EngineError> {

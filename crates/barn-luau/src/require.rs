@@ -516,6 +516,26 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_module_load_can_be_required_again() {
+        let folder = Folder::new();
+        folder.write("bad.luau", b"error('boom')".to_vec());
+
+        let lua = Lua::new();
+        let state = RequireState::new(&folder.path).expect("require state");
+        let loader = install(&lua, state).expect("install require");
+
+        let first = loader
+            .call::<LuaValue>(("./bad",))
+            .expect_err("a module that raises at load time fails");
+        assert_eq!(first.downcast_ref::<RequireCause>(), None);
+
+        let second = loader
+            .call::<LuaValue>(("./bad",))
+            .expect_err("a failed module can be required again and fails again");
+        assert_eq!(second.downcast_ref::<RequireCause>(), None);
+    }
+
+    #[test]
     fn scoped_require_refuses_a_hard_link_within_the_folder() {
         let folder = Folder::new();
         folder.write("original.luau", b"return {}".to_vec());
