@@ -17,6 +17,18 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
   `proto.sock` and `policy.json` from a stale run directory, leaving the
   stall's state folder intact. Any other entry in that directory makes the
   start fail with `removing stale stall run directory` (`DirectoryNotEmpty`).
+- barn also binds `state_dir/run/<stall>/host.sock` before spawning the
+  stall, a Unix socket with mode `0600` in the same directory with mode
+  `0700`. tack receives the socket's absolute path and a single-use host
+  token when barn starts the stall; the stall binds nothing. barn removes
+  `host.sock` on drain or exit. tack supplies its daemon pid at launch,
+  connects and sends `host.start` as its first message. barn checks the
+  peer pid against that pid and the peer uid against the socket owner, then
+  spends the token. A missing or wrong peer, or a token at or past
+  `TOKEN_TTL_SECS`, is a named deny: barn answers with the deny and closes
+  the connection, issuing no new token without a restart. Failures at this
+  boundary are named denies, each in `data.reason` on a `DENIED_CODE`
+  error; `barn-stall`'s `deny` module names every reason.
 - The stall connects and sends `stall.start` as its first message. barn checks
   that the peer PID matches the child it spawned and that the peer UID owns
   the socket. A missing peer PID fails authentication. The stall declares its
@@ -61,6 +73,7 @@ encoding is a new version, never a value added inside this one.
 | Method                        | Direction     | Purpose                                                                                                 |
 | ----------------------------- | ------------- | ------------------------------------------------------------------------------------------------------- |
 | `stall.start`                 | stall to barn | Authenticate the stall and return its state folder                                                      |
+| `host.start`                  | host to barn  | Authenticate the host on `host.sock` and return the stall's name                                        |
 | `stall.health`, `stall.drain` | barn to stall | Report health; finish in-flight work and exit within a deadline                                         |
 | `request`, `cancel`           | barn to stall | A client request from a listener; a cancel or a closed connection                                       |
 | `stream.send`, `stream.end`   | stall to barn | Write to a response stream, such as SSE                                                                 |
@@ -80,6 +93,32 @@ A stall connects and receives its state folder:
 {"jsonrpc":"2.0","id":1,"method":"stall.start","params":{"protocol":1,"token":"…","jobs":{"poll":{"every":"15s"}}}}
 {"jsonrpc":"2.0","id":1,"result":{"state":"/var/lib/barn/sourcefed","jobs":{"poll":{"every":"15s"}}}}
 ```
+
+tack's host authenticates on `host.sock` before it sends a framed request:
+
+```json
+{"jsonrpc":"2.0","id":21,"method":"host.start","params":{"protocol":1,"token":"…","pid":4321}}
+{"jsonrpc":"2.0","id":21,"result":{"stall":"sourcefed"}}
+```
+
+A host whose peer pid differs from the pid barn was given is denied:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 22,
+  "error": {
+    "code": -32001,
+    "message": "denied",
+    "data": { "reason": "wrong peer pid" }
+  }
+}
+```
+
+The other named reasons are `wrong peer uid`, `token expired or spent`,
+`token mismatch`, `protocol mismatch`, `oversize frame` and `closed socket`.
+Each travels in `data.reason` with `DENIED_CODE`; `barn-stall`'s `deny`
+module names every reason.
 
 A reply too long to fit is replaced by one error line:
 
@@ -130,6 +169,8 @@ on this page in that crate's tests, which read this file with `include_str!`:
 | ------------------------ | ----------------------- |
 | `stall.start` parameters | `StallStartParams`      |
 | `stall.start` result     | `StallStartResult`      |
+| `host.start` parameters  | `HostStartParams`       |
+| `host.start` result      | `HostStartResult`       |
 | the jobs by name         | `BTreeMap<String, Job>` |
 | `net.request` parameters | `NetRequestParams`      |
 | the secret to add        | `NetAuth`               |
@@ -212,3 +253,7 @@ The plan fixes these methods' names and directions. These details remain open:
 - how barn reports an unsupported version: the stall sends its version in
   `stall.start`'s `protocol` field.
 - the code of the error barn answers with when a body is over its cap.
+- the payloads of the frames barn brokers between tack and the stall on
+  `host.sock`, past the framed contract above;
+- whether a `host.start` failure writes the named deny line before closing
+  for every reason, and whether its `data` carries fields besides `reason`.

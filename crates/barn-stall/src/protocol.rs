@@ -48,6 +48,8 @@ pub type Headers = Vec<(String, String)>;
 pub mod method {
     /// Stall to barn: authenticate and get the stall's state folder.
     pub const STALL_START: &str = "stall.start";
+    /// Host to barn: authenticate and get the stall's name on `host.sock`.
+    pub const HOST_START: &str = "host.start";
     /// barn to stall: report health.
     pub const STALL_HEALTH: &str = "stall.health";
     /// barn to stall: finish in-flight work and exit within a deadline.
@@ -70,6 +72,26 @@ pub mod method {
     pub const MCP_CALL: &str = "mcp.call";
     /// stall to barn: a structured log line.
     pub const LOG: &str = "log";
+}
+
+/// The named reasons barn puts in a `denied` error's `data.reason`.
+///
+/// Every one of them uses [`DENIED_CODE`] as its error code.
+pub mod deny {
+    /// The host's peer pid is not the pid barn supplied at stall start.
+    pub const WRONG_PEER_PID: &str = "wrong peer pid";
+    /// The host's peer uid does not own the socket.
+    pub const WRONG_PEER_UID: &str = "wrong peer uid";
+    /// The token has expired or was already spent.
+    pub const TOKEN_EXPIRED_OR_SPENT: &str = "token expired or spent";
+    /// The token does not match the one barn issued.
+    pub const TOKEN_MISMATCH: &str = "token mismatch";
+    /// The protocol version does not match the one barn speaks.
+    pub const PROTOCOL_MISMATCH: &str = "protocol mismatch";
+    /// A line is longer than [`MAX_LINE_BYTES`].
+    pub const OVERSIZE_FRAME: &str = "oversize frame";
+    /// The socket closed before the peer completed the exchange.
+    pub const CLOSED_SOCKET: &str = "closed socket";
 }
 
 /// The `stall.start` parameters a stall sends when it connects.
@@ -114,6 +136,35 @@ pub struct StallStartResult {
     /// declares no jobs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub jobs: BTreeMap<String, Job>,
+}
+
+/// The `host.start` parameters tack sends when it connects to `host.sock`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostStartParams {
+    /// The protocol version the host speaks.
+    pub protocol: u32,
+    /// The single-use host token barn gave tack at stall start.
+    pub token: String,
+    /// The tack daemon's pid, checked against the socket's peer pid.
+    pub pid: u32,
+}
+
+impl Debug for HostStartParams {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostStartParams")
+            .field("protocol", &self.protocol)
+            .field("token", &"[redacted]")
+            .field("pid", &self.pid)
+            .finish()
+    }
+}
+
+/// The `host.start` result barn sends after authenticating the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostStartResult {
+    /// The stall's name.
+    pub stall: String,
 }
 
 /// The secret a `net.request` names, and how barn adds it.
@@ -182,4 +233,86 @@ pub struct NetResponse {
     /// How `body` is encoded.
     #[serde(default)]
     pub body_encoding: BodyEncoding,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    const PAGE: &str = include_str!("../../../docs/stall-protocol.md");
+
+    /// Every JSON-RPC line on the protocol page, parsed.
+    fn lines() -> Vec<Value> {
+        PAGE.lines()
+            .filter(|line| line.starts_with("{\"jsonrpc\""))
+            .map(|line| serde_json::from_str(line).expect("the page's JSON line"))
+            .collect()
+    }
+
+    #[test]
+    fn the_host_method_keeps_its_name() {
+        assert_eq!(method::HOST_START, "host.start");
+    }
+
+    #[test]
+    fn host_start_writes_the_pages_request() {
+        let sent = lines()
+            .into_iter()
+            .find(|message| {
+                message.get("method").and_then(Value::as_str) == Some(method::HOST_START)
+            })
+            .expect("the page sends host.start");
+        let wire = sent.get("params").expect("host.start carries params");
+        let params = HostStartParams {
+            protocol: PROTOCOL_VERSION,
+            token: "…".to_owned(),
+            pid: 4321,
+        };
+
+        assert_eq!(sent.get("id"), Some(&json!(21)));
+        assert_eq!(serde_json::to_value(&params).ok().as_ref(), Some(wire));
+    }
+
+    #[test]
+    fn host_start_writes_the_pages_result() {
+        let reply = lines()
+            .into_iter()
+            .find(|message| {
+                message.get("id").and_then(Value::as_i64) == Some(21)
+                    && message.get("result").is_some()
+            })
+            .expect("the page answers host.start");
+        let wire = reply.get("result").expect("the reply carries a result");
+        let result = HostStartResult {
+            stall: "sourcefed".to_owned(),
+        };
+
+        assert_eq!(serde_json::to_value(&result).ok().as_ref(), Some(wire));
+    }
+
+    #[test]
+    fn a_host_denial_writes_the_pages_reason() {
+        let error = lines()
+            .into_iter()
+            .filter_map(|message| message.get("error").cloned())
+            .find(|error| {
+                error
+                    .get("data")
+                    .and_then(|data| data.get("reason"))
+                    .and_then(Value::as_str)
+                    == Some(deny::WRONG_PEER_PID)
+            })
+            .expect("the page names a host denial");
+
+        assert_eq!(
+            error,
+            json!({
+                "code": DENIED_CODE,
+                "message": "denied",
+                "data": {"reason": deny::WRONG_PEER_PID},
+            })
+        );
+    }
 }

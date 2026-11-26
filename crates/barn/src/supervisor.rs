@@ -2,6 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{OsStr, OsString};
+use std::fmt::{self, Debug, Formatter};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::hint::black_box;
 use std::io::{self, Read, Write};
@@ -11,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-use barn_stall::protocol::TOKEN_TTL_SECS;
+use barn_stall::protocol::{
+    DEFAULT_MAX_BODY_BYTES, DENIED_CODE, HostStartParams, HostStartResult, TOKEN_TTL_SECS, deny,
+};
 use barn_stall::{Job, StallStartParams, StallStartResult};
 use barn_stall::{MAX_LINE_BYTES, PROTOCOL_VERSION, method};
 use nono::{AccessMode, CapabilitySet, NonoError, SandboxState, UnixSocketMode};
@@ -38,11 +41,13 @@ const MAX_EXIT_DRAIN_FRAMES: usize = 64;
 const MAX_EXIT_DRAIN_BYTES: usize = 64 * 1024;
 const EXIT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const HOST_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 const TOKEN_BYTES: usize = 32;
 const TOKEN_TTL: Duration = Duration::from_secs(TOKEN_TTL_SECS);
 const PRIVATE_DIR: u32 = 0o700;
 const PRIVATE_FILE: u32 = 0o600;
 const SOCKET_FILE: &str = "proto.sock";
+const HOST_SOCKET_FILE: &str = "host.sock";
 const POLICY_FILE: &str = "policy.json";
 /// The shell shim; a grant that lets a stall execute it gets `SHELL_GRANTS`.
 const SHELL_SHIM: &str = "/bin/sh";
@@ -72,6 +77,69 @@ pub struct StallSpec {
     pub grant: Grant,
 }
 
+/// The socket and single-use token tack uses to reach a running stall.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HostEndpoint {
+    /// The Unix socket tack connects to.
+    pub socket_path: PathBuf,
+    /// The single-use token tack offers in `host.start`.
+    pub token: String,
+}
+
+impl Debug for HostEndpoint {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostEndpoint")
+            .field("socket_path", &self.socket_path)
+            .field("token", &"[redacted]")
+            .finish()
+    }
+}
+
+/// Why barn refuses a host or stops brokering one of its frames.
+///
+/// Every variant writes the reason fixed on the protocol page into a
+/// `denied` reply before the connection closes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostDeny {
+    /// The peer is not the tack daemon barn was told to expect.
+    WrongPeerPid,
+    /// The peer does not own the host socket.
+    WrongPeerUid,
+    /// The host token is gone or past its deadline.
+    TokenExpiredOrSpent,
+    /// The offered host token does not match.
+    TokenMismatch,
+    /// The version or envelope of `host.start` does not match.
+    ProtocolMismatch,
+    /// A line is longer than the line cap.
+    OversizeFrame,
+    /// A body is longer than the body cap.
+    OversizeBody,
+    /// The peer closed before finishing the exchange.
+    ClosedSocket,
+    /// The stall did not answer within the reply deadline.
+    StalledReply,
+    /// The stall's connection ended before it answered.
+    PeerLoss,
+}
+
+impl HostDeny {
+    /// The reason fixed on the protocol page for this denial.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::WrongPeerPid => deny::WRONG_PEER_PID,
+            Self::WrongPeerUid => deny::WRONG_PEER_UID,
+            Self::TokenExpiredOrSpent => deny::TOKEN_EXPIRED_OR_SPENT,
+            Self::TokenMismatch => deny::TOKEN_MISMATCH,
+            Self::ProtocolMismatch => deny::PROTOCOL_MISMATCH,
+            Self::OversizeFrame | Self::OversizeBody => deny::OVERSIZE_FRAME,
+            Self::ClosedSocket | Self::StalledReply | Self::PeerLoss => deny::CLOSED_SOCKET,
+        }
+    }
+}
+
 /// Starts stalls with the named `barn-exec` helper under a trusted state root.
 #[derive(Clone)]
 pub struct Supervisor {
@@ -84,6 +152,7 @@ pub struct RunningStall {
     child: Child,
     pid: u32,
     transport: Transport,
+    host: HostTransport,
     supervisor: Supervisor,
     spec: StallSpec,
     started: Instant,
@@ -101,6 +170,14 @@ struct Transport {
     jobs: BTreeMap<String, Job>,
 }
 
+/// The host listener, its single-use token and the tack daemon it expects.
+struct HostTransport {
+    listener: UnixListener,
+    token: Option<Token>,
+    daemon_pid: Option<u32>,
+    uid: u32,
+}
+
 /// A start token and the moment it stops being accepted.
 struct Token {
     secret: String,
@@ -109,10 +186,12 @@ struct Token {
 
 struct Prepared {
     listener: StdUnixListener,
+    host_listener: StdUnixListener,
     run_dir: RunDir,
     state: String,
     uid: u32,
     token: String,
+    host_token: String,
     program: PathBuf,
 }
 
@@ -338,6 +417,9 @@ pub enum SupervisorError {
     /// The token has already been spent.
     #[error("stall token already spent")]
     TokenSpent,
+    /// A host request is refused with the reason named on the protocol page.
+    #[error("host denied: {0:?}")]
+    HostDenied(HostDeny),
     /// The token's deadline has passed; it is dropped unspent.
     #[error("stall token expired")]
     TokenExpired,
@@ -360,13 +442,31 @@ impl Supervisor {
     /// Returns the stage that fails while preparing or starting the child.
     pub async fn start(&self, spec: StallSpec) -> Result<RunningStall> {
         self.clone()
-            .launch(spec, Instant::now(), RestartPolicy::default())
+            .launch(spec, None, Instant::now(), RestartPolicy::default())
+            .await
+    }
+
+    /// Starts one child and records the tack daemon allowed on `host.sock`.
+    ///
+    /// Run this on a Tokio runtime with I/O and time enabled.
+    ///
+    /// # Errors
+    /// Returns the stage that fails while preparing or starting the child.
+    pub async fn start_for_host(&self, spec: StallSpec, daemon_pid: u32) -> Result<RunningStall> {
+        self.clone()
+            .launch(
+                spec,
+                Some(daemon_pid),
+                Instant::now(),
+                RestartPolicy::default(),
+            )
             .await
     }
 
     async fn launch(
         self,
         spec: StallSpec,
+        daemon_pid: Option<u32>,
         epoch: Instant,
         restart: RestartPolicy,
     ) -> Result<RunningStall> {
@@ -381,6 +481,10 @@ impl Supervisor {
         let listener = io_at(
             "registering stall listener",
             UnixListener::from_std(prepared.listener),
+        )?;
+        let host_listener = io_at(
+            "registering host listener",
+            UnixListener::from_std(prepared.host_listener),
         )?;
         let env = ["PATH", "HOME", "LANG"]
             .into_iter()
@@ -416,6 +520,15 @@ impl Supervisor {
                 }),
                 jobs: BTreeMap::new(),
             },
+            host: HostTransport {
+                listener: host_listener,
+                token: Some(Token {
+                    secret: prepared.host_token,
+                    expires_at,
+                }),
+                daemon_pid,
+                uid: prepared.uid,
+            },
             supervisor: self,
             spec,
             started,
@@ -443,6 +556,82 @@ impl RunningStall {
     #[must_use]
     pub fn socket_path(&self) -> PathBuf {
         self.transport.run_dir.path(SOCKET_FILE)
+    }
+
+    /// The socket and token tack uses to reach this stall.
+    #[must_use]
+    pub fn host_endpoint(&self) -> HostEndpoint {
+        HostEndpoint {
+            socket_path: self.transport.run_dir.path(HOST_SOCKET_FILE),
+            token: self
+                .host
+                .token
+                .as_ref()
+                .map_or_else(String::new, |token| token.secret.clone()),
+        }
+    }
+
+    /// Accepts tack on `host.sock` and answers `host.start`.
+    ///
+    /// Every refusal is written to the peer as a named `denied` reply before
+    /// the connection closes; wrong peers are never retried in a loop. A token
+    /// at or past its deadline is dropped, so only a restart issues a new one.
+    ///
+    /// # Errors
+    /// Returns the named denial, a timeout, or the failing I/O stage.
+    pub async fn accept_host(&mut self) -> Result<BufReader<UnixStream>> {
+        let Some(daemon_pid) = self.host.daemon_pid else {
+            return Err(SupervisorError::HostDenied(HostDeny::WrongPeerPid));
+        };
+        let remaining = self.host.token.as_ref().map_or(Duration::ZERO, |token| {
+            token.expires_at.saturating_duration_since(Instant::now())
+        });
+        let accepted = timeout(remaining, self.host.accept(daemon_pid, &self.spec.name)).await;
+
+        if let Ok(result) = accepted {
+            result
+        } else {
+            self.host.token = None;
+
+            Err(SupervisorError::HostDenied(HostDeny::TokenExpiredOrSpent))
+        }
+    }
+
+    /// Brokers one framed request from `host` to the stall and its reply back.
+    ///
+    /// The frame bytes travel unchanged: no hook payload is read or changed.
+    ///
+    /// # Errors
+    /// Returns a named denial for an oversize frame, a lost peer or a stalled
+    /// reply, else the failing I/O stage.
+    pub async fn serve_host(
+        &self,
+        host: &mut BufReader<UnixStream>,
+        stall: &mut BufReader<UnixStream>,
+    ) -> Result<()> {
+        let frame = match read_line_bounded(host).await {
+            Ok(frame) => frame,
+            Err(host_deny) => return refuse(host, &Value::Null, host_deny).await,
+        };
+        if !body_within_cap(&frame) {
+            return refuse(host, &Value::Null, HostDeny::OversizeBody).await;
+        }
+        let sent = timeout(HOST_REPLY_TIMEOUT, stall.write_all(&frame)).await;
+
+        if !matches!(sent, Ok(Ok(()))) {
+            return refuse(host, &Value::Null, HostDeny::PeerLoss).await;
+        }
+
+        let reply = timeout(HOST_REPLY_TIMEOUT, read_line_bounded(stall)).await;
+        let line = match reply {
+            Ok(Ok(line)) => line,
+            Ok(Err(host_deny)) => return refuse(host, &Value::Null, host_deny).await,
+            Err(_) => return refuse(host, &Value::Null, HostDeny::StalledReply).await,
+        };
+        if !body_within_cap(&line) {
+            return refuse(host, &Value::Null, HostDeny::OversizeBody).await;
+        }
+        io_at("answering host frame", host.write_all(&line).await)
     }
 
     /// Accepts a connection from the child and responds to its start request.
@@ -556,7 +745,7 @@ impl RunningStall {
 
         let stall = self
             .supervisor
-            .launch(self.spec, self.epoch, self.restart)
+            .launch(self.spec, self.host.daemon_pid, self.epoch, self.restart)
             .await?;
 
         Ok(RestartOutcome::Restarted {
@@ -850,6 +1039,184 @@ impl Transport {
     }
 }
 
+impl HostTransport {
+    /// Accepts one host connection and completes the `host.start` handshake.
+    async fn accept(&mut self, daemon_pid: u32, stall_name: &str) -> Result<BufReader<UnixStream>> {
+        let (stream, _) = io_at("accepting host socket", self.listener.accept().await)?;
+        let cred = io_at("reading host peer credentials", stream.peer_cred())?;
+        let mut reader = BufReader::new(stream);
+        let line = match read_line_bounded(&mut reader).await {
+            Ok(line) => line,
+            Err(host_deny) => return refuse(&mut reader, &Value::Null, host_deny).await,
+        };
+        let id = request_id(&line);
+
+        if let Err(host_deny) = host_peer(cred.pid(), cred.uid(), daemon_pid, self.uid) {
+            return refuse(&mut reader, &id, host_deny).await;
+        }
+        let (id, params) = match decode_host_start(&line) {
+            Ok(start) => start,
+            Err(host_deny) => return refuse(&mut reader, &id, host_deny).await,
+        };
+        if params.pid != daemon_pid {
+            return refuse(&mut reader, &id, HostDeny::WrongPeerPid).await;
+        }
+        if params.protocol != PROTOCOL_VERSION {
+            return refuse(&mut reader, &id, HostDeny::ProtocolMismatch).await;
+        }
+        if let Some(host_deny) = host_token_deny(&mut self.token, &params.token, Instant::now()) {
+            return refuse(&mut reader, &id, host_deny).await;
+        }
+        let reply = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": HostStartResult { stall: stall_name.to_owned() }
+        });
+        let frame = bounded_frame(&reply)?;
+        io_at("answering host start", reader.write_all(&frame).await)?;
+
+        Ok(reader)
+    }
+}
+
+/// Maps a host peer's credentials to the named reason for a refusal.
+fn host_peer(
+    pid: Option<i32>,
+    uid: u32,
+    child: u32,
+    owner: u32,
+) -> std::result::Result<(), HostDeny> {
+    match verify_peer(pid, uid, child, owner) {
+        Ok(()) => Ok(()),
+        Err(SupervisorError::MissingPeerPid | SupervisorError::PeerPidMismatch) => {
+            Err(HostDeny::WrongPeerPid)
+        }
+        Err(SupervisorError::PeerUidMismatch) => Err(HostDeny::WrongPeerUid),
+        Err(_) => Err(HostDeny::ClosedSocket),
+    }
+}
+
+/// Spends a host token, naming the reason for a mismatch, expiry or reuse.
+fn host_token_deny(saved: &mut Option<Token>, offer: &str, now: Instant) -> Option<HostDeny> {
+    match spend_token(saved, offer, now) {
+        Ok(()) => None,
+        Err(SupervisorError::InvalidToken) => Some(HostDeny::TokenMismatch),
+        Err(SupervisorError::TokenExpired | SupervisorError::TokenSpent) => {
+            Some(HostDeny::TokenExpiredOrSpent)
+        }
+        Err(_) => Some(HostDeny::ClosedSocket),
+    }
+}
+
+/// Reads one bounded line, naming the reason it cannot be read.
+async fn read_line_bounded(
+    reader: &mut (impl AsyncBufRead + Unpin),
+) -> std::result::Result<Vec<u8>, HostDeny> {
+    let limit = u64::try_from(MAX_LINE_BYTES).unwrap_or(u64::MAX);
+    let mut line = Vec::new();
+
+    if reader
+        .take(limit)
+        .read_until(b'\n', &mut line)
+        .await
+        .is_err()
+    {
+        return Err(HostDeny::PeerLoss);
+    }
+
+    if line.last() == Some(&b'\n') {
+        Ok(line)
+    } else if line.len() == MAX_LINE_BYTES {
+        Err(HostDeny::OversizeFrame)
+    } else {
+        Err(HostDeny::ClosedSocket)
+    }
+}
+
+/// The id a denial echoes, or null when the line has no usable id.
+fn request_id(frame: &[u8]) -> Value {
+    serde_json::from_slice::<Value>(frame)
+        .ok()
+        .and_then(|line| line.get("id").cloned())
+        .filter(|id| id.is_string() || id.is_i64() || id.is_u64())
+        .unwrap_or(Value::Null)
+}
+
+/// The `host.start` request, with the id used in its reply or denial.
+fn decode_host_start(frame: &[u8]) -> std::result::Result<(Value, HostStartParams), HostDeny> {
+    let mut request: Value =
+        serde_json::from_slice(frame).map_err(|_| HostDeny::ProtocolMismatch)?;
+
+    if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || request.get("method").and_then(Value::as_str) != Some(method::HOST_START)
+    {
+        return Err(HostDeny::ProtocolMismatch);
+    }
+    let request = request.as_object_mut().ok_or(HostDeny::ProtocolMismatch)?;
+    let id = request
+        .remove("id")
+        .filter(|value| value.is_string() || value.is_i64() || value.is_u64())
+        .ok_or(HostDeny::ProtocolMismatch)?;
+    let params = request.remove("params").ok_or(HostDeny::ProtocolMismatch)?;
+    let params: HostStartParams =
+        serde_json::from_value(params).map_err(|_| HostDeny::ProtocolMismatch)?;
+
+    Ok((id, params))
+}
+
+/// Writes one named `denied` reply and closes the connection.
+async fn refuse<T>(
+    host: &mut (impl AsyncWrite + Unpin),
+    id: &Value,
+    host_deny: HostDeny,
+) -> Result<T> {
+    let frame = bounded_frame(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": DENIED_CODE,
+            "message": "denied",
+            "data": {"reason": host_deny.reason()}
+        }
+    }))?;
+    io_at("answering host denial", host.write_all(&frame).await)?;
+
+    Err(SupervisorError::HostDenied(host_deny))
+}
+
+/// Whether a frame's inline body fits the cap after decoding.
+fn body_within_cap(frame: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(frame) else {
+        return true;
+    };
+    let Some(body) = value.get("body").and_then(Value::as_str) else {
+        return true;
+    };
+    let decoded = if value.get("body_encoding").and_then(Value::as_str) == Some("base64") {
+        base64_decoded_len(body)
+    } else {
+        body.len()
+    };
+
+    decoded <= DEFAULT_MAX_BODY_BYTES
+}
+
+/// The decoded length of a base64 string, counted without a decoder.
+fn base64_decoded_len(body: &str) -> usize {
+    let padding = body.bytes().rev().take_while(|byte| *byte == b'=').count();
+    let symbols = body.len().saturating_sub(padding);
+    let tail = match symbols % 4 {
+        2 => 1,
+        3 => 2,
+        _ => 0,
+    };
+
+    symbols
+        .saturating_div(4)
+        .saturating_mul(3)
+        .saturating_add(tail)
+}
+
 /// Writes the `stall.start` reply, or the oversize error when it cannot fit.
 async fn send_reply<W>(
     out: &mut W,
@@ -1036,6 +1403,14 @@ fn prepare(state_dir: &Path, spec: &StallSpec) -> Result<Prepared> {
     chmod(&socket, PRIVATE_FILE)?;
     let uid = io_at("reading stall socket owner", fs::metadata(&socket))?.uid();
 
+    let host_socket = run_dir.path(HOST_SOCKET_FILE);
+    let host_listener = io_at("binding host socket", StdUnixListener::bind(&host_socket))?;
+    io_at(
+        "setting host socket nonblocking",
+        host_listener.set_nonblocking(true),
+    )?;
+    chmod(&host_socket, PRIVATE_FILE)?;
+
     let caps = caps
         .allow_unix_socket(socket, UnixSocketMode::Connect)
         .map_err(SupervisorError::SocketPolicy)?;
@@ -1051,13 +1426,16 @@ fn prepare(state_dir: &Path, spec: &StallSpec) -> Result<Prepared> {
 
     write_policy(&run_dir.path(POLICY_FILE), &state_policy)?;
     let token = new_token()?;
+    let host_token = new_token()?;
 
     Ok(Prepared {
         listener,
+        host_listener,
         run_dir,
         state,
         uid,
         token,
+        host_token,
         program,
     })
 }
@@ -1242,7 +1620,7 @@ fn check_locked_dir(
 
 fn remove_run_dir(path: &Path) -> io::Result<()> {
     // Only remove the files barn owns; never traverse the stall's state.
-    for name in [SOCKET_FILE, POLICY_FILE] {
+    for name in [SOCKET_FILE, POLICY_FILE, HOST_SOCKET_FILE] {
         match fs::remove_file(path.join(name)) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             result => result?,
@@ -1334,6 +1712,89 @@ mod tests {
             verify_peer(Some(17), 43, 17, 42),
             Err(SupervisorError::PeerUidMismatch)
         ));
+    }
+
+    #[test]
+    fn every_host_deny_carries_the_reason_fixed_on_the_protocol_page() {
+        for (host_deny, reason) in [
+            (HostDeny::WrongPeerPid, deny::WRONG_PEER_PID),
+            (HostDeny::WrongPeerUid, deny::WRONG_PEER_UID),
+            (HostDeny::TokenExpiredOrSpent, deny::TOKEN_EXPIRED_OR_SPENT),
+            (HostDeny::TokenMismatch, deny::TOKEN_MISMATCH),
+            (HostDeny::ProtocolMismatch, deny::PROTOCOL_MISMATCH),
+            (HostDeny::OversizeFrame, deny::OVERSIZE_FRAME),
+            (HostDeny::OversizeBody, deny::OVERSIZE_FRAME),
+            (HostDeny::ClosedSocket, deny::CLOSED_SOCKET),
+            (HostDeny::StalledReply, deny::CLOSED_SOCKET),
+            (HostDeny::PeerLoss, deny::CLOSED_SOCKET),
+        ] {
+            assert_eq!(host_deny.reason(), reason);
+        }
+    }
+
+    #[test]
+    fn a_host_peer_needs_both_the_expected_pid_and_owner_uid() {
+        assert_eq!(host_peer(Some(17), 42, 17, 42), Ok(()));
+        assert_eq!(host_peer(None, 42, 17, 42), Err(HostDeny::WrongPeerPid));
+        assert_eq!(host_peer(Some(18), 42, 17, 42), Err(HostDeny::WrongPeerPid));
+        assert_eq!(host_peer(Some(17), 43, 17, 42), Err(HostDeny::WrongPeerUid));
+    }
+
+    #[test]
+    fn a_host_token_expires_at_its_deadline_and_spends_only_once() {
+        let start = Instant::now();
+        let deadline = start.checked_add(TOKEN_TTL).expect("deadline fits");
+        let before = deadline
+            .checked_sub(Duration::from_nanos(1))
+            .expect("instant before fits");
+        let after = deadline
+            .checked_add(Duration::from_secs(1))
+            .expect("instant after fits");
+        let issued = || Token {
+            secret: "secret".to_owned(),
+            expires_at: deadline,
+        };
+
+        let mut saved = Some(issued());
+        assert_eq!(host_token_deny(&mut saved, "secret", before), None);
+        assert_eq!(
+            host_token_deny(&mut saved, "secret", before),
+            Some(HostDeny::TokenExpiredOrSpent)
+        );
+
+        for now in [deadline, after] {
+            let mut saved = Some(issued());
+
+            assert_eq!(
+                host_token_deny(&mut saved, "secret", now),
+                Some(HostDeny::TokenExpiredOrSpent)
+            );
+            assert!(saved.is_none());
+        }
+
+        let mut saved = Some(issued());
+        assert_eq!(
+            host_token_deny(&mut saved, "other", before),
+            Some(HostDeny::TokenMismatch)
+        );
+        assert!(saved.is_some());
+    }
+
+    #[test]
+    fn a_host_body_fits_the_cap_only_after_decoding() {
+        const PREFIX: &[u8] = br#"{"body":""#;
+        let mut exact = PREFIX.to_vec();
+        exact.resize(PREFIX.len() + DEFAULT_MAX_BODY_BYTES, b'x');
+        exact.extend_from_slice(b"\"}");
+        assert!(body_within_cap(&exact));
+
+        exact.truncate(PREFIX.len() + DEFAULT_MAX_BODY_BYTES);
+        exact.push(b'x');
+        exact.extend_from_slice(b"\"}");
+        assert!(!body_within_cap(&exact));
+        assert!(body_within_cap(b"not JSON"));
+        assert_eq!(base64_decoded_len("aGk="), 2);
+        assert_eq!(base64_decoded_len("aGk"), 2);
     }
 
     /// The accept loop calls `check` until the token deadline, so a flood of
