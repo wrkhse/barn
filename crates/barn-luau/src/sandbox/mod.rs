@@ -32,7 +32,7 @@ use deadline::Deadline;
 use errors::MAX_ENTRIES;
 use loading::load_plugin;
 use outcome::decode_outcome;
-use values::{json_to_lua, lua_key, lua_to_json, read_tool};
+use values::{json_to_lua, lua_key, lua_to_json, read_tool, tool_named};
 
 // The supported floor for the VM, its sandbox globals, and plugin startup.
 const MIN_MEMORY_BYTES: usize = 16 * 1024 * 1024;
@@ -195,9 +195,9 @@ impl Sandbox {
             .plugin
             .get::<Option<Table>>("tools")?
             .ok_or_else(|| EngineError::UnknownTool(name.to_owned()))?;
-        let definition = tools
-            .get::<Option<Table>>(name)?
-            .ok_or_else(|| EngineError::UnknownTool(name.to_owned()))?;
+        let Some(definition) = tool_named(&tools, name)? else {
+            return Err(EngineError::UnknownTool(name.to_owned()));
+        };
         let run = definition
             .get::<Option<Function>>("run")?
             .ok_or_else(|| EngineError::UnknownTool(name.to_owned()))?;

@@ -5,6 +5,10 @@ use crate::require::RequireCause;
 pub(super) const MAX_DEPTH: usize = 16;
 pub(super) const MAX_ENTRIES: usize = 1024;
 
+/// Mirrors the stall protocol's `MAX_LINE_BYTES` (8 MiB): a reply larger than
+/// a frame can never be sent, so conversion stops before it grows that large.
+pub(super) const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
 /// Why a bounded engine operation was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -12,6 +16,7 @@ pub enum LimitCause {
     Deadline,
     Memory,
     TooManyEntries { limit: usize },
+    TooLarge { limit: usize },
     TooDeep { limit: usize },
 }
 
@@ -23,6 +28,7 @@ impl fmt::Display for LimitCause {
             Self::TooManyEntries { limit } => {
                 write!(f, "too many table entries: {limit}")
             }
+            Self::TooLarge { limit } => write!(f, "output exceeds {limit} bytes"),
             Self::TooDeep { limit } => write!(f, "nesting deeper than {limit}"),
         }
     }
@@ -117,6 +123,12 @@ mod tests {
             (
                 LimitCause::TooDeep { limit: MAX_DEPTH },
                 format!("nesting deeper than {MAX_DEPTH}"),
+            ),
+            (
+                LimitCause::TooLarge {
+                    limit: MAX_OUTPUT_BYTES,
+                },
+                format!("output exceeds {MAX_OUTPUT_BYTES} bytes"),
             ),
         ] {
             assert_eq!(cause.to_string(), expected);

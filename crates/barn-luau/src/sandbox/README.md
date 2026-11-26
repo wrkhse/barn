@@ -1,6 +1,6 @@
 # Sandbox
 
-One mlua VM per plugin, bounded by a memory ceiling and a per-call clock.
+One mlua VM per stall Luau plugin, bounded by a memory ceiling and a per-call clock.
 A call arms the deadline, runs against the plugin's Luau table, and converts
 the result under depth and entry limits.
 

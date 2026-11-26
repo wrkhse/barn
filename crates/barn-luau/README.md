@@ -1,7 +1,8 @@
 # barn-luau
 
-Embed a Luau plugin in a Rust host. Each `Sandbox` loads `plugin.luau` into
-its own VM and exposes the plugin's hooks, named runnables, and manifest.
+Embed a stall's Luau plugin in a Rust host. Each `Sandbox` loads
+`plugin.luau` into its own VM and exposes the plugin's hooks, named runnables,
+and manifest.
 
 ## Run a hook and a runnable
 
@@ -79,7 +80,9 @@ Tool entries carry their name and other non-function fields.
 
 - `require` resolves from the calling module's folder and only loads modules
   within the plugin folder. It refuses absolute paths, parent components,
-  escaping symlinks, and cycles.
+  escaping symlinks, and cycles. It also refuses any regular file with more
+  than one link, with a named reason: std cannot enumerate every link, so even
+  a hard link whose other paths are inside the folder is refused.
 - The host sets a Luau allocator ceiling of at least 16 MiB and a time budget
   for startup, manifest reads, and each invocation. A hook or runnable request
   can shorten that budget. The VM interrupt stops runaway Luau code;

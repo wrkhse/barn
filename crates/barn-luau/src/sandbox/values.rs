@@ -1,24 +1,65 @@
-use std::collections::HashSet;
 use std::ffi::c_void;
 
 use mlua::{Lua, Table, Value as LuaValue};
 use serde_json::{Map, Value};
 
-use super::errors::{EngineError, LimitCause, MAX_DEPTH, MAX_ENTRIES};
+use super::errors::{EngineError, LimitCause, MAX_DEPTH, MAX_ENTRIES, MAX_OUTPUT_BYTES};
 
-/// Error text for a table reached twice in one conversion.
-const SHARED_TABLE: &str = "shared or cyclic Lua table in result";
+/// Error text for a table currently on the conversion path.
+const SHARED_TABLE: &str = "cyclic Lua table in result";
 
 /// The conversion-wide budget for converted entry visits: `MAX_DEPTH` times
-/// `MAX_ENTRIES`, or 16384 visits across the whole conversion. A tree whose
-/// total visits exceed that is refused even when each table stays within
-/// `MAX_ENTRIES` and depth stays within `MAX_DEPTH`.
+/// `MAX_ENTRIES`, or 16384 visits. Each table entry converted spends one
+/// visit, so the budget bounds work across the whole conversion, not just a
+/// single table. A shared acyclic table is visited once per path that reaches
+/// it, since the path stack only rules out cycles. A linear chain at the
+/// per-table caps uses exactly this budget; a branching tree can stay under
+/// `MAX_ENTRIES` per table and `MAX_DEPTH` in depth yet exceed the budget and
+/// be refused.
 const MAX_NODES: usize = MAX_DEPTH.saturating_mul(MAX_ENTRIES);
 
-pub(super) fn read_tool(table: &Table, key: &str) -> Result<(String, Value), EngineError> {
-    let name = table
+/// Bytes charged for the colon and comma separating a converted table entry.
+const ENTRY_OVERHEAD: usize = 2;
+
+/// Bytes charged for the braces surrounding a converted table.
+const TABLE_OVERHEAD: usize = 2;
+
+/// Length of a value once serialized as JSON, quotes and escapes included.
+fn serialized_len(value: &Value) -> Result<usize, EngineError> {
+    serde_json::to_string(value)
+        .map(|text| text.len())
+        .map_err(|error| EngineError::InvalidResult(error.to_string()))
+}
+
+pub(super) fn tool_name(table: &Table, key: &str) -> Result<String, EngineError> {
+    Ok(table
         .raw_get::<Option<String>>("name")?
-        .unwrap_or_else(|| key.to_owned());
+        .unwrap_or_else(|| key.to_owned()))
+}
+
+pub(super) fn tool_named(tools: &Table, name: &str) -> Result<Option<Table>, EngineError> {
+    // The tools table is bounded by the manifest entry cap, so per-run lookup
+    // work stays bounded even if a plugin populates it at runtime.
+    for (index, pair) in tools.pairs::<LuaValue, LuaValue>().enumerate() {
+        if index >= MAX_ENTRIES {
+            break;
+        }
+        let (key, value) = pair?;
+        let LuaValue::String(key) = key else {
+            continue;
+        };
+        let LuaValue::Table(table) = value else {
+            continue;
+        };
+        if tool_name(&table, &key.to_str()?)? == name {
+            return Ok(Some(table));
+        }
+    }
+    Ok(None)
+}
+
+pub(super) fn read_tool(table: &Table, key: &str) -> Result<(String, Value), EngineError> {
+    let name = tool_name(table, key)?;
     let description = table
         .raw_get::<Option<String>>("description")?
         .unwrap_or_default();
@@ -75,15 +116,18 @@ fn lua_index(index: usize) -> Result<i64, EngineError> {
 }
 
 /// Accept only positive integers inside the entry ceiling as array keys.
-fn array_position(index: impl TryInto<usize>) -> Result<usize, EngineError> {
-    let position = index
-        .try_into()
-        .map_err(|_| EngineError::InvalidResult("unsupported table key".into()))?;
-    if (1..=MAX_ENTRIES).contains(&position) {
-        Ok(position)
-    } else {
-        Err(EngineError::InvalidResult("unsupported table key".into()))
+fn array_position(index: i64) -> Result<usize, EngineError> {
+    if index <= 0 {
+        return Err(EngineError::InvalidResult("unsupported table key".into()));
     }
+    let position = usize::try_from(index)
+        .map_err(|_| EngineError::Limit(LimitCause::TooManyEntries { limit: MAX_ENTRIES }))?;
+    if position > MAX_ENTRIES {
+        return Err(EngineError::Limit(LimitCause::TooManyEntries {
+            limit: MAX_ENTRIES,
+        }));
+    }
+    Ok(position)
 }
 
 pub(super) fn json_to_lua(lua: &Lua, value: &Value, depth: usize) -> Result<LuaValue, EngineError> {
@@ -91,7 +135,7 @@ pub(super) fn json_to_lua(lua: &Lua, value: &Value, depth: usize) -> Result<LuaV
         return Err(EngineError::Limit(LimitCause::TooDeep { limit: MAX_DEPTH }));
     }
     match value {
-        Value::Null => Ok(LuaValue::Nil),
+        Value::Null => Ok(LuaValue::NULL),
         Value::Bool(value) => Ok(LuaValue::Boolean(*value)),
         Value::Number(value) => value.as_i64().map_or_else(
             || {
@@ -133,18 +177,31 @@ pub(super) fn json_to_lua(lua: &Lua, value: &Value, depth: usize) -> Result<LuaV
     }
 }
 
-/// Table identities and node count for one Lua-to-JSON conversion.
+/// Path, node visits and output bytes spent by one Lua-to-JSON conversion.
 struct Conversion {
-    visited: HashSet<*const c_void>,
+    path: Vec<*const c_void>,
     nodes: usize,
+    bytes: usize,
 }
 
 impl Conversion {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
-            visited: HashSet::new(),
+            path: Vec::new(),
             nodes: 0,
+            bytes: 0,
         }
+    }
+
+    /// Charge the byte length of a converted string against the output budget.
+    const fn charge_bytes(&mut self, len: usize) -> Result<(), EngineError> {
+        self.bytes = self.bytes.saturating_add(len);
+        if self.bytes > MAX_OUTPUT_BYTES {
+            return Err(EngineError::Limit(LimitCause::TooLarge {
+                limit: MAX_OUTPUT_BYTES,
+            }));
+        }
+        Ok(())
     }
 
     /// Charge one table entry against the conversion-wide node budget.
@@ -155,20 +212,26 @@ impl Conversion {
                 limit: MAX_NODES,
             }));
         }
-        Ok(())
+        self.charge_bytes(ENTRY_OVERHEAD)
     }
 
     fn value(&mut self, value: LuaValue, depth: usize) -> Result<Value, EngineError> {
         if let LuaValue::Table(table) = &value
-            && !self.visited.insert(table.to_pointer())
+            && self.path.contains(&table.to_pointer())
         {
             return Err(EngineError::InvalidResult(SHARED_TABLE.into()));
         }
         if depth > MAX_DEPTH {
             return Err(EngineError::Limit(LimitCause::TooDeep { limit: MAX_DEPTH }));
         }
+        if let LuaValue::Table(table) = &value {
+            self.charge_bytes(TABLE_OVERHEAD)?;
+            self.path.push(table.to_pointer());
+            let result = self.table(table, depth);
+            self.path.pop();
+            return result;
+        }
         match value {
-            LuaValue::Table(table) => self.table(&table, depth),
             LuaValue::Nil => Ok(Value::Null),
             LuaValue::LightUserData(value) if value.0.is_null() => Ok(Value::Null),
             LuaValue::Boolean(value) => Ok(Value::Bool(value)),
@@ -176,7 +239,12 @@ impl Conversion {
             LuaValue::Number(value) => serde_json::Number::from_f64(value)
                 .map(Value::Number)
                 .ok_or_else(|| EngineError::InvalidResult("non-finite Lua number".into())),
-            LuaValue::String(value) => Ok(Value::String(value.to_str()?.to_string())),
+            LuaValue::String(value) => {
+                let text = value.to_str()?;
+                let string = Value::String(text.to_string());
+                self.charge_bytes(serialized_len(&string)?)?;
+                Ok(string)
+            }
             _ => Err(EngineError::InvalidResult("unsupported Lua value".into())),
         }
     }
@@ -201,7 +269,10 @@ impl Conversion {
                     }
                     array_mode = Some(false);
                     let converted = self.value(value, depth.saturating_add(1))?;
-                    object.insert(key.to_str()?.to_string(), converted);
+                    let text = key.to_str()?.to_string();
+                    let key_value = Value::String(text.clone());
+                    self.charge_bytes(serialized_len(&key_value)?)?;
+                    object.insert(text, converted);
                 }
                 LuaValue::Integer(index) => {
                     let position = array_position(index)?;
@@ -259,6 +330,34 @@ mod tests {
     }
 
     #[test]
+    fn tool_name_uses_the_key_unless_the_table_names_itself() {
+        let lua = Lua::new();
+        let table = lua.create_table().unwrap();
+        assert_eq!(tool_name(&table, "key").unwrap(), "key");
+        table.set("name", "named").unwrap();
+        assert_eq!(tool_name(&table, "key").unwrap(), "named");
+    }
+
+    #[test]
+    fn tool_named_finds_a_table_by_its_name_and_skips_other_entries() {
+        let lua = Lua::new();
+        let tools = lua.create_table().unwrap();
+
+        let numbered = lua.create_table().unwrap();
+        numbered.set("name", "wanted").unwrap();
+        tools.set(1i64, numbered).unwrap();
+        tools.set("plain", "wanted").unwrap();
+
+        let wanted = lua.create_table().unwrap();
+        wanted.set("name", "wanted").unwrap();
+        tools.set("fallback", wanted.clone()).unwrap();
+
+        let found = tool_named(&tools, "wanted").unwrap().unwrap();
+        assert_eq!(found.to_pointer(), wanted.to_pointer());
+        assert!(tool_named(&tools, "absent").unwrap().is_none());
+    }
+
+    #[test]
     fn lua_index_converts_the_position_exactly() {
         assert_eq!(lua_index(0), Ok(0));
         assert_eq!(lua_index(1), Ok(1));
@@ -282,10 +381,38 @@ mod tests {
             Ok(MAX_ENTRIES)
         );
 
-        let over = i64::try_from(MAX_ENTRIES + 1).unwrap();
-        for bad in [0i64, -1, over] {
-            assert_eq!(array_position(bad), Err(unsupported()), "key {bad}");
-        }
+        assert_eq!(array_position(0i64), Err(unsupported()));
+        assert_eq!(array_position(-1i64), Err(unsupported()));
+        assert_eq!(
+            array_position(i64::try_from(MAX_ENTRIES.saturating_add(1)).unwrap()),
+            Err(EngineError::Limit(LimitCause::TooManyEntries {
+                limit: MAX_ENTRIES
+            }))
+        );
+    }
+
+    #[test]
+    fn array_position_refuses_i64_max_as_an_entry_limit() {
+        assert_eq!(
+            array_position(i64::MAX),
+            Err(EngineError::Limit(LimitCause::TooManyEntries {
+                limit: MAX_ENTRIES
+            }))
+        );
+    }
+
+    #[test]
+    fn lua_table_to_json_refuses_an_out_of_ceiling_array_key() {
+        let lua = Lua::new();
+        let table = lua.create_table().unwrap();
+        let past_cap = i64::try_from(MAX_ENTRIES.saturating_add(1)).unwrap();
+        table.set(past_cap, "a").unwrap();
+        assert_eq!(
+            lua_table_to_json(&table, 0),
+            Err(EngineError::Limit(LimitCause::TooManyEntries {
+                limit: MAX_ENTRIES
+            }))
+        );
     }
 
     #[test]
@@ -400,11 +527,27 @@ mod tests {
     fn json_to_lua_accepts_depth_16_and_refuses_depth_17() {
         let lua = Lua::new();
 
-        assert_eq!(json_to_lua(&lua, &Value::Null, 16), Ok(LuaValue::Nil));
+        assert_eq!(json_to_lua(&lua, &Value::Null, 16), Ok(LuaValue::NULL));
         assert_eq!(
             json_to_lua(&lua, &Value::Null, 17),
             Err(EngineError::Limit(LimitCause::TooDeep { limit: 16 }))
         );
+    }
+
+    #[test]
+    fn json_to_lua_round_trips_an_object_with_a_null_field() {
+        let lua = Lua::new();
+        let input = serde_json::json!({ "keep": null, "value": 1 });
+        let converted = json_to_lua(&lua, &input, 0).unwrap();
+        assert_eq!(lua_to_json(converted, 0).unwrap(), input);
+    }
+
+    #[test]
+    fn json_to_lua_round_trips_an_array_with_a_null_slot() {
+        let lua = Lua::new();
+        let input = serde_json::json!([1, null, 3]);
+        let converted = json_to_lua(&lua, &input, 0).unwrap();
+        assert_eq!(lua_to_json(converted, 0).unwrap(), input);
     }
 
     #[test]
@@ -461,29 +604,103 @@ mod tests {
     #[test]
     fn lua_to_json_refuses_a_shared_table_dag() {
         let lua = Lua::new();
-        let mut tables = Vec::with_capacity(16);
-        for _ in 0..16 {
+        let depth = MAX_DEPTH;
+        let mut tables = Vec::with_capacity(depth);
+        for _ in 0..depth {
             tables.push(lua.create_table().unwrap());
         }
 
-        // Each table's entries all point at the next one, so without the
-        // visited set this 16-table, 1024-way shape expands to 1024^15
-        // visits. The leaf integers sit at depth 16, within MAX_DEPTH, so
-        // they convert; the revisit of a table is caught by table identity
-        // rather than the depth limit reporting TooDeep.
-        for index in 0..15usize {
+        // Each table's entries all point at the next one. A path stack allows
+        // sibling reuse, so this MAX_DEPTH-table, MAX_ENTRIES-way DAG expands
+        // until the conversion-wide node budget stops it instead of a shared
+        // table error.
+        for index in 0..depth.saturating_sub(1) {
             let child = tables[index.saturating_add(1)].clone();
             for key in 0..MAX_ENTRIES {
                 tables[index].set(format!("k{key}"), child.clone()).unwrap();
             }
         }
+        let leaf = depth.saturating_sub(1);
         for key in 0..MAX_ENTRIES {
-            tables[15].set(format!("k{key}"), 1i64).unwrap();
+            tables[leaf].set(format!("k{key}"), 1i64).unwrap();
         }
 
         assert_eq!(
             lua_to_json(LuaValue::Table(tables[0].clone()), 0),
-            Err(shared_table())
+            Err(EngineError::Limit(LimitCause::TooManyEntries {
+                limit: MAX_NODES
+            }))
+        );
+    }
+
+    #[test]
+    fn lua_to_json_refuses_a_shared_large_string_past_the_output_budget() {
+        const ONE_MIB: usize = 1024 * 1024;
+        let lua = Lua::new();
+
+        let blob = vec![b'x'; ONE_MIB];
+        let shared = lua.create_table().unwrap();
+        shared
+            .set("blob", lua.create_string(blob.as_slice()).unwrap())
+            .unwrap();
+
+        let root = lua.create_table().unwrap();
+        for child in 0..16 {
+            let holder = lua.create_table().unwrap();
+            holder.set("shared", shared.clone()).unwrap();
+            root.set(format!("k{child}"), holder).unwrap();
+        }
+
+        assert_eq!(
+            lua_to_json(LuaValue::Table(root), 0),
+            Err(EngineError::Limit(LimitCause::TooLarge {
+                limit: MAX_OUTPUT_BYTES
+            }))
+        );
+    }
+
+    #[test]
+    fn lua_to_json_refuses_an_escaped_shared_string_past_the_output_budget() {
+        const ONE_MIB: usize = 1024 * 1024;
+        let lua = Lua::new();
+
+        // Byte 1 serializes as a six-byte escape, so the 1 MiB blob becomes
+        // 6 MiB of JSON while its raw Lua length is only 1 MiB. Two holders
+        // convert it twice, which overshoots the 8 MiB output budget only
+        // when escaped lengths are charged.
+        let blob = vec![1u8; ONE_MIB];
+        let shared = lua.create_table().unwrap();
+        shared
+            .set("blob", lua.create_string(blob.as_slice()).unwrap())
+            .unwrap();
+
+        let root = lua.create_table().unwrap();
+        for child in 0..2 {
+            let holder = lua.create_table().unwrap();
+            holder.set("shared", shared.clone()).unwrap();
+            root.set(format!("k{child}"), holder).unwrap();
+        }
+
+        assert_eq!(
+            lua_to_json(LuaValue::Table(root), 0),
+            Err(EngineError::Limit(LimitCause::TooLarge {
+                limit: MAX_OUTPUT_BYTES
+            }))
+        );
+    }
+
+    #[test]
+    fn lua_to_json_converts_a_table_shared_by_siblings() {
+        let lua = Lua::new();
+        let child = lua.create_table().unwrap();
+        child.set("v", 1i64).unwrap();
+        let root = lua.create_table().unwrap();
+        root.set("a", child.clone()).unwrap();
+        root.set("b", child).unwrap();
+
+        assert_eq!(
+            lua_to_json(LuaValue::Table(root), 0),
+            Ok(serde_json::json!({ "a": { "v": 1 }, "b": { "v": 1 } }))
         );
     }
 
@@ -554,5 +771,22 @@ mod tests {
         }
 
         assert!(lua_to_json(LuaValue::Table(root), 0).is_ok());
+    }
+
+    #[test]
+    fn lua_to_json_accepts_exactly_the_output_budget() {
+        let lua = Lua::new();
+
+        // One root entry serializes to exactly 8 MiB: 2 table braces, 2 entry
+        // separators, a 3-byte quoted key ("k"), and an 8_388_601-byte quoted
+        // value (8_388_599 'x' bytes plus 2 quotes). Literal counts keep this
+        // boundary independent of the named limit.
+        let blob = vec![b'x'; 8_388_599];
+        let root = lua.create_table().unwrap();
+        root.set("k", lua.create_string(blob.as_slice()).unwrap())
+            .unwrap();
+
+        let expected = serde_json::json!({ "k": String::from_utf8(blob).unwrap() });
+        assert_eq!(lua_to_json(LuaValue::Table(root), 0), Ok(expected));
     }
 }

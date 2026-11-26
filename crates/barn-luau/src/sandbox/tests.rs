@@ -771,6 +771,54 @@ fn a_runnable_returns_json_without_a_content_envelope() {
 }
 
 #[test]
+fn a_tool_is_run_by_its_manifest_name_not_its_table_key() {
+    let scratch = Scratch::new();
+    scratch.write(
+        "plugin.luau",
+        r#"
+        return {
+            name = "renamed",
+            tools = {
+                internal = {
+                    name = "public",
+                    run = function(input, ctx)
+                        return {
+                            content = {
+                                { kind = "text", text = "renamed tool ran" },
+                            },
+                        }
+                    end,
+                },
+            },
+        }
+        "#,
+    );
+    let sandbox = Sandbox::new(scratch.path(), default_limits(), Capabilities::default())
+        .expect("fixture loads");
+
+    assert_eq!(
+        sandbox.manifest(),
+        Ok(json!({
+            "name": "renamed",
+            "needs": [],
+            "tools": [{
+                "name": "public",
+                "description": "",
+                "input": {},
+            }],
+        }))
+    );
+    assert_eq!(
+        sandbox.run("public", &json!({}), DEFAULT_DEADLINE_MS),
+        Ok(json!({ "content": [{ "kind": "text", "text": "renamed tool ran" }] }))
+    );
+    assert_eq!(
+        sandbox.run("internal", &json!({}), DEFAULT_DEADLINE_MS),
+        Err(EngineError::UnknownTool("internal".into()))
+    );
+}
+
+#[test]
 fn global_require_is_a_refuser_through_getfenv() {
     let (_scratch, sandbox) = fixture(default_limits());
     let lua = &sandbox.lua;
