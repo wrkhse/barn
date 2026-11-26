@@ -29,9 +29,10 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
   the connection, issuing no new token without a restart. Failures at this
   boundary are named denies, each in `data.reason` on a `DENIED_CODE`
   error; `barn-stall`'s `deny` module names every reason. The socket path and
-  token reach the embedding host in-process, as the `HostEndpoint` value that
-  `Supervisor::start_for_host` returns; no environment variable or file carries
-  them to tack.
+  token reach the embedding host in-process: the embedding host calls
+  `RunningStall::host_endpoint()` after `Supervisor::start_for_host` and receives
+  the path and token there; no environment variable or file carries them to
+  tack.
 - The stall connects and sends `stall.start` as its first message. barn checks
   that the peer PID matches the child it spawned and that the peer UID owns
   the socket. A missing peer PID fails authentication. The stall declares its
@@ -59,8 +60,7 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
   UTF-8 when the bytes are valid UTF-8 and the line still fits `MAX_LINE_BYTES`,
   and base64 otherwise, with `body_encoding` saying which. A body over the cap
   is refused: barn answers the stall with an error naming the cap, and a stall
-  that sends one has broken the protocol. _For a later slice to confirm: that error's
-  code._
+  that sends one has broken the protocol.
 
 ## Versions
 
@@ -255,8 +255,5 @@ The plan fixes these methods' names and directions. These details remain open:
 - whether `Job.every` is a duration grammar, and which one.
 - how barn reports an unsupported version: the stall sends its version in
   `stall.start`'s `protocol` field.
-- the code of the error barn answers with when a body is over its cap.
 - the payloads of the frames barn brokers between tack and the stall on
-  `host.sock`, past the framed contract above;
-- whether a `host.start` failure writes the named deny line before closing
-  for every reason, and whether its `data` carries fields besides `reason`.
+  `host.sock`, past the framed contract above.
