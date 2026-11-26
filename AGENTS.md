@@ -6,8 +6,8 @@ its background jobs such as polling, and the events it emits. barn starts each
 stall in its own sandboxed child process, holds every listener and speaks its
 protocol, and brokers the network, secrets, webhooks, MCP and upgrades.
 
-The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1). Slice B0,
-this repository and its gates, is what exists today; B1 builds the supervisor.
+The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1). Slices B0
+(the repository and its gates) and B1 (the supervisor) are in place.
 
 ## Vocabulary
 
@@ -29,16 +29,16 @@ stall's own JavaScript, which `barn-plugin-host` runs when that crate exists.
 
 ## Layout
 
-| Path                                                  | What it holds                                                                      |
-| ----------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| `crates/barn`                                         | the `barn` library and binary hold the supervisor, listeners and CLI               |
-| `crates/barn-exec`                                    | the sandbox helper: applies a grant's policy, then execs the stall                 |
-| `crates/barn-stall`                                   | the Rust stall SDK: the protocol's version, limits, method names and message types |
-| `docs/stall-protocol.md`                              | the protocol as it is fixed; anything not fixed is marked "for B1 to confirm"      |
-| [grant](https://github.com/wrkhse/barn/issues/14)     | the grant contract and its planned crate                                           |
-| [steering](https://github.com/wrkhse/barn/issues/15)  | the steering contract and its planned crate                                        |
-| [approvals](https://github.com/wrkhse/barn/issues/16) | the approvals contract and its planned crate                                       |
-| [control](https://github.com/wrkhse/barn/issues/17)   | the control contract and its planned crate                                         |
+| Path                                                  | What it holds                                                                            |
+| ----------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| `crates/barn`                                         | the `barn` library and binary hold the supervisor, listeners and CLI                     |
+| `crates/barn-exec`                                    | the sandbox helper: applies a grant's policy, then execs the stall                       |
+| `crates/barn-stall`                                   | the Rust stall SDK: the protocol's version, limits, method names and message types       |
+| `docs/stall-protocol.md`                              | the protocol as it is fixed; anything not fixed is marked "for a later slice to confirm" |
+| [grant](https://github.com/wrkhse/barn/issues/14)     | the grant contract and its planned crate                                                 |
+| [steering](https://github.com/wrkhse/barn/issues/15)  | the steering contract and its planned crate                                              |
+| [approvals](https://github.com/wrkhse/barn/issues/16) | the approvals contract and its planned crate                                             |
+| [control](https://github.com/wrkhse/barn/issues/17)   | the control contract and its planned crate                                               |
 
 ## Build and gate
 
@@ -93,7 +93,7 @@ in place (barn#21 Decided, supervisor 2026-11-25).
 `crates/barn-stall` and `docs/stall-protocol.md` change in the same commit.
 After the first release, fields are only added within a version; a rename or a
 removal is a new version, and barn speaks the current version and the one
-before it. Anything the plan does not fix stays marked "for B1 to confirm"
+before it. Anything the plan does not fix stays marked "for a later slice to confirm"
 and unbuilt.
 
 ## Branches

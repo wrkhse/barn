@@ -1,7 +1,7 @@
 # The stall protocol
 
-**Status: version 1 is a draft until barn's first release.** The page records
-what the plan fixes and names the open questions under "for B1 to confirm".
+**Status: version 1 is a draft until barn's first release.** The page records what
+the plan fixes and names the open questions under "for a later slice to confirm".
 
 A stall is a project's logic in its own child process: its request handlers, the
 jobs it runs and the events it emits. barn starts it, restarts it, holds its
@@ -37,14 +37,14 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
   is held to the same limit: a reply that would be longer is never sent, and
   the stall gets the same `-32600` line before the connection closes. The
   error line is fixed under "The messages fixed so far".
-- Calls in flight are bounded. _For B1 to confirm: the bound, and what a stall is
-  sent when its answers would exceed it._
+- Calls in flight are bounded. _For a later slice to confirm: the bound, and what a
+  stall is sent when its answers would exceed it._
 - Bodies are inline, and the cap counts decoded bytes: at most 4 MiB, the
   grant's `DEFAULT_MAX_BODY_BYTES` by default. A side that sends a body uses
   UTF-8 when the bytes are valid UTF-8 and the line still fits `MAX_LINE_BYTES`,
   and base64 otherwise, with `body_encoding` saying which. A body over the cap
   is refused: barn answers the stall with an error naming the cap, and a stall
-  that sends one has broken the protocol. _For B1 to confirm: that error's
+  that sends one has broken the protocol. _For a later slice to confirm: that error's
   code._
 
 ## Versions
@@ -138,7 +138,7 @@ on this page in that crate's tests, which read this file with `include_str!`:
 
 The plan's sketch shows a response's headers as one JSON object and its body as
 one string. Some things in HTTP cannot be carried that way, so these types go
-past the sketch and B1 confirms them:
+past the sketch and a later slice confirms them:
 
 - a response's headers are a list of name and value pairs, names lower-cased,
   so a name that repeats, such as `set-cookie`, keeps every value;
@@ -151,8 +151,8 @@ past the sketch and B1 confirms them:
 - a header whose value is not valid UTF-8 is dropped, and barn logs it once per
   request with its name; the request or response still goes through.
 
-_For B1 to confirm: whether a JSON-RPC id is an integer, a string or both, and
-whether `net.request`'s `auth.as` has values beyond `bearer`._
+_For a later slice to confirm: whether a JSON-RPC id is an integer, a string or both,
+and whether `net.request`'s `auth.as` has values beyond `bearer`._
 
 ## The framed hook and tool contract
 
@@ -191,7 +191,7 @@ access to a tool or a session.
 | `DENIED_CODE`            | `-32001`  | the error code for `denied`              |
 | `TOKEN_TTL_SECS`         | `30`      | seconds before a start token expires     |
 
-## For B1 to confirm
+## For a later slice to confirm
 
 The plan fixes these methods' names and directions. These details remain open:
 
