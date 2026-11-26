@@ -574,8 +574,9 @@ impl RunningStall {
     /// Accepts tack on `host.sock` and answers `host.start`.
     ///
     /// Every refusal is written to the peer as a named `denied` reply before
-    /// the connection closes; wrong peers are never retried in a loop. A token
-    /// at or past its deadline is dropped, so only a restart issues a new one.
+    /// the connection closes; wrong peers are never retried in a loop. A spent
+    /// or expired token still answers the next host with `TokenExpiredOrSpent`
+    /// on the wire, and only a restart issues a new one.
     ///
     /// # Errors
     /// Returns the named denial, a timeout, or the failing I/O stage.
@@ -583,23 +584,17 @@ impl RunningStall {
         let Some(daemon_pid) = self.host.daemon_pid else {
             return Err(SupervisorError::HostDenied(HostDeny::WrongPeerPid));
         };
-        let remaining = self.host.token.as_ref().map_or(Duration::ZERO, |token| {
-            token.expires_at.saturating_duration_since(Instant::now())
-        });
-        let accepted = timeout(remaining, self.host.accept(daemon_pid, &self.spec.name)).await;
 
-        if let Ok(result) = accepted {
-            result
-        } else {
-            self.host.token = None;
-
-            Err(SupervisorError::HostDenied(HostDeny::TokenExpiredOrSpent))
-        }
+        self.host
+            .accept_with_deadline(daemon_pid, &self.spec.name)
+            .await
     }
 
     /// Brokers one framed request from `host` to the stall and its reply back.
     ///
     /// The frame bytes travel unchanged: no hook payload is read or changed.
+    /// A stalled or failed write to the stall leaves that connection dead: no
+    /// further frame can be brokered on it, and the host is denied.
     ///
     /// # Errors
     /// Returns a named denial for an oversize frame, a lost peer or a stalled
@@ -609,29 +604,7 @@ impl RunningStall {
         host: &mut BufReader<UnixStream>,
         stall: &mut BufReader<UnixStream>,
     ) -> Result<()> {
-        let frame = match read_line_bounded(host).await {
-            Ok(frame) => frame,
-            Err(host_deny) => return refuse(host, &Value::Null, host_deny).await,
-        };
-        if !body_within_cap(&frame) {
-            return refuse(host, &Value::Null, HostDeny::OversizeBody).await;
-        }
-        let sent = timeout(HOST_REPLY_TIMEOUT, stall.write_all(&frame)).await;
-
-        if !matches!(sent, Ok(Ok(()))) {
-            return refuse(host, &Value::Null, HostDeny::PeerLoss).await;
-        }
-
-        let reply = timeout(HOST_REPLY_TIMEOUT, read_line_bounded(stall)).await;
-        let line = match reply {
-            Ok(Ok(line)) => line,
-            Ok(Err(host_deny)) => return refuse(host, &Value::Null, host_deny).await,
-            Err(_) => return refuse(host, &Value::Null, HostDeny::StalledReply).await,
-        };
-        if !body_within_cap(&line) {
-            return refuse(host, &Value::Null, HostDeny::OversizeBody).await;
-        }
-        io_at("answering host frame", host.write_all(&line).await)
+        broker_host_frame(host, stall, HOST_REPLY_TIMEOUT).await
     }
 
     /// Accepts a connection from the child and responds to its start request.
@@ -1040,6 +1013,38 @@ impl Transport {
 }
 
 impl HostTransport {
+    /// Accepts one host connection within the token's remaining lifetime.
+    ///
+    /// A token that is already spent or past its deadline takes the next
+    /// connection and lets the handshake write the named deny on the wire;
+    /// the token stays spent. When no host arrives before the deadline, the
+    /// token is dropped with no peer to answer.
+    async fn accept_with_deadline(
+        &mut self,
+        daemon_pid: u32,
+        stall_name: &str,
+    ) -> Result<BufReader<UnixStream>> {
+        let remaining = self.token.as_ref().map_or(Duration::ZERO, |token| {
+            token.expires_at.saturating_duration_since(Instant::now())
+        });
+
+        if remaining.is_zero() {
+            self.token = None;
+
+            return self.accept(daemon_pid, stall_name).await;
+        }
+
+        let accepted = timeout(remaining, self.accept(daemon_pid, stall_name)).await;
+
+        if let Ok(result) = accepted {
+            result
+        } else {
+            self.token = None;
+
+            Err(SupervisorError::HostDenied(HostDeny::TokenExpiredOrSpent))
+        }
+    }
+
     /// Accepts one host connection and completes the `host.start` handshake.
     async fn accept(&mut self, daemon_pid: u32, stall_name: &str) -> Result<BufReader<UnixStream>> {
         let (stream, _) = io_at("accepting host socket", self.listener.accept().await)?;
@@ -1182,6 +1187,56 @@ async fn refuse<T>(
     io_at("answering host denial", host.write_all(&frame).await)?;
 
     Err(SupervisorError::HostDenied(host_deny))
+}
+
+/// Forwards one host frame to the stall and copies its reply back, with every
+/// I/O step bounded by `limit`.
+async fn broker_host_frame(
+    host: &mut BufReader<UnixStream>,
+    stall: &mut BufReader<UnixStream>,
+    limit: Duration,
+) -> Result<()> {
+    let frame = match read_line_bounded(host).await {
+        Ok(frame) => frame,
+        Err(host_deny) => return refuse(host, &Value::Null, host_deny).await,
+    };
+    if !body_within_cap(&frame) {
+        return refuse(host, &Value::Null, HostDeny::OversizeBody).await;
+    }
+
+    // A partial write leaves a half frame on the stall stream. That
+    // connection is dead from here: no further frame can be brokerable on it,
+    // so barn denies this host instead of trying to resynchronize.
+    let sent = timeout(limit, stall.write_all(&frame)).await;
+
+    if !matches!(sent, Ok(Ok(()))) {
+        return refuse(host, &Value::Null, HostDeny::PeerLoss).await;
+    }
+
+    let reply = timeout(limit, read_line_bounded(stall)).await;
+    let line = match reply {
+        Ok(Ok(line)) => line,
+        Ok(Err(host_deny)) => return refuse(host, &Value::Null, host_deny).await,
+        Err(_) => return refuse(host, &Value::Null, HostDeny::StalledReply).await,
+    };
+    if !body_within_cap(&line) {
+        return refuse(host, &Value::Null, HostDeny::OversizeBody).await;
+    }
+
+    answer_host(host, &line, limit).await
+}
+
+/// Copies one reply line to the host, denying `StalledReply` if it stops
+/// taking bytes before the deadline.
+async fn answer_host(
+    host: &mut (impl AsyncWrite + Unpin),
+    line: &[u8],
+    limit: Duration,
+) -> Result<()> {
+    match timeout(limit, host.write_all(line)).await {
+        Ok(result) => io_at("answering host frame", result),
+        Err(_) => refuse(host, &Value::Null, HostDeny::StalledReply).await,
+    }
 }
 
 /// Whether a frame's inline body fits the cap after decoding.
@@ -1684,6 +1739,8 @@ fn io_at<T>(operation: &'static str, result: io::Result<T>) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::FileTypeExt as _;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
 
     use super::*;
 
@@ -1816,6 +1873,207 @@ mod tests {
             secret: "secret".to_owned(),
             expires_at,
         }
+    }
+
+    /// A complete `host.start` line for the daemon barn expects.
+    fn host_start(pid: u32, token: &str) -> Vec<u8> {
+        let mut line = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": method::HOST_START,
+            "params": {"protocol": PROTOCOL_VERSION, "token": token, "pid": pid}
+        }))
+        .expect("host.start JSON");
+        line.push(b'\n');
+
+        line
+    }
+
+    /// A host transport bound to `root/host.sock`, expecting this process.
+    fn test_host_transport(root: &Path, token: Option<Token>) -> HostTransport {
+        let socket = root.join(HOST_SOCKET_FILE);
+        let std_listener = StdUnixListener::bind(&socket).expect("host socket");
+        std_listener
+            .set_nonblocking(true)
+            .expect("nonblocking host socket");
+        let owner = fs::metadata(&socket).expect("socket owner").uid();
+        let listener = UnixListener::from_std(std_listener).expect("host listener");
+
+        HostTransport {
+            listener,
+            token,
+            daemon_pid: Some(std::process::id()),
+            uid: owner,
+        }
+    }
+
+    /// The exact `denied` reply, with the id the request carried.
+    fn denied(id: &Value, reason: &str) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": DENIED_CODE,
+                "message": "denied",
+                "data": {"reason": reason}
+            }
+        })
+    }
+
+    /// The one deny line a host reads before barn closes its connection.
+    async fn read_deny(peer: &mut UnixStream) -> Value {
+        let mut reply = Vec::new();
+        timeout(Duration::from_millis(500), peer.read_to_end(&mut reply))
+            .await
+            .expect("deny arrives")
+            .expect("read deny");
+        assert_eq!(reply.last(), Some(&b'\n'));
+        let line = reply.strip_suffix(b"\n").expect("newline");
+        assert!(!line.contains(&b'\n'), "one line only");
+
+        serde_json::from_slice(line).expect("deny JSON")
+    }
+
+    #[tokio::test]
+    async fn a_spent_host_token_still_writes_the_named_deny_on_the_wire() {
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("the past deadline fits");
+
+        for token in [Some(issued(past)), None] {
+            let fixture = PrepareFixture::new();
+            let socket = fixture.0.join(HOST_SOCKET_FILE);
+            let mut transport = test_host_transport(&fixture.0, token);
+            let daemon = std::process::id();
+            let mut peer = UnixStream::connect(&socket).await.expect("host connects");
+            peer.write_all(&host_start(daemon, "secret"))
+                .await
+                .expect("host.start");
+
+            let refused = transport.accept_with_deadline(daemon, "fixture").await;
+
+            assert!(matches!(
+                refused,
+                Err(SupervisorError::HostDenied(HostDeny::TokenExpiredOrSpent))
+            ));
+            assert!(transport.token.is_none());
+            assert_eq!(
+                read_deny(&mut peer).await,
+                denied(&json!(21), deny::TOKEN_EXPIRED_OR_SPENT)
+            );
+        }
+    }
+
+    /// A sink that takes no bytes on the first write and captures the rest.
+    struct StalledWriter {
+        written: Vec<u8>,
+        pending: bool,
+    }
+
+    impl StalledWriter {
+        fn new() -> Self {
+            Self {
+                written: Vec::new(),
+                pending: true,
+            }
+        }
+    }
+
+    impl AsyncWrite for StalledWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.pending {
+                self.pending = false;
+
+                return Poll::Pending;
+            }
+            self.written.extend_from_slice(buf);
+
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_that_stops_taking_the_reply_gets_the_stalled_reply_deny() {
+        let reply = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n";
+        let mut writer = StalledWriter::new();
+
+        let stalled = answer_host(&mut writer, reply, Duration::from_millis(20)).await;
+
+        assert!(matches!(
+            stalled,
+            Err(SupervisorError::HostDenied(HostDeny::StalledReply))
+        ));
+        assert_eq!(writer.written.last(), Some(&b'\n'));
+        let line = writer.written.strip_suffix(b"\n").expect("one line");
+        assert_eq!(
+            serde_json::from_slice::<Value>(line).expect("deny JSON"),
+            denied(&Value::Null, deny::CLOSED_SOCKET)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dead_stall_peer_denies_the_host_with_peer_loss() {
+        let (host_barn, mut host_peer) = UnixStream::pair().expect("host pair");
+        let (stall_barn, stall_peer) = UnixStream::pair().expect("stall pair");
+        drop(stall_peer);
+        let mut host = BufReader::new(host_barn);
+        let mut stall = BufReader::new(stall_barn);
+
+        host_peer
+            .write_all(&host_start(1, "secret"))
+            .await
+            .expect("host frame");
+        let result = broker_host_frame(&mut host, &mut stall, Duration::from_millis(100)).await;
+
+        assert!(matches!(
+            result,
+            Err(SupervisorError::HostDenied(HostDeny::PeerLoss))
+        ));
+        assert_eq!(
+            read_deny(&mut host_peer).await,
+            denied(&Value::Null, deny::CLOSED_SOCKET)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partial_stall_write_denies_the_host_with_peer_loss() {
+        let (host_barn, mut host_peer) = UnixStream::pair().expect("host pair");
+        let (stall_barn, stall_peer) = UnixStream::pair().expect("stall pair");
+        let mut host = BufReader::new(host_barn);
+        let mut stall = BufReader::new(stall_barn);
+        // Far more than a socket buffer: the timed write gets part way in.
+        let mut frame = vec![b'x'; 1 << 20];
+        frame.push(b'\n');
+        let writing = async {
+            host_peer.write_all(&frame).await.expect("large host frame");
+        };
+
+        let (result, ()) = tokio::join!(
+            broker_host_frame(&mut host, &mut stall, Duration::from_millis(20)),
+            writing
+        );
+
+        assert!(matches!(
+            result,
+            Err(SupervisorError::HostDenied(HostDeny::PeerLoss))
+        ));
+        assert_eq!(
+            read_deny(&mut host_peer).await,
+            denied(&Value::Null, deny::CLOSED_SOCKET)
+        );
+        drop(stall_peer);
     }
 
     /// A transport bound to `root/proto.sock`, with a token at `expiry`.

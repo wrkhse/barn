@@ -243,12 +243,32 @@ mod tests {
 
     const PAGE: &str = include_str!("../../../docs/stall-protocol.md");
 
-    /// Every JSON-RPC line on the protocol page, parsed.
+    /// Every JSON-RPC object on the protocol page, parsed, wrapped or not.
     fn lines() -> Vec<Value> {
-        PAGE.lines()
-            .filter(|line| line.starts_with("{\"jsonrpc\""))
-            .map(|line| serde_json::from_str(line).expect("the page's JSON line"))
-            .collect()
+        let mut objects = Vec::new();
+        let mut buffer = String::new();
+        let mut depth: i32 = 0;
+
+        for line in PAGE.lines() {
+            if buffer.is_empty() && !line.trim_start().starts_with('{') {
+                continue;
+            }
+
+            buffer.push_str(line);
+            buffer.push(' ');
+            depth = line.chars().fold(depth, |n, c| match c {
+                '{' => n.saturating_add(1),
+                '}' => n.saturating_sub(1),
+                _ => n,
+            });
+
+            if depth == 0 {
+                objects.push(serde_json::from_str(&buffer).expect("the page's JSON object"));
+                buffer.clear();
+            }
+        }
+
+        objects
     }
 
     #[test]
