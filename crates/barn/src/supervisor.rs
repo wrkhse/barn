@@ -1233,10 +1233,12 @@ async fn answer_host(
     line: &[u8],
     limit: Duration,
 ) -> Result<()> {
-    match timeout(limit, host.write_all(line)).await {
-        Ok(result) => io_at("answering host frame", result),
-        Err(_) => refuse(host, &Value::Null, HostDeny::StalledReply).await,
+    if let Ok(result) = timeout(limit, host.write_all(line)).await {
+        return io_at("answering host frame", result);
     }
+
+    refuse(host, &Value::Null, HostDeny::StalledReply).await?;
+    Err(SupervisorError::HostDenied(HostDeny::StalledReply))
 }
 
 /// Whether a frame's inline body fits the cap after decoding.
@@ -2036,6 +2038,7 @@ mod tests {
             .await
             .expect("host frame");
         let result = broker_host_frame(&mut host, &mut stall, Duration::from_millis(100)).await;
+        drop(host);
 
         assert!(matches!(
             result,
@@ -2064,6 +2067,7 @@ mod tests {
             broker_host_frame(&mut host, &mut stall, Duration::from_millis(20)),
             writing
         );
+        drop(host);
 
         assert!(matches!(
             result,
