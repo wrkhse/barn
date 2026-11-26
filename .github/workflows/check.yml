@@ -8,6 +8,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      full_tree:
+        description: "Run mutants on the whole tree instead of the pull request diff"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -174,7 +179,7 @@ jobs:
       - name: The diff to mutate
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
-          IS_MAIN: ${{ github.ref == 'refs/heads/main' }}
+          IS_MAIN: ${{ github.ref == 'refs/heads/main' || inputs.full_tree }}
         run: |
           if [ "$IS_MAIN" != true ]; then
             git diff "${BASE:-origin/main}"...HEAD -- '*.rs' > pr.diff
@@ -184,7 +189,7 @@ jobs:
       # excluded by name in .cargo/mutants.toml, with its reason.
       - name: Run mutants
         env:
-          IS_MAIN: ${{ github.ref == 'refs/heads/main' }}
+          IS_MAIN: ${{ github.ref == 'refs/heads/main' || inputs.full_tree }}
         run: |
           args="--shard ${{ matrix.shard }}/4 --no-shuffle -j 2 -vV"
           list_args="--shard ${{ matrix.shard }}/4"
