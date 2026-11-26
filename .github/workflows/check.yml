@@ -209,6 +209,7 @@ jobs:
               exit 1
             fi
           fi
+          rm -f mutants.out/outcomes.json
       - name: Check outcomes
         run: |
           if ! jq -e '.missed == 0 and .timeout == 0' mutants.out/outcomes.json > /dev/null; then
