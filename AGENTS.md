@@ -71,7 +71,7 @@ run it here.
 | test    | a failing test or doc test                                                                                   | `test`                               |
 | msrv    | anything the pinned toolchain accepts and 1.100.0 does not                                                   | `msrv`                               |
 | deny    | a licence off the allow-list, a banned crate, an advisory, a yanked crate, an unknown registry or git source | `deny`                               |
-| mutants | a viable mutant in a pull request's changed lines or, on main, in the whole tree, that no test catches                                       | `mutants`                            |
+| mutants | a viable mutant in a pull request's changed lines or, on main, in the whole tree, that no test catches       | `mutants`                            |
 | docs    | markdown that prettier or markdownlint would change                                                          | `docs`                               |
 
 Every gate runs in CI; the mutants gate uses four shards plus an aggregate,
