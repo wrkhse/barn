@@ -159,17 +159,16 @@ impl Conversion {
     }
 
     fn value(&mut self, value: LuaValue, depth: usize) -> Result<Value, EngineError> {
+        if let LuaValue::Table(table) = &value
+            && !self.visited.insert(table.to_pointer())
+        {
+            return Err(EngineError::InvalidResult(SHARED_TABLE.into()));
+        }
+        if depth > MAX_DEPTH {
+            return Err(EngineError::Limit(LimitCause::TooDeep { limit: MAX_DEPTH }));
+        }
         match value {
-            LuaValue::Table(table) => {
-                if !self.visited.insert(table.to_pointer()) {
-                    return Err(EngineError::InvalidResult(SHARED_TABLE.into()));
-                }
-                if depth > MAX_DEPTH {
-                    let cause = LimitCause::TooDeep { limit: MAX_DEPTH };
-                    return Err(EngineError::Limit(cause));
-                }
-                self.table(&table, depth)
-            }
+            LuaValue::Table(table) => self.table(&table, depth),
             LuaValue::Nil => Ok(Value::Null),
             LuaValue::LightUserData(value) if value.0.is_null() => Ok(Value::Null),
             LuaValue::Boolean(value) => Ok(Value::Bool(value)),
@@ -243,9 +242,6 @@ impl Conversion {
 }
 
 pub(super) fn lua_to_json(value: LuaValue, depth: usize) -> Result<Value, EngineError> {
-    if depth > MAX_DEPTH {
-        return Err(EngineError::Limit(LimitCause::TooDeep { limit: MAX_DEPTH }));
-    }
     let mut conversion = Conversion::new();
     conversion.value(value, depth)
 }
@@ -465,23 +461,24 @@ mod tests {
     #[test]
     fn lua_to_json_refuses_a_shared_table_dag() {
         let lua = Lua::new();
-        let mut tables = Vec::with_capacity(17);
-        for _ in 0..17 {
+        let mut tables = Vec::with_capacity(16);
+        for _ in 0..16 {
             tables.push(lua.create_table().unwrap());
         }
 
         // Each table's entries all point at the next one, so without the
-        // visited set this 17-table, 1024-way shape expands to 1024^16
-        // visits. The revisit past depth 16 is caught by table identity
-        // before the depth limit can report TooDeep.
-        for index in 0..16usize {
+        // visited set this 16-table, 1024-way shape expands to 1024^15
+        // visits. The leaf integers sit at depth 16, within MAX_DEPTH, so
+        // they convert; the revisit of a table is caught by table identity
+        // rather than the depth limit reporting TooDeep.
+        for index in 0..15usize {
             let child = tables[index.saturating_add(1)].clone();
             for key in 0..MAX_ENTRIES {
                 tables[index].set(format!("k{key}"), child.clone()).unwrap();
             }
         }
         for key in 0..MAX_ENTRIES {
-            tables[16].set(format!("k{key}"), 1i64).unwrap();
+            tables[15].set(format!("k{key}"), 1i64).unwrap();
         }
 
         assert_eq!(
