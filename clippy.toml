@@ -3,3 +3,6 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
+
+# The wall-clock lint is duplicated in barn-luau's crate-local clippy.toml for B2.
+# Keep both files in sync until PR C deletes the duplicate and moves the lint here.

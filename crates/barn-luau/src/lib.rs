@@ -5,4 +5,4 @@ mod require;
 mod sandbox;
 
 pub use require::RequireCause;
-pub use sandbox::{Capabilities, EngineError, LimitCause, Limits, LoadCause, Sandbox};
+pub use sandbox::{Capabilities, Clock, EngineError, LimitCause, Limits, LoadCause, Sandbox};

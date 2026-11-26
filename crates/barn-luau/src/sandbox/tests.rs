@@ -1,13 +1,15 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde_json::json;
 
+use crate::Clock;
 use crate::require::{REQUIRE_CONFINED, RequireCause};
 
 use super::*;
 
+use super::clock::FakeClock;
 use super::errors::MAX_DEPTH;
 
 const DEFAULT_DEADLINE_MS: u64 = 100;
@@ -21,16 +23,12 @@ struct Scratch {
 
 impl Scratch {
     fn new() -> Self {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock before epoch")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "barn-sandbox-{}-{}-{}",
+        let token = format!(
+            "{}-{}",
             std::process::id(),
-            unique,
             NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        );
+        let root = std::env::temp_dir().join(format!("barn-sandbox-{token}"));
         std::fs::create_dir_all(&root).expect("create scratch folder");
         Self { root }
     }
@@ -121,6 +119,10 @@ tools = {
 }
 "#;
 
+fn test_clock() -> Arc<dyn Clock> {
+    Arc::new(FakeClock::new())
+}
+
 fn default_limits() -> Limits {
     Limits::new(DEFAULT_MEMORY_BYTES, DEFAULT_DEADLINE_MS).expect("valid limits")
 }
@@ -129,8 +131,13 @@ fn fixture(limits: Limits) -> (Scratch, Sandbox) {
     let scratch = Scratch::new();
     scratch.write("plugin.luau", PLUGIN);
     scratch.write("helper.luau", HELPER);
-    let sandbox =
-        Sandbox::new(scratch.path(), limits, Capabilities::default()).expect("fixture loads");
+    let sandbox = Sandbox::new(
+        scratch.path(),
+        limits,
+        Capabilities::default(),
+        test_clock(),
+    )
+    .expect("fixture loads");
     (scratch, sandbox)
 }
 
@@ -193,8 +200,13 @@ fn a_hook_can_replace_a_payload_with_scalar_or_null_host_context() {
         }
         "#,
     );
-    let sandbox = Sandbox::new(scratch.path(), default_limits(), Capabilities::default())
-        .expect("fixture loads");
+    let sandbox = Sandbox::new(
+        scratch.path(),
+        default_limits(),
+        Capabilities::default(),
+        test_clock(),
+    )
+    .expect("fixture loads");
 
     for context in [json!(false), Value::Null] {
         let invocation = Invocation {
@@ -224,8 +236,13 @@ fn a_non_object_host_context_is_only_exposed_as_ctx_host() {
         }
         "#,
     );
-    let sandbox = Sandbox::new(scratch.path(), default_limits(), Capabilities::default())
-        .expect("fixture loads");
+    let sandbox = Sandbox::new(
+        scratch.path(),
+        default_limits(),
+        Capabilities::default(),
+        test_clock(),
+    )
+    .expect("fixture loads");
 
     for context in [json!("text"), json!(7), json!(["first", "second"])] {
         let invocation = Invocation {
@@ -261,8 +278,8 @@ fn host_context_fields_cannot_override_helpers_or_capabilities() {
     );
     let mut capabilities = Capabilities::default();
     capabilities.insert("lookup", Ok);
-    let sandbox =
-        Sandbox::new(scratch.path(), default_limits(), capabilities).expect("fixture loads");
+    let sandbox = Sandbox::new(scratch.path(), default_limits(), capabilities, test_clock())
+        .expect("fixture loads");
     let invocation = Invocation {
         hook: "inspect".into(),
         payload: Value::Null,
@@ -293,6 +310,46 @@ fn a_runaway_loop_is_limited_by_the_deadline() {
 }
 
 #[test]
+fn a_deadline_uses_the_injected_clock() {
+    let fake = Arc::new(FakeClock::new());
+    let clock: Arc<dyn Clock> = Arc::<FakeClock>::clone(&fake);
+    let scratch = Scratch::new();
+    scratch.write("plugin.luau", PLUGIN);
+    let sandbox = Sandbox::new(
+        scratch.path(),
+        default_limits(),
+        Capabilities::default(),
+        clock,
+    )
+    .expect("fixture loads");
+
+    sandbox.deadline.begin(5);
+    assert!(
+        !sandbox.deadline.expired(),
+        "the injected clock has not advanced"
+    );
+
+    fake.advance(Duration::from_millis(6));
+    assert!(
+        sandbox.deadline.expired(),
+        "the injected clock passed the budget"
+    );
+
+    sandbox.deadline.disarm();
+    assert!(
+        !sandbox.deadline.expired(),
+        "disarmed after an injected-clock expiry"
+    );
+
+    // The hook rearms its own budget; zero keeps the interrupt fired without
+    // a wall-time measurement. The loop guarantees the VM reaches a checkpoint.
+    assert_eq!(
+        sandbox.hook(&invocation("toolBefore", "loop"), 0),
+        Err(EngineError::Limit(LimitCause::Deadline))
+    );
+}
+
+#[test]
 fn a_memory_hog_is_limited_by_the_ceiling() {
     let (_scratch, sandbox) =
         fixture(Limits::new(DEFAULT_MEMORY_BYTES, 1000).expect("valid limits"));
@@ -315,6 +372,7 @@ return { name = "startup-hog", size = #hog }"#,
         scratch.path(),
         Limits::new(DEFAULT_MEMORY_BYTES, 1000).expect("valid limits"),
         Capabilities::default(),
+        test_clock(),
     )
     .expect_err("top-level allocation is refused");
 
@@ -356,7 +414,7 @@ fn sandbox_rejects_a_reserved_capability_name() {
     let mut capabilities = Capabilities::default();
     capabilities.insert("allow", Ok);
 
-    let error = Sandbox::new(scratch.path(), default_limits(), capabilities)
+    let error = Sandbox::new(scratch.path(), default_limits(), capabilities, test_clock())
         .expect_err("reserved capability is refused");
     assert_eq!(
         error,
@@ -376,8 +434,15 @@ fn a_second_host_with_different_limits_works() {
         _ => Err("record not found".into()),
     });
 
-    let first = Sandbox::new(scratch.path(), smaller, Capabilities::default()).expect("first host");
-    let second = Sandbox::new(scratch.path(), larger, capabilities).expect("second host");
+    let first = Sandbox::new(
+        scratch.path(),
+        smaller,
+        Capabilities::default(),
+        test_clock(),
+    )
+    .expect("first host");
+    let second =
+        Sandbox::new(scratch.path(), larger, capabilities, test_clock()).expect("second host");
     let call_for = |hook: &str, payload| Invocation {
         hook: hook.into(),
         payload,
@@ -422,32 +487,6 @@ fn a_second_host_with_different_limits_works() {
             name: "lookup".into(),
             reason: "record not found".into()
         })
-    );
-
-    let spin = call_for("spin", Value::Null);
-    assert_deadline_between(
-        &first,
-        &spin,
-        smaller.call_deadline_ms,
-        larger.call_deadline_ms,
-    );
-    assert_deadline_between(&second, &spin, larger.call_deadline_ms, 4000);
-}
-
-fn assert_deadline_between(sandbox: &Sandbox, spin: &Invocation, lower_ms: u64, upper_ms: u64) {
-    let started = Instant::now();
-    assert_eq!(
-        sandbox.hook(spin, 5000),
-        Err(EngineError::Limit(LimitCause::Deadline))
-    );
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed >= Duration::from_millis(lower_ms),
-        "expired after {elapsed:?}"
-    );
-    assert!(
-        elapsed < Duration::from_millis(upper_ms),
-        "expired after {elapsed:?}"
     );
 }
 
@@ -512,6 +551,7 @@ fn a_top_level_loop_is_limited_during_load() {
         scratch.path(),
         Limits::new(DEFAULT_MEMORY_BYTES, 20).expect("valid limits"),
         Capabilities::default(),
+        test_clock(),
     )
     .expect_err("top-level loop is interrupted");
     assert_eq!(error, EngineError::Limit(LimitCause::Deadline));
@@ -549,8 +589,13 @@ fn require_refuses_parent_and_absolute_paths() {
             "plugin.luau",
             &format!(r#"local x = require("{spec}") return {{ name = "x" }}"#),
         );
-        let error = Sandbox::new(scratch.path(), default_limits(), Capabilities::default())
-            .expect_err("require is refused");
+        let error = Sandbox::new(
+            scratch.path(),
+            default_limits(),
+            Capabilities::default(),
+            test_clock(),
+        )
+        .expect_err("require is refused");
         assert_eq!(error, EngineError::Load(LoadCause::Require(expected)));
     }
 }
@@ -566,8 +611,13 @@ fn require_refuses_a_cycle() {
         "a.luau",
         r#"local x = require("./plugin") return { name = "a" }"#,
     );
-    let error = Sandbox::new(scratch.path(), default_limits(), Capabilities::default())
-        .expect_err("cycle is refused");
+    let error = Sandbox::new(
+        scratch.path(),
+        default_limits(),
+        Capabilities::default(),
+        test_clock(),
+    )
+    .expect_err("cycle is refused");
     assert_eq!(
         error,
         EngineError::Load(LoadCause::Require(RequireCause::Cycle("./plugin".into())))
@@ -581,8 +631,13 @@ fn require_refuses_a_missing_module() {
         "plugin.luau",
         r#"local x = require("./nope") return { name = "x" }"#,
     );
-    let error = Sandbox::new(scratch.path(), default_limits(), Capabilities::default())
-        .expect_err("missing module is refused");
+    let error = Sandbox::new(
+        scratch.path(),
+        default_limits(),
+        Capabilities::default(),
+        test_clock(),
+    )
+    .expect_err("missing module is refused");
     assert_eq!(
         error,
         EngineError::Load(LoadCause::Require(RequireCause::Missing("./nope".into())))
@@ -603,8 +658,13 @@ fn require_refuses_a_symlink_that_escapes_the_folder() {
         "plugin.luau",
         r#"local x = require("./linked") return { name = "x" }"#,
     );
-    let error = Sandbox::new(scratch.path(), default_limits(), Capabilities::default())
-        .expect_err("escaping symlink is refused");
+    let error = Sandbox::new(
+        scratch.path(),
+        default_limits(),
+        Capabilities::default(),
+        test_clock(),
+    )
+    .expect_err("escaping symlink is refused");
     assert_eq!(
         error,
         EngineError::Load(LoadCause::Require(RequireCause::Escape("./linked".into())))
@@ -649,8 +709,13 @@ tools = {
         r#"local helper = require("./helper") return { value = helper.sub }"#,
     );
 
-    let sandbox = Sandbox::new(scratch.path(), default_limits(), Capabilities::default())
-        .expect("fixture loads");
+    let sandbox = Sandbox::new(
+        scratch.path(),
+        default_limits(),
+        Capabilities::default(),
+        test_clock(),
+    )
+    .expect("fixture loads");
 
     // The child's "./helper" is sub/helper.luau, not the root helper:
     // one returns a "sub" field and the other a "root" field.
@@ -712,8 +777,13 @@ return { later = later }
 "#,
     );
 
-    let sandbox = Sandbox::new(scratch.path(), default_limits(), Capabilities::default())
-        .expect("fixture loads");
+    let sandbox = Sandbox::new(
+        scratch.path(),
+        default_limits(),
+        Capabilities::default(),
+        test_clock(),
+    )
+    .expect("fixture loads");
 
     // The deferred call runs after child.luau finished loading; its
     // require still resolves against sub/, not the plugin root.
@@ -761,8 +831,13 @@ fn a_runnable_returns_json_without_a_content_envelope() {
         }
         "#,
     );
-    let sandbox = Sandbox::new(scratch.path(), default_limits(), Capabilities::default())
-        .expect("fixture loads");
+    let sandbox = Sandbox::new(
+        scratch.path(),
+        default_limits(),
+        Capabilities::default(),
+        test_clock(),
+    )
+    .expect("fixture loads");
 
     assert_eq!(
         sandbox.run("double", &json!(21), DEFAULT_DEADLINE_MS),
@@ -793,8 +868,13 @@ fn a_tool_is_run_by_its_manifest_name_not_its_table_key() {
         }
         "#,
     );
-    let sandbox = Sandbox::new(scratch.path(), default_limits(), Capabilities::default())
-        .expect("fixture loads");
+    let sandbox = Sandbox::new(
+        scratch.path(),
+        default_limits(),
+        Capabilities::default(),
+        test_clock(),
+    )
+    .expect("fixture loads");
 
     assert_eq!(
         sandbox.manifest(),
@@ -888,8 +968,13 @@ tools = {
 }
 "#,
     );
-    let sandbox = Sandbox::new(scratch.path(), default_limits(), Capabilities::default())
-        .expect("fixture loads");
+    let sandbox = Sandbox::new(
+        scratch.path(),
+        default_limits(),
+        Capabilities::default(),
+        test_clock(),
+    )
+    .expect("fixture loads");
 
     let content = sandbox
         .run("probe", &json!({}), DEFAULT_DEADLINE_MS)
@@ -920,8 +1005,13 @@ fn manifest_reads_the_fixture() {
         }
         "#,
     );
-    let sandbox = Sandbox::new(scratch.path(), default_limits(), Capabilities::default())
-        .expect("fixture loads");
+    let sandbox = Sandbox::new(
+        scratch.path(),
+        default_limits(),
+        Capabilities::default(),
+        test_clock(),
+    )
+    .expect("fixture loads");
 
     assert_eq!(
         sandbox.manifest(),
@@ -942,8 +1032,13 @@ fn manifest_reads_the_fixture() {
 fn manifest_refuses_a_duplicate_tool_name() {
     let scratch = Scratch::new();
     scratch.write("plugin.luau", DUPLICATE);
-    let sandbox =
-        Sandbox::new(scratch.path(), default_limits(), Capabilities::default()).expect("loads");
+    let sandbox = Sandbox::new(
+        scratch.path(),
+        default_limits(),
+        Capabilities::default(),
+        test_clock(),
+    )
+    .expect("loads");
     let error = sandbox.manifest().expect_err("duplicate is refused");
     assert_eq!(
         error,

@@ -15,5 +15,33 @@ mlua = { workspace = true, features = ["send"] }
 serde.workspace = true
 serde_json.workspace = true
 
-[lints]
-workspace = true
+# Cargo cannot combine `lints.workspace = true` with a package-specific lint,
+# so barn-luau restates the workspace lints and adds the wall-clock lint. The
+# crate-local clippy.toml carries the method list; the duplicate ends in PR C.
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+# Explicit panics
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+unreachable = "deny"
+unimplemented = "deny"
+todo = "deny"
+exit = "deny"
+dbg_macro = "deny"
+# Implicit panics
+indexing_slicing = "deny"
+string_slice = "deny"
+arithmetic_side_effects = "deny"
+unchecked_time_subtraction = "deny"
+as_conversions = "deny"
+# Size
+too_many_lines = "deny"
+# Wall clock is injected through barn-luau's clock seam.
+disallowed_methods = "deny"

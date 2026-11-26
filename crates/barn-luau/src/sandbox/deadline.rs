@@ -1,17 +1,23 @@
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+
+use super::clock::Clock;
 
 #[derive(Debug)]
 pub(super) struct Deadline {
-    started: Mutex<Instant>,
+    clock: Arc<dyn Clock>,
+    started: Mutex<u128>,
     budget_us: AtomicU64,
 }
 
 impl Deadline {
-    pub(super) fn new() -> Self {
+    pub(super) fn with_clock(clock: Arc<dyn Clock>) -> Self {
+        let started = clock.micros();
+
         Self {
-            started: Mutex::new(Instant::now()),
+            clock,
+            started: Mutex::new(started),
             budget_us: AtomicU64::new(u64::MAX),
         }
     }
@@ -24,7 +30,7 @@ impl Deadline {
             return;
         };
 
-        *started = Instant::now();
+        *started = self.clock.micros();
         self.budget_us
             .store(ms.saturating_mul(1000).min(u64::MAX - 1), Ordering::Relaxed);
     }
@@ -42,18 +48,28 @@ impl Deadline {
             // Fail closed: a poisoned clock becomes a named deadline deny.
             return true;
         };
+        let started = *started;
+        let now = self.clock.micros();
 
-        started.elapsed().as_micros() >= u128::from(budget)
+        if now < started {
+            // A backwards clock cannot prove the budget is intact.
+            return true;
+        }
+
+        now.saturating_sub(started) >= u128::from(budget)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::sandbox::clock::FakeClock;
 
     #[test]
     fn begin_arms_a_budget_and_disarm_clears_it() {
-        let deadline = Deadline::new();
+        let deadline = Deadline::with_clock(Arc::new(FakeClock::new()));
         assert!(!deadline.expired(), "a fresh clock has no budget");
 
         deadline.begin(0);
@@ -65,9 +81,35 @@ mod tests {
 
     #[test]
     fn a_saturated_budget_stays_below_the_disarmed_sentinel() {
-        let deadline = Deadline::new();
+        let deadline = Deadline::with_clock(Arc::new(FakeClock::new()));
         deadline.begin(u64::MAX);
 
         assert_eq!(deadline.budget_us.load(Ordering::Relaxed), u64::MAX - 1);
+    }
+
+    #[test]
+    fn with_clock_arms_from_the_injected_clock() {
+        let clock = Arc::new(FakeClock::new());
+        let deadline = Deadline::with_clock(Arc::<FakeClock>::clone(&clock));
+
+        deadline.begin(10);
+        clock.advance(Duration::from_millis(9));
+        assert!(!deadline.expired(), "nine milliseconds is within ten");
+
+        clock.advance(Duration::from_millis(2));
+        assert!(deadline.expired(), "eleven milliseconds exceeds ten");
+    }
+
+    #[test]
+    fn a_clock_that_moved_backwards_fails_closed() {
+        let clock = Arc::new(FakeClock::new());
+        let deadline = Deadline::with_clock(Arc::<FakeClock>::clone(&clock));
+        deadline.begin(5);
+
+        // Push the captured start ahead of the clock to model a backwards step.
+        let ahead = clock.micros().saturating_add(6_000);
+        *deadline.started.lock().expect("lock start") = ahead;
+
+        assert!(deadline.expired(), "a backwards clock fails closed");
     }
 }
