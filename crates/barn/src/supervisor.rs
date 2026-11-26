@@ -2370,4 +2370,28 @@ mod tests {
         );
         assert_eq!(delivered, Vec::<Vec<u8>>::new());
     }
+
+    #[tokio::test]
+    async fn draining_at_exit_stops_at_the_exact_byte_boundary() {
+        let count = 8usize;
+        let prefix = br#"{"jsonrpc":"2.0","method":"log","body":""#;
+        let suffix = b"\"}\n";
+        let frame_len = MAX_EXIT_DRAIN_BYTES / count;
+        let mut frame = prefix.to_vec();
+        frame.resize(frame_len.saturating_sub(suffix.len()), b'x');
+        frame.extend_from_slice(suffix);
+        assert_eq!(frame.len() * count, MAX_EXIT_DRAIN_BYTES);
+
+        let mut input = frame.repeat(count);
+        input.extend_from_slice(&log_frame(99));
+        let mut reader = BufReader::new(input.as_slice());
+        let mut delivered = Vec::new();
+        let stop = drain_on_exit(&mut reader, 1, |frame| delivered.push(frame)).await;
+        let total: usize = delivered.iter().map(Vec::len).sum();
+
+        assert_eq!(stop, DrainStop::ByteLimit);
+        assert_eq!(delivered.len(), count);
+        assert_eq!(total, MAX_EXIT_DRAIN_BYTES);
+        assert_eq!(delivered, vec![frame; count]);
+    }
 }
