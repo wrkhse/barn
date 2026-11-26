@@ -134,6 +134,26 @@ async fn barn_restarts_a_crashed_child_with_a_fresh_pid() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn a_sandboxed_macos_sh_runs_its_command() -> TestResult {
+    if !cfg!(target_os = "macos") || env::var_os("CI").is_none() {
+        return Ok(());
+    }
+
+    let root = Scratch::new()?;
+    let spec = fixture(PathBuf::from("/bin/sh"), &["-c", "exit 0"]);
+    let stall = root.supervisor().start(spec).await?;
+    let outcome = timeout(DEADLINE, stall.wait_and_restart()).await??;
+
+    if !matches!(outcome, RestartOutcome::Exited) {
+        let message = "sandboxed /bin/sh did not exit cleanly";
+
+        return Err(io::Error::other(message).into());
+    }
+
+    Ok(())
+}
+
 #[test]
 fn sandbox_client_fixture() -> TestResult {
     let Some(socket) = env::var_os("BARN_SOCKET").map(PathBuf::from) else {

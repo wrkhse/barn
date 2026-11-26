@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use barn_stall::protocol::TOKEN_TTL_SECS;
 use barn_stall::{MAX_LINE_BYTES, PROTOCOL_VERSION, method};
 use barn_stall::{StallStartParams, StallStartResult};
-use nono::{AccessMode, NonoError, SandboxState, UnixSocketMode};
+use nono::{AccessMode, CapabilitySet, NonoError, SandboxState, UnixSocketMode};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
@@ -41,6 +41,13 @@ const PRIVATE_DIR: u32 = 0o700;
 const PRIVATE_FILE: u32 = 0o600;
 const SOCKET_FILE: &str = "proto.sock";
 const POLICY_FILE: &str = "policy.json";
+/// macOS's `/bin/sh` reads this link to choose the shell it runs.
+const SHELL_LINK: &str = "/private/var/select/sh";
+/// The link and the shells it can name, each granted read as a literal.
+#[cfg(target_os = "macos")]
+const SHELL_GRANTS: &[&str] = &[SHELL_LINK, "/bin/bash", "/bin/zsh", "/bin/dash"];
+#[cfg(not(target_os = "macos"))]
+const SHELL_GRANTS: &[&str] = &[];
 const OVERSIZE_REPLY: &[u8] = concat!(
     r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"#,
     r#""message":"stall start message exceeds the protocol line limit"}}"#,
@@ -270,6 +277,9 @@ pub enum SupervisorError {
     /// nono cannot grant access to the stall's state directory.
     #[error("granting access to the stall state directory: {0}")]
     StatePolicy(#[source] NonoError),
+    /// nono cannot grant read access to macOS's `/bin/sh` link or its shells.
+    #[error("granting access to the macOS shell: {0}")]
+    ShellPolicy(#[source] NonoError),
     /// Preparing the transport fails.
     #[error("preparing stall transport: {0}")]
     Prepare(#[from] tokio::task::JoinError),
@@ -818,6 +828,7 @@ fn prepare(state_dir: &Path, spec: &StallSpec) -> Result<Prepared> {
         .to_capability_set()?
         .allow_path(&state, AccessMode::ReadWrite)
         .map_err(SupervisorError::StatePolicy)?;
+    let caps = allow_shell(caps, SHELL_GRANTS)?;
 
     let socket = run_dir.path(SOCKET_FILE);
     let listener = io_at("binding stall socket", StdUnixListener::bind(&socket))?;
@@ -833,9 +844,12 @@ fn prepare(state_dir: &Path, spec: &StallSpec) -> Result<Prepared> {
         .map_err(SupervisorError::SocketPolicy)?;
     let mut state_policy = SandboxState::from_caps(&caps);
 
-    // Reconstruct filesystem grants from the resolved names in the helper.
+    // Reconstruct filesystem grants from the resolved names in the helper,
+    // except the shell link: Seatbelt checks the link by its own name.
     for path in &mut state_policy.fs {
-        path.original.clone_from(&path.resolved);
+        if path.original != Path::new(SHELL_LINK) {
+            path.original.clone_from(&path.resolved);
+        }
     }
 
     write_policy(&run_dir.path(POLICY_FILE), &state_policy)?;
@@ -849,6 +863,20 @@ fn prepare(state_dir: &Path, spec: &StallSpec) -> Result<Prepared> {
         token,
         program,
     })
+}
+
+/// Read access to each of `paths` that exists, as a literal, so a stall can
+/// run macOS's `/bin/sh`. A missing path is skipped.
+fn allow_shell(mut caps: CapabilitySet, paths: &[&str]) -> Result<CapabilitySet> {
+    let paths = paths.iter().map(Path::new);
+
+    for path in paths.filter(|path| path.exists()) {
+        caps = caps
+            .allow_file(path, AccessMode::Read)
+            .map_err(SupervisorError::ShellPolicy)?;
+    }
+
+    Ok(caps)
 }
 
 /// The grant with its executable set to the program barn-exec runs, so a
@@ -1507,6 +1535,63 @@ mod tests {
             grants,
             [(&state, "read", false), (&state, "read+write", false)]
         );
+    }
+
+    #[test]
+    fn the_policy_names_resolved_paths_and_keeps_the_macos_shell_link() {
+        let fixture = PrepareFixture::new();
+        let target = fixture.0.join("target");
+        let link = fixture.0.join("link");
+        fs::create_dir(&target).expect("link target");
+        std::os::unix::fs::symlink(&target, &link).expect("read path link");
+        let mut spec = PrepareFixture::spec();
+        spec.grant.read_paths.push(link);
+        let program = spec.program.canonicalize().expect("canonical program");
+        let state = fixture.0.join("fixture");
+
+        let prepared = prepare(&fixture.0, &spec).expect("prepare");
+        let bytes = fs::read(prepared.run_dir.path(POLICY_FILE)).expect("policy");
+        let policy: SandboxState = serde_json::from_slice(&bytes).expect("policy");
+        let grants: Vec<_> = policy
+            .fs
+            .into_iter()
+            .map(|cap| (cap.original, cap.resolved, cap.is_file))
+            .collect();
+
+        let mut expected = vec![
+            (target.clone(), target, false),
+            (program.clone(), program, true),
+            (state.clone(), state, false),
+        ];
+
+        if cfg!(target_os = "macos") {
+            let shell = Path::new(SHELL_LINK).canonicalize().expect("shell");
+            expected.push((SHELL_LINK.into(), shell, true));
+
+            for path in ["/bin/bash", "/bin/zsh", "/bin/dash"].map(PathBuf::from) {
+                expected.push((path.clone(), path, true));
+            }
+        }
+
+        assert_eq!(grants, expected);
+    }
+
+    #[test]
+    fn the_shell_grant_skips_a_missing_path() {
+        let fixture = PrepareFixture::new();
+        let present = fixture.0.join("present");
+        fs::write(&present, b"").expect("present file");
+        let missing = fixture.0.join("missing");
+        let paths = [&present, &missing].map(|path| path.to_str().expect("UTF-8"));
+
+        let caps = allow_shell(CapabilitySet::new(), &paths).expect("shell grant");
+        let grants: Vec<_> = caps
+            .fs_capabilities()
+            .iter()
+            .map(|cap| (&cap.resolved, cap.access, cap.is_file))
+            .collect();
+
+        assert_eq!(grants, [(&present, AccessMode::Read, true)]);
     }
 
     #[test]

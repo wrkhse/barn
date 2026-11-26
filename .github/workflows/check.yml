@@ -68,6 +68,16 @@ jobs:
         with:
           tool: cargo-nextest@0.9.152
       - run: cargo nextest run --workspace --locked
+      # The restart test runs /bin/sh under Seatbelt; thirty runs in a row show
+      # it passes every time, not once.
+      - name: Repeat the restart test
+        if: matrix.os == 'macos-15'
+        run: |
+          for run in $(seq 1 30); do
+            echo "restart test, run $run of 30"
+            cargo nextest run -p barn-exec --locked \
+              -E 'test(=barn_restarts_a_crashed_child_with_a_fresh_pid)'
+          done
       - run: cargo test --doc --workspace --locked
 
   # Cargo.toml's rust-version, exactly. Today the pinned toolchain is the same
