@@ -174,9 +174,9 @@ jobs:
       - name: The diff to mutate
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
-          EVENT_NAME: ${{ github.event_name }}
+          IS_MAIN: ${{ github.ref == 'refs/heads/main' }}
         run: |
-          if [ "$EVENT_NAME" != push ]; then
+          if [ "$IS_MAIN" != true ]; then
             git diff "${BASE:-origin/main}"...HEAD -- '*.rs' > pr.diff
           fi
           touch pr.diff
@@ -184,22 +184,22 @@ jobs:
       # excluded by name in .cargo/mutants.toml, with its reason.
       - name: Run mutants
         env:
-          EVENT_NAME: ${{ github.event_name }}
+          IS_MAIN: ${{ github.ref == 'refs/heads/main' }}
         run: |
-          zero() {
+          args="--shard ${{ matrix.shard }}/4 --no-shuffle -j 2 -vV"
+          if [ "$IS_MAIN" != true ] && [ ! -s pr.diff ]; then
             mkdir -p mutants.out
             jq -n '{total_mutants: 0, caught: 0, missed: 0, timeout: 0, unviable: 0}' > mutants.out/outcomes.json
-          }
-          args="--shard ${{ matrix.shard }}/4 --no-shuffle -j 2 -vV"
-          if [ "$EVENT_NAME" != push ] && [ ! -s pr.diff ]; then
-            zero
             exit 0
           fi
-          if [ "$EVENT_NAME" != push ]; then
+          if [ "$IS_MAIN" != true ]; then
             args="$args --in-diff pr.diff"
           fi
           cargo mutants $args
-          [ -f mutants.out/outcomes.json ] || zero
+          if [ ! -f mutants.out/outcomes.json ]; then
+            echo "::error::cargo mutants did not write mutants.out/outcomes.json"
+            exit 1
+          fi
       - name: Check outcomes
         run: |
           if ! jq -e '.missed == 0 and .timeout == 0' mutants.out/outcomes.json > /dev/null; then

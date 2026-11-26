@@ -58,8 +58,9 @@ npm ci && npm run check
 
 `cargo nextest run` needs `cargo-nextest`; `cargo test --workspace` runs the
 same tests without it. `npm run check` is prettier and markdownlint over the
-markdown, from `package.json`. Mutation testing runs on a pull request's
-changed lines only, and only in CI: dispatch the Check workflow on your branch
+markdown, from `package.json`. Mutation testing runs in CI only: on a pull
+request's changed lines in four shards behind the `mutants` aggregate, and on
+pushes to `main` on the full tree. Dispatch the Check workflow on your branch
 (`gh workflow run check.yml --ref <branch>`) and read its `mutants` job. Never
 run it here.
 
