@@ -45,10 +45,9 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
 
 ## Versions
 
-`protocol` is an integer, `1` (`PROTOCOL_VERSION` in `barn-stall`). Starting
-with barn's first release, barn speaks the current version and the one before
-it. Fields are only added within a released version: a rename or a removal
-requires a new version.
+`protocol` is an integer, `1` (`PROTOCOL_VERSION` in `barn-stall`). barn speaks
+the current version and the one before it. Fields are only added within a
+version: a rename or a removal is a new version.
 
 The values `body_encoding` may carry are closed within a version: another
 encoding is a new version, never a value added inside this one.

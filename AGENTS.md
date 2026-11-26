@@ -32,6 +32,7 @@ stall's own JavaScript, which `barn-plugin-host` runs when that crate exists.
 | Path                                                  | What it holds                                                                      |
 | ----------------------------------------------------- | ---------------------------------------------------------------------------------- |
 | `crates/barn`                                         | the `barn` binary: today the command line, later the supervisor                    |
+| `crates/barn-exec`                                    | the sandbox helper: applies a grant's policy, then execs the stall                 |
 | `crates/barn-stall`                                   | the Rust stall SDK: the protocol's version, limits, method names and message types |
 | `docs/stall-protocol.md`                              | the protocol as it is fixed; anything not fixed is marked "for B1 to confirm"      |
 | [grant](https://github.com/wrkhse/barn/issues/14)     | the grant contract and its planned crate                                           |

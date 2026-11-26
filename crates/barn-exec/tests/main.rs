@@ -154,6 +154,23 @@ async fn a_sandboxed_macos_sh_runs_its_command() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn a_stall_not_granted_sh_is_refused_before_it_starts() -> TestResult {
+    if !cfg!(target_os = "macos") || env::var_os("CI").is_none() {
+        return Ok(());
+    }
+
+    let root = Scratch::new()?;
+    let mut spec = fixture(PathBuf::from("/bin/sh"), &["-c", "exit 0"]);
+    spec.grant.executable = Some(env::current_exe()?);
+
+    match root.supervisor().start(spec).await {
+        Err(SupervisorError::ExecutableNotGranted) => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(_) => Err(io::Error::other("barn started an ungranted /bin/sh").into()),
+    }
+}
+
 #[test]
 fn sandbox_client_fixture() -> TestResult {
     let Some(socket) = env::var_os("BARN_SOCKET").map(PathBuf::from) else {

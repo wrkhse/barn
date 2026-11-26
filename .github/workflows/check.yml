@@ -51,10 +51,25 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-15]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned toolchain
+        run: |
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: cargo-nextest@0.9.152
+      - run: cargo nextest run --workspace --locked
+      - run: cargo test --doc --workspace --locked
+
+  # The same tests under Seatbelt, where stalls run on the owner's Macs.
+  test-macos:
+    runs-on: macos-15
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -71,7 +86,6 @@ jobs:
       # The restart test runs /bin/sh under Seatbelt; thirty runs in a row show
       # it passes every time, not once.
       - name: Repeat the restart test
-        if: matrix.os == 'macos-15'
         run: |
           for run in $(seq 1 30); do
             echo "restart test, run $run of 30"

@@ -41,6 +41,8 @@ const PRIVATE_DIR: u32 = 0o700;
 const PRIVATE_FILE: u32 = 0o600;
 const SOCKET_FILE: &str = "proto.sock";
 const POLICY_FILE: &str = "policy.json";
+/// The shell shim; a grant that lets a stall execute it gets `SHELL_GRANTS`.
+const SHELL_SHIM: &str = "/bin/sh";
 /// macOS's `/bin/sh` reads this link to choose the shell it runs.
 const SHELL_LINK: &str = "/private/var/select/sh";
 /// The link and the shells it can name, each granted read as a literal.
@@ -824,11 +826,12 @@ fn prepare(state_dir: &Path, spec: &StallSpec) -> Result<Prepared> {
 
     let program = io_at("resolving stall program", spec.program.canonicalize())?;
     let (run_dir, state) = run_paths(state_dir, &spec.name)?;
-    let caps = pin_executable(&spec.grant, program.clone())
+    let grant = pin_executable(&spec.grant, program.clone());
+    let caps = grant
         .to_capability_set()?
         .allow_path(&state, AccessMode::ReadWrite)
         .map_err(SupervisorError::StatePolicy)?;
-    let caps = allow_shell(caps, SHELL_GRANTS)?;
+    let caps = allow_shell(caps, shell_grants(&grant))?;
 
     let socket = run_dir.path(SOCKET_FILE);
     let listener = io_at("binding stall socket", StdUnixListener::bind(&socket))?;
@@ -863,6 +866,26 @@ fn prepare(state_dir: &Path, spec: &StallSpec) -> Result<Prepared> {
         token,
         program,
     })
+}
+
+/// `SHELL_GRANTS` when the grant lets the stall execute `/bin/sh`, else none.
+///
+/// The executable may name the shim, or a read path may cover it: Seatbelt
+/// lets a stall execute what it can read, so it can start the shim itself.
+fn shell_grants(grant: &Grant) -> &'static [&'static str] {
+    let shim = Path::new(SHELL_SHIM);
+    let resolved = shim.canonicalize().ok();
+    let executable = grant
+        .executable
+        .as_ref()
+        .and_then(|path| path.canonicalize().ok());
+    let names_shim = resolved.is_some() && executable == resolved;
+
+    if names_shim || grant.allows_read(shim) {
+        SHELL_GRANTS
+    } else {
+        &[]
+    }
 }
 
 /// Read access to each of `paths` that exists, as a literal, so a stall can
@@ -1538,7 +1561,7 @@ mod tests {
     }
 
     #[test]
-    fn the_policy_names_resolved_paths_and_keeps_the_macos_shell_link() {
+    fn the_policy_names_resolved_paths() {
         let fixture = PrepareFixture::new();
         let target = fixture.0.join("target");
         let link = fixture.0.join("link");
@@ -1558,22 +1581,94 @@ mod tests {
             .map(|cap| (cap.original, cap.resolved, cap.is_file))
             .collect();
 
-        let mut expected = vec![
-            (target.clone(), target, false),
-            (program.clone(), program, true),
-            (state.clone(), state, false),
-        ];
+        assert_eq!(
+            grants,
+            [
+                (target.clone(), target, false),
+                (program.clone(), program, true),
+                (state.clone(), state, false),
+            ]
+        );
+    }
 
-        if cfg!(target_os = "macos") {
-            let shell = Path::new(SHELL_LINK).canonicalize().expect("shell");
-            expected.push((SHELL_LINK.into(), shell, true));
+    type PolicyEntry = (PathBuf, PathBuf, bool);
 
-            for path in ["/bin/bash", "/bin/zsh", "/bin/dash"].map(PathBuf::from) {
-                expected.push((path.clone(), path, true));
-            }
+    /// The shim literals in the policy `prepare` writes for `spec`.
+    fn shim_entries(spec: &StallSpec) -> Vec<PolicyEntry> {
+        let fixture = PrepareFixture::new();
+        let prepared = prepare(&fixture.0, spec).expect("prepare");
+        let bytes = fs::read(prepared.run_dir.path(POLICY_FILE)).expect("policy");
+        let policy: SandboxState = serde_json::from_slice(&bytes).expect("policy");
+        let shim = [SHELL_LINK, "/bin/bash", "/bin/zsh", "/bin/dash"];
+
+        policy
+            .fs
+            .into_iter()
+            .filter(|cap| shim.map(Path::new).contains(&cap.original.as_path()))
+            .map(|cap| (cap.original, cap.resolved, cap.is_file))
+            .collect()
+    }
+
+    /// The literals a stall that may run `/bin/sh` gets: on macOS the link,
+    /// kept by its own name, and each shell that exists; elsewhere none.
+    fn expected_shim_entries() -> Vec<PolicyEntry> {
+        if !cfg!(target_os = "macos") {
+            return Vec::new();
         }
 
-        assert_eq!(grants, expected);
+        let link = Path::new(SHELL_LINK).canonicalize().expect("shell link");
+        let shells = ["/bin/bash", "/bin/zsh", "/bin/dash"]
+            .map(PathBuf::from)
+            .into_iter()
+            .filter(|path| path.exists())
+            .map(|path| (path.clone(), path, true));
+
+        std::iter::once((SHELL_LINK.into(), link, true))
+            .chain(shells)
+            .collect()
+    }
+
+    fn shell_spec() -> StallSpec {
+        let mut spec = PrepareFixture::spec();
+        spec.program = SHELL_SHIM.into();
+        spec.grant.executable = Some(SHELL_SHIM.into());
+
+        spec
+    }
+
+    #[test]
+    fn a_stall_granted_the_shell_gets_the_shim_literals() {
+        assert_eq!(shim_entries(&shell_spec()), expected_shim_entries());
+    }
+
+    #[test]
+    fn a_read_path_over_the_shell_gets_the_shim_literals() {
+        let mut spec = PrepareFixture::spec();
+        spec.grant.read_paths.push("/bin".into());
+
+        assert_eq!(shim_entries(&spec), expected_shim_entries());
+    }
+
+    #[test]
+    fn a_stall_not_granted_the_shell_gets_no_shim_literals() {
+        assert_eq!(shim_entries(&PrepareFixture::spec()), []);
+    }
+
+    #[test]
+    fn a_stall_not_granted_the_shell_cannot_run_it() {
+        let fixture = PrepareFixture::new();
+        let mut spec = shell_spec();
+        spec.grant.executable = PrepareFixture::spec().grant.executable;
+        let refused = prepare(&fixture.0, &spec).err();
+
+        assert!(matches!(
+            refused,
+            Some(SupervisorError::ExecutableNotGranted)
+        ));
+        assert_eq!(
+            refused.map(|error| error.to_string()).as_deref(),
+            Some("stall program does not match its executable grant")
+        );
     }
 
     #[test]
