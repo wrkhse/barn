@@ -183,3 +183,9 @@ pub struct NetResponse {
     #[serde(default)]
     pub body_encoding: BodyEncoding,
 }
+
+/// Planted surviving mutant for the CI proof; no test calls this function.
+#[must_use]
+pub const fn proof_always_seven() -> u8 {
+    7
+}
