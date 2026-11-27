@@ -1913,6 +1913,19 @@ mod tests {
     .as_bytes();
 
     #[test]
+    fn host_endpoint_debug_names_the_struct_and_redacts_the_token() {
+        let endpoint = HostEndpoint {
+            socket_path: PathBuf::from("/tmp/barn-host.sock"),
+            token: "a1b2c3d4e5f60718293a4b5c6d7e8f90".to_owned(),
+        };
+
+        assert_eq!(
+            format!("{endpoint:?}"),
+            r#"HostEndpoint { socket_path: "/tmp/barn-host.sock", token: "[redacted]" }"#
+        );
+    }
+
+    #[test]
     fn peer_credentials_require_both_a_matching_pid_and_uid() {
         assert!(verify_peer(Some(17), 42, 17, 42).is_ok());
         assert!(matches!(
@@ -2073,6 +2086,95 @@ mod tests {
         line.push(b'\n');
 
         line
+    }
+
+    /// A `host.start` line with the given id and fixed, valid parameters.
+    fn host_start_with_id(id: &Value) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method::HOST_START,
+            "params": {"protocol": PROTOCOL_VERSION, "token": "secret", "pid": 21}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn request_id_keeps_string_i64_and_u64_ids_and_nulls_a_bool() {
+        for (id, expected) in [
+            (json!("host-7"), json!("host-7")),
+            (json!(-42_i64), json!(-42)),
+            (json!(u64::MAX), json!(u64::MAX)),
+            (json!(true), Value::Null),
+        ] {
+            let frame = host_start_with_id(&id);
+
+            assert_eq!(request_id(frame.as_bytes()), expected, "{frame}");
+        }
+    }
+
+    #[test]
+    fn host_start_denies_a_wrong_version_or_method_and_accepts_both_right() {
+        for (version, named_method, denied) in [
+            (json!("1.0"), method::HOST_START.to_owned(), true),
+            (json!("2.0"), "other.method".to_owned(), true),
+            (json!("2.0"), method::HOST_START.to_owned(), false),
+        ] {
+            let frame = json!({
+                "jsonrpc": version,
+                "id": 21,
+                "method": named_method,
+                "params": {"protocol": PROTOCOL_VERSION, "token": "secret", "pid": 21}
+            })
+            .to_string();
+            let decoded = decode_host_start(frame.as_bytes());
+
+            if denied {
+                assert_eq!(decoded.err(), Some(HostDeny::ProtocolMismatch), "{frame}");
+            } else {
+                let (id, params) = decoded.expect("a valid host.start");
+                assert_eq!(id, json!(21), "{frame}");
+                assert_eq!(
+                    params,
+                    HostStartParams {
+                        protocol: PROTOCOL_VERSION,
+                        token: "secret".to_owned(),
+                        pid: 21,
+                    },
+                    "{frame}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn host_start_decodes_every_id_kind_and_refuses_a_bool_id() {
+        for (id, expected) in [
+            (json!("host-7"), Some(json!("host-7"))),
+            (json!(-42_i64), Some(json!(-42))),
+            (json!(u64::MAX), Some(json!(u64::MAX))),
+            (json!(true), None),
+        ] {
+            let frame = host_start_with_id(&id);
+            let decoded = decode_host_start(frame.as_bytes());
+
+            match expected {
+                Some(wanted) => {
+                    let (got, params) = decoded.expect("a decodable host.start");
+                    assert_eq!(got, wanted, "{frame}");
+                    assert_eq!(
+                        params,
+                        HostStartParams {
+                            protocol: PROTOCOL_VERSION,
+                            token: "secret".to_owned(),
+                            pid: 21,
+                        },
+                        "{frame}"
+                    );
+                }
+                None => assert_eq!(decoded.err(), Some(HostDeny::ProtocolMismatch), "{frame}"),
+            }
+        }
     }
 
     /// A host transport bound to `root/host.sock`, expecting this process.
@@ -2717,6 +2819,75 @@ mod tests {
             denied(&Value::Null, deny::CLOSED_SOCKET)
         );
         drop(stall_peer);
+    }
+
+    /// A `RunningStall` whose listeners and child are idle: `serve_host`
+    /// borrows `self` without reading it, so only the caller's two streams
+    /// take part in the broker step. Spawning the child makes callers a
+    /// process test.
+    fn idle_stall_for_brokering() -> RunningStall {
+        let fixture = PrepareFixture::new();
+        let deadline = Instant::now()
+            .checked_add(TOKEN_TTL)
+            .expect("the token deadline fits");
+        let child = Command::new("/usr/bin/true").spawn().expect("idle child");
+
+        RunningStall {
+            child,
+            pid: std::process::id(),
+            transport: test_transport(&fixture.0, Some(deadline)),
+            host: test_host_transport(&fixture.0, Some(issued(deadline))),
+            supervisor: Supervisor::new(fixture.0.clone(), PathBuf::from("/usr/bin/true")),
+            spec: PrepareFixture::spec(),
+            started: Instant::now(),
+            epoch: Instant::now(),
+            restart: RestartPolicy::default(),
+            health: HealthTracker::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_host_forwards_one_framed_request_and_returns_the_exact_reply() {
+        // This spawns an idle child, so it runs in CI only.
+        if std::env::var_os("CI").is_none() {
+            return;
+        }
+
+        let stall = idle_stall_for_brokering();
+        let (host_barn, mut host_peer) = UnixStream::pair().expect("host pair");
+        let (stall_barn, mut stall_peer) = UnixStream::pair().expect("stall pair");
+        let mut host = BufReader::new(host_barn);
+        let mut stall_stream = BufReader::new(stall_barn);
+        let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"request\"}\n";
+        let reply = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n";
+        let mut forwarded = Vec::new();
+
+        let exchange = async {
+            host_peer.write_all(request).await.expect("host frame");
+            BufReader::new(&mut stall_peer)
+                .read_until(b'\n', &mut forwarded)
+                .await
+                .expect("forwarded frame");
+            stall_peer.write_all(reply).await.expect("stall reply");
+        };
+        let (served, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(stall.serve_host(&mut host, &mut stall_stream), exchange)
+        })
+        .await
+        .expect("broker and stall finish within the deadline");
+
+        assert!(matches!(served, Ok(())));
+        assert_eq!(forwarded, request.to_vec());
+
+        let mut received = Vec::new();
+        timeout(
+            Duration::from_secs(1),
+            BufReader::new(&mut host_peer).read_until(b'\n', &mut received),
+        )
+        .await
+        .expect("host reply within the deadline")
+        .expect("read host reply");
+        assert_eq!(received, reply.to_vec());
     }
 
     /// A transport bound to `root/proto.sock`, with a token at `expiry`.
