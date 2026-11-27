@@ -6,14 +6,12 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use barn_stall::{LAUNCH_PROTOCOL, MAX_LAUNCH_LINE_BYTES};
 use clap::{Parser, Subcommand};
 use thiserror::Error;
 
 use crate::Grant;
 use crate::supervisor::{HostEndpoint, StallSpec, Supervisor, SupervisorError};
-
-const LAUNCH_PROTOCOL: u32 = 1;
-const MAX_LAUNCH_LINE_BYTES: usize = 8 * 1024;
 
 /// barn: the only daemon on a wrkhse machine.
 #[derive(Debug, Parser)]
@@ -415,6 +413,7 @@ fn report_failure(stdout: &mut impl Write, stderr: &mut impl Write, failure: &St
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::ffi::OsString;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -424,7 +423,7 @@ mod tests {
     use super::{
         Cli, CliCommand, Grant, HostEndpoint, MAX_LAUNCH_LINE_BYTES, StallCommand, StallsCommand,
         StartError, endpoint_line, error_line, helper_from, prepare_launch, report_failure,
-        runtime_from, stall_spec, start, start_async, state_dir_from, write_endpoint,
+        runtime_from, stall_spec, start, start_async, state_dir, state_dir_from, write_endpoint,
         write_endpoint_to, write_line,
     };
 
@@ -549,6 +548,11 @@ mod tests {
             Some("stall run directory in use")
         );
         fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn the_launch_line_limit_is_eight_kibibytes() {
+        assert_eq!(MAX_LAUNCH_LINE_BYTES, 8192);
     }
 
     #[test]
@@ -694,6 +698,20 @@ mod tests {
             state_dir_from(Some(OsString::from("/custom/state")), Some(home)).expect("a state dir"),
             PathBuf::from("/custom/state")
         );
+    }
+
+    #[test]
+    fn state_dir_reads_the_current_environment() {
+        let configured = env::var_os("BARN_STATE_DIR").filter(|value| !value.is_empty());
+        let expected = configured.map_or_else(
+            || {
+                let home = env::var_os("HOME").expect("HOME is set");
+                Path::new(&home).join(".local").join("state").join("barn")
+            },
+            PathBuf::from,
+        );
+
+        assert_eq!(state_dir().expect("a state dir"), expected);
     }
 
     #[test]

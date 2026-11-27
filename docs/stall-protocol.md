@@ -46,9 +46,9 @@ Two plugin folders with the same file name do not collide: while a
 `run/<stall>` folder is live, a second start for it is refused with a named
 reason.
 
-barn then accepts the stall on `proto.sock` and supervises it for as long as it
-runs. Host-side frame brokering over `host.sock` is a follow-up
-([barn#46](https://github.com/wrkhse/barn/issues/46),
+Barn starts the stall and prints the endpoint; the accept and supervision loop
+on `proto.sock` is a separate follow-up. Host-side frame brokering over
+`host.sock` is a follow-up ([barn#46](https://github.com/wrkhse/barn/issues/46),
 [barn#48](https://github.com/wrkhse/barn/issues/48)); this command does not
 broker tack's frames yet.
 

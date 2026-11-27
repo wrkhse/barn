@@ -24,3 +24,9 @@ pub use protocol::{
     Job, MAX_LINE_BYTES, NetAuth, NetRequestParams, NetResponse, PROTOCOL_VERSION,
     StallStartParams, StallStartResult, deny, method,
 };
+
+/// The protocol version barn writes on the launch line: 1.
+pub const LAUNCH_PROTOCOL: u32 = 1;
+
+/// The longest launch line barn writes to stdout, in bytes: 8 KiB.
+pub const MAX_LAUNCH_LINE_BYTES: usize = 8 * 1024;
