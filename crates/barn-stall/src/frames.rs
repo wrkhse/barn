@@ -139,10 +139,45 @@ pub enum Outcome {
 }
 
 /// What a tool produced.
+///
+/// A tool result's `content` list holds items with `kind: "text"`. barn joins
+/// the items' `text` values in order, separated by a newline, into the single
+/// `text` field of its own tool reply; an empty `content` list yields empty
+/// text. A result that is neither a string nor a table with a `content` list,
+/// an item whose `kind` is not `text`, or an item whose `text` is not a string
+/// is a named `invalid_result` error, never stringified.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Content {
     /// How to read the text, such as `text` or `markdown`.
     pub kind: String,
     /// The text itself.
     pub text: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_content_list_round_trips_its_kind_and_text() {
+        let items = vec![
+            Content {
+                kind: "text".to_owned(),
+                text: "first line".to_owned(),
+            },
+            Content {
+                kind: "text".to_owned(),
+                text: "second line".to_owned(),
+            },
+        ];
+
+        let wire = serde_json::to_string(&items).expect("serialize the content list");
+        let back: Vec<Content> = serde_json::from_str(&wire).expect("deserialize the content list");
+
+        assert_eq!(back, items);
+        assert_eq!(back[0].kind, "text");
+        assert_eq!(back[0].text, "first line");
+        assert_eq!(back[1].kind, "text");
+        assert_eq!(back[1].text, "second line");
+    }
 }
