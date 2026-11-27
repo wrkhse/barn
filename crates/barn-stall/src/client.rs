@@ -220,6 +220,9 @@ mod tests {
         thread::scope(|scope| {
             scope.spawn(|| {
                 let mut server = server;
+                server
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("a read deadline");
                 let mut request = Vec::new();
                 let mut lines = BufReader::new(&mut server);
                 lines.read_until(b'\n', &mut request).expect("the request");
@@ -375,6 +378,34 @@ mod tests {
             });
 
             write_line(&mut writer, &json!({"a": 1})).expect("the small write succeeds");
+        });
+    }
+
+    #[test]
+    fn a_write_at_the_byte_cap_is_accepted_and_reaches_the_peer() {
+        let (mut writer, peer) = UnixStream::pair().expect("a socket pair");
+
+        // A JSON string adds two quote bytes and the newline adds one, so a
+        // payload of MAX_LINE_BYTES - 3 makes the line exactly MAX_LINE_BYTES.
+        let padding = "x".repeat(MAX_LINE_BYTES - 3);
+        let message = json!(padding);
+        let mut expected = serde_json::to_vec(&message).expect("the message serializes");
+        expected.push(b'\n');
+        assert_eq!(expected.len(), MAX_LINE_BYTES);
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut peer = peer;
+                peer.set_read_timeout(Some(Duration::from_secs(1)))
+                    .expect("a read deadline");
+                let mut received = Vec::new();
+                peer.read_to_end(&mut received)
+                    .expect("the peer drains the line");
+                assert_eq!(received, expected);
+            });
+
+            write_line(&mut writer, &message).expect("a line at the cap is accepted");
+            drop(writer);
         });
     }
 
