@@ -2160,6 +2160,16 @@ mod tests {
     }
 
     #[test]
+    fn a_standard_base64_symbol_is_plus_slash_or_alphanumeric() {
+        assert!(is_base64_symbol(b'+'));
+        assert!(is_base64_symbol(b'/'));
+        assert!(is_base64_symbol(b'a'));
+        assert!(is_base64_symbol(b'7'));
+        assert!(!is_base64_symbol(b'='));
+        assert!(!is_base64_symbol(b'*'));
+    }
+
+    #[test]
     fn a_base64_body_with_a_bad_alphabet_character_is_a_bad_frame() {
         for body in ["aGk*", "a$Gk", "a-Gk"] {
             let frame = format!(r#"{{"body_encoding":"base64","body":"{body}"}}"#);
