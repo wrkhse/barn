@@ -3567,6 +3567,24 @@ mod tests {
         );
     }
 
+    /// The fixture program's ELF machine, read from its header without
+    /// running it. The data encoding decides how `e_machine` is read.
+    #[cfg(target_os = "linux")]
+    fn elf_machine(path: &Path) -> Option<u16> {
+        let mut file = File::open(path).ok()?;
+        let mut header = [0_u8; 20];
+        file.read_exact(&mut header).ok()?;
+        // e_ident[EI_DATA]: 1 is little endian, 2 is big endian.
+        let little = header[5] == 1;
+        let raw = [header[18], header[19]];
+
+        Some(if little {
+            u16::from_le_bytes(raw)
+        } else {
+            u16::from_be_bytes(raw)
+        })
+    }
+
     #[test]
     fn the_policy_names_resolved_paths() {
         let fixture = PrepareFixture::new();
@@ -3588,14 +3606,58 @@ mod tests {
             .map(|cap| (cap.original, cap.resolved, cap.is_file))
             .collect();
 
-        assert_eq!(
-            grants,
-            [
-                (target.clone(), target, false),
-                (program.clone(), program, true),
-                (state.clone(), state, false),
+        #[cfg(target_os = "linux")]
+        let machine = elf_machine(&program).expect("ELF machine");
+
+        let mut expected = vec![
+            (target.clone(), target, false),
+            (program.clone(), program, true),
+        ];
+
+        #[cfg(target_os = "linux")]
+        {
+            let loader = [
+                "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+                "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+                "/lib64/ld-linux-x86-64.so.2",
+                "/lib/ld-musl-x86_64.so.1",
             ]
-        );
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.exists());
+
+            if let Some(loader) = loader {
+                let loader = loader.canonicalize().expect("system loader");
+                expected.push((loader.clone(), loader, true));
+
+                let dirs = [
+                    (62_u16, "/usr/lib/x86_64-linux-gnu"),
+                    (62, "/lib/x86_64-linux-gnu"),
+                    (183, "/usr/lib/aarch64-linux-gnu"),
+                    (183, "/lib/aarch64-linux-gnu"),
+                ]
+                .into_iter()
+                .filter(|(arch, _)| *arch == machine)
+                .map(|(_, dir)| dir)
+                .map(Path::new)
+                .filter(|dir| dir.is_dir())
+                .filter_map(|dir| dir.canonicalize().ok())
+                .fold(Vec::new(), |mut dirs, dir| {
+                    if !dirs.contains(&dir) {
+                        dirs.push(dir);
+                    }
+                    dirs
+                });
+
+                for dir in dirs {
+                    expected.push((dir.clone(), dir, false));
+                }
+            }
+        }
+
+        expected.push((state.clone(), state, false));
+
+        assert_eq!(grants, expected);
     }
 
     type PolicyEntry = (PathBuf, PathBuf, bool);
