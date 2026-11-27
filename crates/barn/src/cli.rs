@@ -367,35 +367,49 @@ fn prepare_launch(
     })
 }
 
-/// Whether another start holds the run directory's lock.
-///
-/// An unheld directory is stale: the supervisor clears it in `RunDir::create`.
-/// Only a live lock blocks a second start.
-fn run_dir_is_live(path: &Path) -> Result<bool, StartError> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(source) => {
-            return Err(StartError::Io {
-                operation: "opening the stall run directory",
-                source,
-            });
-        }
-    };
+/// Resolves opening the run directory: a missing directory is stale, while
+/// any other failure is named at the open boundary.
+fn opened_run_dir(result: io::Result<File>) -> Result<Option<File>, StartError> {
+    match result {
+        Ok(file) => Ok(Some(file)),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(StartError::Io {
+            operation: "opening the stall run directory",
+            source,
+        }),
+    }
+}
 
-    match file.try_lock().map_err(io::Error::from) {
+/// Resolves locking the run directory: a contended lock is live, an acquired
+/// one is stale, and any other failure is named at the lock boundary.
+fn locked_run_dir(result: io::Result<()>) -> Result<bool, StartError> {
+    match result {
+        Ok(()) => Ok(false),
         Err(source) if source.kind() == io::ErrorKind::WouldBlock => Ok(true),
         Err(source) => Err(StartError::Io {
             operation: "locking the stall run directory",
             source,
         }),
-        Ok(()) => {
-            // We own this lock; release it so the supervisor can relock the
-            // directory for the start this check is allowing.
-            drop(file);
-            Ok(false)
-        }
     }
+}
+
+/// Whether another start holds the run directory's lock.
+///
+/// An unheld directory is stale: the supervisor clears it in `RunDir::create`.
+/// Only a live lock blocks a second start.
+fn run_dir_is_live(path: &Path) -> Result<bool, StartError> {
+    let Some(file) = opened_run_dir(File::open(path))? else {
+        return Ok(false);
+    };
+
+    if locked_run_dir(file.try_lock().map_err(io::Error::from))? {
+        return Ok(true);
+    }
+
+    // We own this lock; release it so the supervisor can relock the
+    // directory for the start this check is allowing.
+    drop(file);
+    Ok(false)
 }
 
 /// The runtime is the program; the plugin folder is its first argument and
@@ -501,9 +515,9 @@ mod tests {
 
     use super::{
         Cli, CliCommand, Grant, HostEndpoint, MAX_LAUNCH_LINE_BYTES, StallCommand, StallsCommand,
-        StartError, StartFailure, endpoint_line, error_line, helper_from, prepare_launch,
-        report_failure, runtime_from, stall_spec, start, start_async, state_dir, state_dir_from,
-        write_endpoint, write_endpoint_to, write_line,
+        StartError, StartFailure, endpoint_line, error_line, helper_from, locked_run_dir,
+        opened_run_dir, prepare_launch, report_failure, runtime_from, stall_spec, start,
+        start_async, state_dir, state_dir_from, write_endpoint, write_endpoint_to, write_line,
     };
 
     /// A sink that writes a prefix, then fails, to model a broken stdout.
@@ -690,6 +704,52 @@ mod tests {
         .expect("a missing run directory must not block a start");
 
         assert_eq!(launch.stall.name, "sourcefed");
+    }
+
+    #[test]
+    fn an_unexpected_open_error_is_a_named_io_failure() {
+        let failure =
+            opened_run_dir(Err(io::Error::other("boom"))).expect_err("a named open failure");
+
+        assert_eq!(failure.reason(), "opening the stall run directory");
+        assert!(matches!(
+            failure,
+            StartError::Io {
+                operation: "opening the stall run directory",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_unexpected_lock_error_is_a_named_io_failure() {
+        let failure =
+            locked_run_dir(Err(io::Error::other("boom"))).expect_err("a named lock failure");
+
+        assert_eq!(failure.reason(), "locking the stall run directory");
+        assert!(matches!(
+            failure,
+            StartError::Io {
+                operation: "locking the stall run directory",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_missing_run_directory_is_not_live_via_the_open_helper() {
+        let opened = opened_run_dir(Err(io::Error::from(io::ErrorKind::NotFound)))
+            .expect("a missing run directory is not a failure");
+
+        assert!(opened.is_none());
+    }
+
+    #[test]
+    fn a_contended_lock_is_live_via_the_lock_helper() {
+        let live = locked_run_dir(Err(io::Error::from(io::ErrorKind::WouldBlock)))
+            .expect("a contended lock is not a failure");
+
+        assert!(live);
     }
 
     #[test]
