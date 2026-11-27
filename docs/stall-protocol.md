@@ -11,43 +11,42 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
 ## Launching a stall from tack
 
 tack runs barn as a separate program; its only barn dependency is
-`barn-stall`. tack writes a spec file and launches one stall with:
+`barn-stall`. tack launches one stall with:
 
 ```sh
-barn stalls start /path/to/stall.json \
-  --helper /path/to/barn-exec \
-  --state-dir /var/lib/barn \
-  --host-pid 4321
+barn stall start --plugin /abs/path/to/plugin --daemon-pid 4321
 ```
 
-The spec is one JSON object. Every field is required, and every path in it is
-absolute:
+`--plugin` is the absolute path of the plugin folder and `--daemon-pid` is
+the pid of the tack daemon. tack finds the binary at `TACK_BARN_BIN`, or beside
+the tack daemon when that is unset. It searches no `PATH`; when the binary is in
+neither place, tack refuses with a named deny.
 
-```json
-{
-  "name": "sourcefed",
-  "program": "/usr/local/bin/sourcefed",
-  "args": [],
-  "grant": {
-    "executable": "/usr/local/bin/sourcefed",
-    "read_paths": ["/usr/local/bin/sourcefed"],
-    "write_paths": ["/var/lib/barn/sourcefed"],
-    "network_hosts": ["api.github.com"]
-  }
-}
-```
+barn's state lives in `BARN_STATE_DIR`. tack sets it to `<tack state>/barn`;
+a standalone barn defaults to `HOME/.local/state/barn`.
 
-barn writes one newline-terminated line to stdout, the endpoint tack reads for
-the stall it just started:
+stdout carries exactly one newline-terminated JSON line, bounded by
+`MAX_LINE_BYTES`, and logs go only to stderr. On success the line is the
+endpoint tack reads for the stall it just started:
 
 <!-- prettier-ignore -->
 ```json
-{"socket_path":"/var/lib/barn/run/sourcefed/host.sock","token":"…"}
+{"protocol":1,"socket_path":"/abs/path/run/<stall>/host.sock","token":"<single-use token>"}
 ```
 
-The line is bounded by `MAX_LINE_BYTES`, including its newline. barn then
-accepts the stall on `proto.sock` and supervises it for as long as it runs.
-Host-side frame brokering over `host.sock` is a follow-up
+On failure the line names the reason and barn exits non-zero:
+
+<!-- prettier-ignore -->
+```json
+{"protocol":1,"error":"<named reason>"}
+```
+
+Both lines reject unknown fields. Two plugin folders with the same file name do
+not collide: while a `run/<stall>` folder is live, a second start for it is
+refused with a named reason.
+
+barn then accepts the stall on `proto.sock` and supervises it for as long as it
+runs. Host-side frame brokering over `host.sock` is a follow-up
 ([barn#46](https://github.com/wrkhse/barn/issues/46),
 [barn#48](https://github.com/wrkhse/barn/issues/48)); this command does not
 broker tack's frames yet.
@@ -72,11 +71,10 @@ broker tack's frames yet.
   `TOKEN_TTL_SECS`, is a named deny: barn answers with the deny and closes
   the connection, issuing no new token without a restart. Failures at this
   boundary are named denies, each in `data.reason` on a `DENIED_CODE`
-  error; `barn-stall`'s `deny` module names every reason. The socket path and
-  token reach the embedding host in-process: the embedding host calls
-  `RunningStall::host_endpoint()` after `Supervisor::start_for_host` and receives
-  the path and token there; no environment variable or file carries them to
-  tack.
+  error; `barn-stall`'s `deny` module names every reason. tack launches barn as a
+  separate program and reads the socket path and token from barn's stdout as
+  one bounded JSON line, as "Launching a stall from tack" describes; there is
+  no in-process carrier.
 - The stall connects and sends `stall.start` as its first message. barn checks
   that the peer PID matches the child it spawned and that the peer UID owns
   the socket. A missing peer PID fails authentication. The stall declares its
