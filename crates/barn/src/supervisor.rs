@@ -2037,6 +2037,16 @@ mod tests {
     }
 
     #[test]
+    fn a_base64_tail_of_two_symbols_decodes_to_one_byte() {
+        assert_eq!(base64_decoded_len("ag=="), 1);
+    }
+
+    #[test]
+    fn a_base64_tail_of_three_symbols_decodes_to_two_bytes() {
+        assert_eq!(base64_decoded_len("aGk="), 2);
+    }
+
+    #[test]
     fn a_body_that_cannot_be_measured_is_denied() {
         for frame in [
             br#"{"body":42}"#.as_slice(),

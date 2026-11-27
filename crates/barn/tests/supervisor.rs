@@ -470,6 +470,7 @@ fn host_start(id: u64, token: &str, pid: u32, protocol: u32) -> String {
 
 fn connect_host(endpoint: &HostEndpoint) -> io::Result<BufReader<UnixStream>> {
     let stream = UnixStream::connect(&endpoint.socket_path)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
 
     Ok(BufReader::new(stream))
 }
@@ -693,8 +694,15 @@ async fn a_framed_request_is_forwarded_and_its_exact_reply_returned() {
         .await
         .expect("broker the frame");
 
-    let mut reply = String::new();
-    client.read_line(&mut reply).expect("framed reply");
+    let read = tokio::task::spawn_blocking(move || {
+        let mut reply = String::new();
+        client.read_line(&mut reply).expect("framed reply");
+        reply
+    });
+    let reply = timeout(Duration::from_secs(2), read)
+        .await
+        .expect("framed reply within the deadline")
+        .expect("framed reply task");
     assert_eq!(reply, format!("{HOST_REPLY}\n"));
 }
 
