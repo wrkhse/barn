@@ -3953,6 +3953,72 @@ mod tests {
         })
     }
 
+    #[cfg(target_os = "linux")]
+    fn expected_system_loader_entries(machine: u16) -> Vec<PolicyEntry> {
+        let loader = [
+            "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+            "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+            "/lib64/ld-linux-x86-64.so.2",
+            "/lib/ld-musl-x86_64.so.1",
+        ]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.exists());
+
+        let mut expected = Vec::new();
+
+        if let Some(loader) = loader {
+            let loader = loader.canonicalize().expect("system loader");
+            let parent = loader.parent().expect("loader parent").to_path_buf();
+            expected.push((loader.clone(), loader.clone(), true));
+
+            let mut dirs = [
+                (62_u16, "/usr/lib/x86_64-linux-gnu"),
+                (62, "/lib/x86_64-linux-gnu"),
+                (183, "/usr/lib/aarch64-linux-gnu"),
+                (183, "/lib/aarch64-linux-gnu"),
+            ]
+            .into_iter()
+            .filter(|(arch, _)| *arch == machine)
+            .map(|(_, dir)| dir)
+            .map(Path::new)
+            .filter(|dir| dir.is_dir())
+            .filter_map(|dir| dir.canonicalize().ok())
+            .fold(Vec::new(), |mut dirs, dir| {
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+                dirs
+            });
+
+            if !dirs.contains(&parent) {
+                let roots: &[&str] =
+                    if loader.starts_with("/lib64") || loader.starts_with("/usr/lib64") {
+                        &["/lib64", "/usr/lib64"]
+                    } else {
+                        &["/lib", "/usr/lib"]
+                    };
+
+                for &root in roots {
+                    let root = Path::new(root);
+                    if !root.exists() {
+                        continue;
+                    }
+                    let root = root.canonicalize().expect("family root");
+                    if !dirs.contains(&root) {
+                        dirs.push(root);
+                    }
+                }
+            }
+
+            for dir in dirs {
+                expected.push((dir.clone(), dir, false));
+            }
+        }
+
+        expected
+    }
+
     #[test]
     fn the_policy_names_resolved_paths() {
         let fixture = PrepareFixture::new();
@@ -3983,45 +4049,7 @@ mod tests {
         ];
 
         #[cfg(target_os = "linux")]
-        {
-            let loader = [
-                "/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
-                "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
-                "/lib64/ld-linux-x86-64.so.2",
-                "/lib/ld-musl-x86_64.so.1",
-            ]
-            .into_iter()
-            .map(Path::new)
-            .find(|path| path.exists());
-
-            if let Some(loader) = loader {
-                let loader = loader.canonicalize().expect("system loader");
-                expected.push((loader.clone(), loader, true));
-
-                let dirs = [
-                    (62_u16, "/usr/lib/x86_64-linux-gnu"),
-                    (62, "/lib/x86_64-linux-gnu"),
-                    (183, "/usr/lib/aarch64-linux-gnu"),
-                    (183, "/lib/aarch64-linux-gnu"),
-                ]
-                .into_iter()
-                .filter(|(arch, _)| *arch == machine)
-                .map(|(_, dir)| dir)
-                .map(Path::new)
-                .filter(|dir| dir.is_dir())
-                .filter_map(|dir| dir.canonicalize().ok())
-                .fold(Vec::new(), |mut dirs, dir| {
-                    if !dirs.contains(&dir) {
-                        dirs.push(dir);
-                    }
-                    dirs
-                });
-
-                for dir in dirs {
-                    expected.push((dir.clone(), dir, false));
-                }
-            }
-        }
+        expected.extend(expected_system_loader_entries(machine));
 
         expected.push((state.clone(), state, false));
 

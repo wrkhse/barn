@@ -114,6 +114,66 @@ jobs:
           done
       - run: cargo test --doc --workspace --locked
 
+  # The real stall exec proof on a non-Debian layout: Fedora keeps its loader in
+  # /usr/lib64. The policy test grants that library folder read and execute but
+  # not write, and asserts a stall's write into it is refused.
+  linux-nonddebian:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      BARN_NON_DEBIAN_LAYOUT: "1"
+    steps:
+      - name: Install build tools
+        run: dnf install -y git gcc gcc-c++ curl jq
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # fedora:latest has no rustup, so install it before reading the pin out of
+      # rust-toolchain.toml. The installer is downloaded from the pinned URL and
+      # its published sha256 is verified before it is run. jq and curl are what
+      # install-action needs; gcc builds native dependencies and gcc-c++ builds
+      # mlua-sys; git is installed before checkout.
+      - name: Install rustup and the pinned toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init \
+            -o rustup-init
+          curl --proto '=https' --tlsv1.2 -sSf \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init.sha256 \
+            -o rustup-init.sha256
+          sha256sum -c rustup-init.sha256 --ignore-missing
+          chmod +x rustup-init
+          ./rustup-init -y --profile minimal --default-toolchain none --no-modify-path
+          . "$HOME/.cargo/env"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          rustup toolchain install "$channel" --profile minimal \
+            --component rustfmt --component clippy
+          rustup default "$channel"
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: cargo-nextest@0.9.152
+      - name: Require a non-multiarch layout
+        run: |
+          if [ ! -d /usr/lib64 ] && [ ! -d /lib64 ]; then
+            echo "::error::expected a plain lib64 library root: neither /usr/lib64 nor /lib64 is a directory"
+            exit 1
+          fi
+          if [ -d /lib/x86_64-linux-gnu ] || [ -d /usr/lib/x86_64-linux-gnu ]; then
+            echo "::error::expected a non-multiarch layout: /lib/x86_64-linux-gnu or /usr/lib/x86_64-linux-gnu is a directory"
+            exit 1
+          fi
+      # The lib target checks the computed grant; the non_debian target execs
+      # a stall in the real sandbox, grants the host's library folder read-only
+      # and checks that a write into that folder is refused.
+      - name: The non-Debian loader grant, in the real sandbox
+        run: |
+          cargo nextest run --locked -p barn --lib
+          cargo nextest run --locked -p barn --test non_debian
+
   # Cargo.toml's rust-version, exactly. Today the pinned toolchain is the same
   # version, so this job states the floor a pin change would have to keep.
   msrv:

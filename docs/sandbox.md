@@ -31,31 +31,26 @@ runs `ldd` or any other process to find it. The grant then holds:
 
 - the stall executable: read, execute
 - the exact `PT_INTERP` loader file: read, execute
-- the Debian-style multiarch directories for the ELF machine type (x86-64 or
-  aarch64), `/lib/<arch>-linux-gnu` and `/usr/lib/<arch>-linux-gnu`, such as
-  `/lib/x86_64-linux-gnu`: read, execute, each only when it exists
+- the library directories for the host's layout, read, execute, each only when
+  it exists
 
-The multiarch directories are granted for reading so the loader can map
-libraries. They are named from the ELF machine type, not from where the loader
-lives, so they are granted for any loader that passes the check below. The
-loader's own parent directory is not granted separately: it is readable only
-when it is one of these directories. nono's `AccessMode::Read` includes Execute
-(see above), so the stall can also execute any ELF it can read in those
-directories. nono 0.82 cannot grant read without execute, so the grant cannot
-be narrowed.
+On a Debian-style multiarch layout the library directories are the multiarch
+directories for the ELF machine type (x86-64 or aarch64),
+`/lib/<arch>-linux-gnu` and `/usr/lib/<arch>-linux-gnu`, such as
+`/lib/x86_64-linux-gnu`. They are named from the ELF machine type, not from
+where the loader lives. On a merged-/usr system, where `/lib` canonicalizes to
+`/usr/lib`, the grant stays these directories and never widens to `/usr/lib`.
 
-A broad library root is never granted: not `/lib` or `/usr/lib` itself. On a
-merged-/usr system, where `/lib` canonicalizes to `/usr/lib`, the grant stays
-the multiarch directories and never widens to `/usr/lib`.
+On any other layout barn grants both roots of the loader's family that exist:
+`/lib` and `/usr/lib`, or `/lib64` and `/usr/lib64`. The grant is those roots
+plus the exact loader file. When `/usr` is merged and two roots resolve to the
+same directory, the grant holds it once. barn grants neither `/` nor a home
+folder.
 
-A loader in a non-multiarch layout (`/lib64`, `/usr/lib64` or Alpine's `/lib`)
-is refused at policy time, and the stall does not start. The error is:
-
-```text
-unsupported library layout <dir>: barn-luau-stall must be statically linked on this host
-```
-
-Portable Linux support needs a static musl build of the stall.
+nono's `AccessMode::Read` includes Execute (see above), so the granted
+directories are readable and executable but not writable. The stall can execute
+any ELF it can read in them. nono 0.82 cannot grant read without execute, so
+the grant cannot be narrowed.
 
 barn grants no blanket read of `/`. A stall cannot read a library or file
 outside the paths above.
