@@ -49,6 +49,13 @@ async fn barn_accepts_a_sandboxed_child_only_once() -> TestResult {
         return Err(io::Error::other("wrong follow-on frame").into());
     }
 
+    // The marker can only arrive after the spent-token peer's frame is queued.
+    let mut marker = String::new();
+    timeout(DEADLINE, stream.read_line(&mut marker)).await??;
+    if marker != "{\"spent_attempt\":true}\n" {
+        return Err(io::Error::other("wrong spent-attempt marker").into());
+    }
+
     drop(stream);
 
     match stall.accept().await {
@@ -203,6 +210,9 @@ fn sandbox_client_fixture() -> TestResult {
     }
 
     let mut second = connect(&socket, &token, "")?;
+    // Written after the spent-token frame: one stream preserves byte order, so
+    // seeing this marker means that peer is already in the listener backlog.
+    first.get_mut().write_all(b"{\"spent_attempt\":true}\n")?;
     let mut extra = String::new();
 
     if second.read_line(&mut extra)? != 0 {

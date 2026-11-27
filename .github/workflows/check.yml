@@ -7,6 +7,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # macOS runners are scarce; a daily run keeps the flake proof on main too.
+  schedule:
+    - cron: '0 3 * * *'
   workflow_dispatch:
     inputs:
       full_tree:
@@ -91,6 +94,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Install the pinned toolchain
         run: |
           channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
@@ -103,15 +107,72 @@ jobs:
         with:
           tool: cargo-nextest@0.9.152
       - run: cargo nextest run --workspace --locked
+      # macOS runners are scarce: repeat the flaky sandbox-child proof only on
+      # a change to the code it covers, or on the daily main run.
+      - name: Is the sandbox child flake in scope?
+        id: flake_scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          BEFORE: ${{ github.event.before }}
+          FULL_TREE: ${{ inputs.full_tree }}
+        run: |
+          if [ "$EVENT" = schedule ] || [ "$FULL_TREE" = true ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$EVENT" = pull_request ]; then
+            base="${BASE:-origin/main}"
+          else
+            # A branch creation reports an all-zero before; diffing from it
+            # would silently skip the flake proof.
+            if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              echo "::error::push before commit is all zero (branch creation); cannot scope the flake proof"
+              exit 1
+            fi
+            base="${BEFORE:-HEAD^}"
+          fi
+          if ! git rev-parse --verify 'HEAD^' > /dev/null 2>&1; then
+            echo "::error::HEAD has no parent commit; cannot scope the flake proof"
+            exit 1
+          fi
+          if ! git rev-parse --verify "${base}^{commit}" > /dev/null 2>&1; then
+            echo "::error::scope base $base is not a commit; cannot scope the flake proof"
+            exit 1
+          fi
+          if ! changed=$(git diff --name-only "$base"...HEAD -- \
+            'crates/barn-exec/**' 'crates/barn/src/supervisor.rs'); then
+            echo "::error::git diff failed; cannot scope the flake proof"
+            exit 1
+          fi
+          if [ -n "$changed" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Repeat the sandbox child acceptance test 40x
+        if: steps.flake_scope.outputs.run == 'true'
+        run: |
+          ran=0
+          for n in {1..40}; do
+            echo "sandbox child acceptance, run $n of 40"
+            cargo nextest run -p barn-exec --locked --no-tests=fail \
+              -E 'test(=barn_accepts_a_sandboxed_child_only_once)'
+            ran=$((ran + 1))
+          done
+          test "$ran" -eq 40
       # The restart test runs /bin/sh under Seatbelt; thirty runs in a row show
       # it passes every time, not once.
       - name: Repeat the restart test
         run: |
-          for run in $(seq 1 30); do
+          ran=0
+          for run in {1..30}; do
             echo "restart test, run $run of 30"
-            cargo nextest run -p barn-exec --locked \
+            cargo nextest run -p barn-exec --locked --no-tests=fail \
               -E 'test(=barn_restarts_a_crashed_child_with_a_fresh_pid)'
+            ran=$((ran + 1))
           done
+          test "$ran" -eq 30
       - run: cargo test --doc --workspace --locked
 
   # The real stall exec proof on a non-Debian layout: Fedora keeps its loader in
