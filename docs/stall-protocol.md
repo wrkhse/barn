@@ -60,7 +60,8 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
   UTF-8 when the bytes are valid UTF-8 and the line still fits `MAX_LINE_BYTES`,
   and base64 otherwise, with `body_encoding` saying which. A body over the cap
   is refused: barn answers the stall with an error naming the cap, and a stall
-  that sends one has broken the protocol.
+  that sends one has broken the protocol. _For a later slice to confirm: that
+  error's code._
 
 ## Versions
 
@@ -269,5 +270,6 @@ The plan fixes these methods' names and directions. These details remain open:
 - whether `Job.every` is a duration grammar, and which one.
 - how barn reports an unsupported version: the stall sends its version in
   `stall.start`'s `protocol` field.
+- the code of the error barn answers with when a body is over its cap.
 - the payloads of the frames barn brokers between tack and the stall on
   `host.sock`, past the framed contract above.
