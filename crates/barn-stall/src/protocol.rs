@@ -298,6 +298,20 @@ mod tests {
     }
 
     #[test]
+    fn host_start_params_debug_redacts_the_token() {
+        let params = HostStartParams {
+            protocol: 1,
+            token: "secret".to_owned(),
+            pid: 7,
+        };
+
+        assert_eq!(
+            format!("{params:?}"),
+            "HostStartParams { protocol: 1, token: \"[redacted]\", pid: 7 }"
+        );
+    }
+
+    #[test]
     fn host_start_writes_the_pages_result() {
         let reply = lines()
             .into_iter()
