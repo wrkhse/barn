@@ -74,14 +74,17 @@ impl Grant {
     /// for the egress allow-list.
     ///
     /// On Linux, an ELF64 executable's `PT_INTERP` names a dynamic loader. The
-    /// loader must resolve to a strict descendant of a system library root,
-    /// sit in a Debian-style multiarch directory and be a regular file; it is
-    /// granted read and execute. Only existing multiarch directories for the
-    /// architecture are granted read; a broad root itself is never granted. No
-    /// home folder or `/` is opened up. A loader outside those roots, in
-    /// another layout (for example `/lib64` or `/usr/lib64`), or an ELF64 file
-    /// that cannot be parsed, is an error. macOS needs no extra grants: its
-    /// Seatbelt profile already allows reading `/` and executing readable
+    /// loader must resolve to a strict descendant of a system library root and
+    /// be a regular file; it is granted read and execute. A Debian-style
+    /// multiarch loader gets only the existing multiarch directories for its
+    /// architecture. Any other layout gets both library roots its family
+    /// searches that exist: `/lib` and `/usr/lib`, or `/lib64` and
+    /// `/usr/lib64`, deduplicated when `/usr` is merged. Those directories
+    /// are read and execute but never write, because nono's read includes
+    /// execute; a body or state file under them stays unwritable. No home
+    /// folder or `/` is opened up. A loader outside those roots, or an ELF64
+    /// file that cannot be parsed, is an error. macOS needs no extra grants:
+    /// its Seatbelt profile already allows reading `/` and executing readable
     /// paths.
     ///
     /// # Errors
@@ -185,10 +188,11 @@ mod loader {
     /// Grants the loader and the directories it searches for libraries.
     ///
     /// A non-ELF executable has no interpreter and adds no paths. An unusable
-    /// ELF file, a loader outside the system library roots, or a loader in a
-    /// non-multiarch layout is an error. Only existing Debian-style multiarch
-    /// directories are added; a broad root, a home folder or `/` is never
-    /// opened up.
+    /// ELF file or a loader outside the system library roots is an error. A
+    /// Debian multiarch loader gets its exact file and the existing multiarch
+    /// directories; any other layout gets its exact file and the library roots
+    /// its family searches, read and execute but never write. A home folder or
+    /// `/` is never opened up.
     pub(super) fn grant_paths(
         caps: CapabilitySet,
         executable: &Path,
@@ -198,24 +202,13 @@ mod loader {
         };
 
         require_system_loader(&interp.path)?;
-        require_multiarch_layout(&interp.path, interp.arch)?;
         require_regular_file(&interp.path)?;
 
-        let caps = caps
-            .allow_file(&interp.path, AccessMode::Read)
-            .map_err(|source| PolicyError::Executable {
-                path: interp.path.clone(),
-                source,
-            })?;
-
-        let mut caps = caps;
-        for dir in loader_dirs(&interp) {
-            caps = caps
-                .allow_path(&dir, AccessMode::Read)
-                .map_err(|source| PolicyError::ReadPath { path: dir, source })?;
+        if is_multiarch_layout(&interp) {
+            grant_multiarch(caps, &interp)
+        } else {
+            grant_non_multiarch(caps, &interp.path)
         }
-
-        Ok(caps)
     }
 
     /// Whether `path` is a strict descendant of `/lib`, `/lib64`,
@@ -287,40 +280,178 @@ mod loader {
         Ok(())
     }
 
-    /// A loader is supported only in a Debian-style multiarch directory for
-    /// its machine. Fedora, RHEL and Arch keep loaders in `/lib64` or
-    /// `/usr/lib64`, and Alpine in `/lib`; those hosts need a static stall.
-    ///
-    /// An existing loader is checked by its resolved parent: Ubuntu's
+    /// Whether a loader sits in a Debian-style multiarch directory for its
+    /// machine. An existing loader is checked by its resolved parent: Ubuntu's
     /// `/lib64/ld-linux-x86-64.so.2` is a symlink into a multiarch directory.
-    /// A missing loader falls back to its literal parent, so a real `/lib64`
-    /// or `/lib` loader stays refused by name.
-    fn require_multiarch_layout(path: &Path, arch: Architecture) -> Result<(), PolicyError> {
-        let resolved = path.canonicalize().ok();
-        require_multiarch_layout_of(path, resolved.as_deref(), arch)
+    fn is_multiarch_layout(interp: &Interpreter) -> bool {
+        let resolved = interp.path.canonicalize().ok();
+        is_multiarch_layout_of(&interp.path, resolved.as_deref(), interp.arch)
     }
 
     /// Checks the layout of the resolved loader for an existing path, or the
     /// literal path otherwise. Taking the resolver's result separately lets a
     /// symlinked loader be checked without writing into a system library root.
-    fn require_multiarch_layout_of(
-        path: &Path,
-        resolved: Option<&Path>,
-        arch: Architecture,
-    ) -> Result<(), PolicyError> {
+    fn is_multiarch_layout_of(path: &Path, resolved: Option<&Path>, arch: Architecture) -> bool {
         let target = resolved.unwrap_or(path);
         let dir = target.parent().unwrap_or(target);
-        let supported = arch_lib_dirs(arch)
-            .iter()
-            .any(|candidate| Path::new(candidate) == dir);
 
-        if supported {
-            Ok(())
-        } else {
-            Err(PolicyError::UnsupportedLibraryLayout {
-                dir: dir.to_path_buf(),
-            })
+        arch_lib_dirs(arch)
+            .iter()
+            .any(|candidate| Path::new(candidate) == dir)
+    }
+
+    /// The library roots a non-multiarch loader searches, each once. The
+    /// loader's own directory is always searched: on Alpine the musl loader
+    /// lives in `/lib` while libraries install in `/usr/lib`, and an unmerged
+    /// `/lib64` host needs `/usr/lib64` too. A loader under `/lib` or
+    /// `/usr/lib` therefore searches both of that pair, and one under
+    /// `/lib64` or `/usr/lib64` both of that pair. Only paths and folders are
+    /// read; nothing is executed to choose the roots.
+    fn library_roots(loader: &Path) -> Vec<PathBuf> {
+        let resolved = loader
+            .canonicalize()
+            .unwrap_or_else(|_| loader.to_path_buf());
+
+        library_roots_of(&resolved, |path| path.canonicalize().ok())
+    }
+
+    /// Selects library roots from an already-resolved loader path and an
+    /// injected resolver for candidate directories. A candidate that cannot be
+    /// resolved does not exist and is skipped; a family candidate that resolves
+    /// to `/` or outside the library roots is skipped. Roots come back in
+    /// search order, once each, so a merged `/usr` does not double-grant.
+    fn library_roots_of(
+        resolved_loader: &Path,
+        resolve: impl Fn(&Path) -> Option<PathBuf>,
+    ) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+
+        let parent = resolved_loader.parent().unwrap_or(resolved_loader);
+        if let Some(root) = resolve(parent)
+            && root != Path::new("/")
+            && !roots.contains(&root)
+        {
+            roots.push(root);
         }
+
+        if let Some(family) = library_family(resolved_loader) {
+            for candidate in family_candidates(family) {
+                if let Some(root) = resolve(Path::new(candidate))
+                    && root != Path::new("/")
+                    && is_library_root(&root)
+                    && !roots.contains(&root)
+                {
+                    roots.push(root);
+                }
+            }
+        }
+
+        roots
+    }
+
+    /// The legacy library family a resolved loader lives in, read from its
+    /// path: `/lib` and `/usr/lib` form one family, `/lib64` and
+    /// `/usr/lib64` the other. A path under no library root has no family.
+    fn library_family(loader: &Path) -> Option<LibraryFamily> {
+        let mut parts = loader.components();
+        if !matches!(parts.next(), Some(Component::RootDir)) {
+            return None;
+        }
+        match parts.next().and_then(|part| part.as_os_str().to_str()) {
+            Some("lib") => Some(LibraryFamily::Lib),
+            Some("lib64") => Some(LibraryFamily::Lib64),
+            Some("usr") => match parts.next().and_then(|part| part.as_os_str().to_str()) {
+                Some("lib") => Some(LibraryFamily::Lib),
+                Some("lib64") => Some(LibraryFamily::Lib64),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The two roots a library family searches, in search order.
+    const fn family_candidates(family: LibraryFamily) -> &'static [&'static str] {
+        match family {
+            LibraryFamily::Lib => &["/lib", "/usr/lib"],
+            LibraryFamily::Lib64 => &["/lib64", "/usr/lib64"],
+        }
+    }
+
+    /// Whether `path` is exactly one of the system library roots, so a
+    /// resolved family candidate never broadens the grant to `/`, `/usr` or a
+    /// home folder.
+    fn is_library_root(path: &Path) -> bool {
+        let mut parts = path.components();
+        if !matches!(parts.next(), Some(Component::RootDir)) {
+            return false;
+        }
+        match parts.next().and_then(|part| part.as_os_str().to_str()) {
+            Some("lib" | "lib64") => parts.next().is_none(),
+            Some("usr") => {
+                matches!(
+                    parts.next().and_then(|part| part.as_os_str().to_str()),
+                    Some("lib" | "lib64")
+                ) && parts.next().is_none()
+            }
+            _ => false,
+        }
+    }
+
+    /// The legacy library families a non-multiarch loader may belong to.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum LibraryFamily {
+        Lib,
+        Lib64,
+    }
+
+    /// Grants the exact loader file and the existing multiarch directories for
+    /// its machine. A broad root is never granted here.
+    fn grant_multiarch(
+        caps: CapabilitySet,
+        interp: &Interpreter,
+    ) -> Result<CapabilitySet, PolicyError> {
+        let mut caps = grant_loader_file(caps, &interp.path)?;
+        for dir in loader_dirs(interp) {
+            caps = caps
+                .allow_path(&dir, AccessMode::Read)
+                .map_err(|source| PolicyError::ReadPath { path: dir, source })?;
+        }
+
+        Ok(caps)
+    }
+
+    /// Grants the exact loader file and every library root it searches.
+    /// nono's read includes execute, so the loader can run the libraries here;
+    /// a body or state file under a root is never writable.
+    fn grant_non_multiarch(
+        caps: CapabilitySet,
+        loader: &Path,
+    ) -> Result<CapabilitySet, PolicyError> {
+        let mut caps = grant_loader_file(caps, loader)?;
+
+        for root in library_roots(loader) {
+            caps = grant_library_root(caps, &root)?;
+        }
+
+        Ok(caps)
+    }
+
+    /// Grants the loader file read, and so execute on both nono backends.
+    fn grant_loader_file(caps: CapabilitySet, loader: &Path) -> Result<CapabilitySet, PolicyError> {
+        caps.allow_file(loader, AccessMode::Read)
+            .map_err(|source| PolicyError::Executable {
+                path: loader.to_path_buf(),
+                source,
+            })
+    }
+
+    /// Grants a whole library root read and execute, never write.
+    fn grant_library_root(caps: CapabilitySet, root: &Path) -> Result<CapabilitySet, PolicyError> {
+        caps.allow_path(root, AccessMode::Read)
+            .map_err(|source| PolicyError::ReadPath {
+                path: root.to_path_buf(),
+                source,
+            })
     }
 
     /// Reads `PT_INTERP` from an ELF64 file. `Ok(None)` means the file is
@@ -597,10 +728,9 @@ mod loader {
         dirs
     }
 
-    /// Debian-style multiarch directories, the only supported library layout.
-    /// NixOS keeps its libraries in a store with no fixed path, and the
-    /// `/lib64`, `/usr/lib64` and `/lib` layouts need a static stall, so no
-    /// guessed directory is granted for them.
+    /// Debian-style multiarch directories. A loader in one of these gets only
+    /// these directories; every other layout gets the whole library root the
+    /// loader searches.
     const fn arch_lib_dirs(arch: Architecture) -> &'static [&'static str] {
         match arch {
             Architecture::X86_64 => &["/usr/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu"],
@@ -1060,6 +1190,21 @@ mod loader {
         }
 
         #[test]
+        fn only_the_four_plain_roots_are_library_roots() {
+            for root in ["/lib", "/lib64", "/usr/lib", "/usr/lib64"] {
+                assert!(is_library_root(Path::new(root)), "{root}");
+            }
+            for path in [
+                "/usr/lib/x86_64-linux-gnu",
+                "/lib64/sub",
+                "/usr/local",
+                "/home/stall/lib",
+            ] {
+                assert!(!is_library_root(Path::new(path)), "{path}");
+            }
+        }
+
+        #[test]
         fn a_symlink_target_outside_the_roots_is_refused() {
             let scratch = Scratch::new().expect("scratch");
             let target = scratch.0.join("outside.so");
@@ -1176,34 +1321,201 @@ mod loader {
             let literal = Path::new("/lib64/ld-linux-x86-64.so.2");
             let resolved = Path::new("/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2");
 
-            let check = require_multiarch_layout_of(literal, Some(resolved), Architecture::X86_64);
+            let multiarch = is_multiarch_layout_of(literal, Some(resolved), Architecture::X86_64);
 
-            assert!(check.is_ok());
+            assert!(multiarch);
         }
 
         #[test]
-        fn a_non_multiarch_loader_layout_is_refused_by_name() {
-            let scratch = Scratch::new().expect("scratch");
-            // A literal that does not exist: a real /usr/lib64 loader may be a
-            // symlink into a multiarch directory on this host.
-            let interp = Path::new("/usr/lib64/ld-barn-nonexistent.so");
-            let exe = scratch.0.join("stall");
-            fs::write(&exe, elf64(interp, 62, true)).expect("write ELF");
+        fn a_loader_outside_a_multiarch_directory_is_not_a_multiarch_layout() {
+            let interp = Interpreter {
+                path: PathBuf::from("/usr/lib64/ld-barn-nonexistent.so"),
+                arch: Architecture::X86_64,
+            };
 
-            let error = grant_paths(CapabilitySet::new(), &exe)
-                .expect_err("a /usr/lib64 loader is an unsupported layout");
-            let message = error.to_string();
+            assert!(!is_multiarch_layout(&interp));
+        }
+
+        #[test]
+        fn a_real_multiarch_interpreter_is_a_multiarch_layout() {
+            let interp = Interpreter {
+                path: PathBuf::from("/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2"),
+                arch: Architecture::X86_64,
+            };
+
+            assert!(is_multiarch_layout(&interp));
+        }
+
+        #[test]
+        fn a_plain_lib_loader_is_not_a_multiarch_layout() {
+            let interp = Interpreter {
+                path: PathBuf::from("/lib/ld-musl-x86_64.so.1"),
+                arch: Architecture::X86_64,
+            };
+
+            assert!(!is_multiarch_layout(&interp));
+        }
+
+        #[test]
+        fn each_library_root_yields_its_library_family() {
+            assert_eq!(
+                library_family(Path::new("/lib/ld-musl-x86_64.so.1")),
+                Some(LibraryFamily::Lib)
+            );
+            assert_eq!(
+                library_family(Path::new("/lib64/ld-linux-x86-64.so.2")),
+                Some(LibraryFamily::Lib64)
+            );
+            assert_eq!(
+                library_family(Path::new("/usr/lib/ld-musl-x86_64.so.1")),
+                Some(LibraryFamily::Lib)
+            );
+            assert_eq!(
+                library_family(Path::new("/usr/lib64/ld-linux-x86-64.so.2")),
+                Some(LibraryFamily::Lib64)
+            );
+        }
+
+        #[test]
+        fn a_lib_loader_searches_both_lib_and_usr_lib() {
+            let resolved = Path::new("/lib/ld-musl-x86_64.so.1");
+
+            let roots = library_roots_of(resolved, |path| Some(path.to_path_buf()));
+
+            assert_eq!(roots, [PathBuf::from("/lib"), PathBuf::from("/usr/lib")]);
+        }
+
+        #[test]
+        fn a_lib64_loader_searches_both_lib64_and_usr_lib64() {
+            let resolved = Path::new("/lib64/ld-linux-x86-64.so.2");
+
+            let roots = library_roots_of(resolved, |path| Some(path.to_path_buf()));
 
             assert_eq!(
-                message,
-                "unsupported library layout /usr/lib64: barn-luau-stall must be statically linked on this host"
+                roots,
+                [PathBuf::from("/lib64"), PathBuf::from("/usr/lib64")]
             );
+        }
+
+        #[test]
+        fn a_merged_usr_layout_yields_one_canonical_root() {
+            let resolved = Path::new("/usr/lib/ld-musl-x86_64.so.1");
+
+            let roots = library_roots_of(resolved, |path| {
+                if path == Path::new("/lib") || path == Path::new("/usr/lib") {
+                    Some(PathBuf::from("/usr/lib"))
+                } else {
+                    Some(path.to_path_buf())
+                }
+            });
+
+            assert_eq!(roots, [PathBuf::from("/usr/lib")]);
+            assert!(roots.iter().all(|root| root.as_path() != Path::new("/")));
+        }
+
+        #[test]
+        fn a_candidate_resolving_outside_the_library_roots_is_not_granted() {
+            let resolved = Path::new("/lib/ld-musl-x86_64.so.1");
+
+            let roots = library_roots_of(resolved, |path| {
+                if path == Path::new("/lib") {
+                    Some(PathBuf::from("/"))
+                } else if path == Path::new("/usr/lib") {
+                    Some(PathBuf::from("/home/stall"))
+                } else {
+                    None
+                }
+            });
+
+            assert_eq!(roots, Vec::<std::path::PathBuf>::new());
+        }
+
+        #[test]
+        fn a_loader_resolving_into_a_home_folder_is_refused() {
+            let literal = Path::new("/usr/lib64/ld-linux-x86-64.so.2");
+            let resolved = PathBuf::from("/home/stall/ld-linux-x86-64.so.2");
+
+            let error = require_resolved_within_root(literal, Ok(resolved))
+                .expect_err("a loader resolving into a home folder is refused");
+
             match error {
-                PolicyError::UnsupportedLibraryLayout { dir } => {
-                    assert_eq!(dir.as_path(), Path::new("/usr/lib64"));
+                PolicyError::InterpreterOutsideLibraryRoot { path } => {
+                    assert_eq!(path.as_path(), literal);
                 }
                 other => panic!("unexpected error: {other:?}"),
             }
+        }
+
+        #[test]
+        fn a_lib64_loader_resolving_to_usr_lib64_yields_one_root() {
+            let resolved = Path::new("/usr/lib64/ld-linux-x86-64.so.2");
+
+            let roots = library_roots_of(resolved, |path| {
+                if path == Path::new("/lib64") {
+                    Some(PathBuf::from("/usr/lib64"))
+                } else {
+                    Some(path.to_path_buf())
+                }
+            });
+
+            assert_eq!(roots, [PathBuf::from("/usr/lib64")]);
+        }
+
+        #[test]
+        fn a_synthetic_non_multiarch_loader_gets_its_file_and_library_root() {
+            let scratch = Scratch::new().expect("scratch");
+            // A temp folder stands in for /usr/lib64: the grant is the same
+            // whatever the system library root is called on the host.
+            let root = scratch.0.join("lib64");
+            fs::create_dir_all(&root).expect("create library root");
+            let loader = root.join("ld-barn.so");
+            fs::write(&loader, b"loader").expect("write loader");
+
+            let caps = grant_non_multiarch(CapabilitySet::new(), &loader).expect("grant");
+            let listed = caps.fs_capabilities();
+
+            let resolved_loader = loader.canonicalize().expect("resolve loader");
+            let resolved_root = root.canonicalize().expect("resolve root");
+            let mut granted: Vec<&PathBuf> = listed.iter().map(|cap| &cap.resolved).collect();
+            granted.sort();
+            let mut expected = [&resolved_root, &resolved_loader];
+            expected.sort();
+            assert_eq!(granted, expected);
+            assert_eq!(
+                listed
+                    .iter()
+                    .find(|cap| cap.resolved == resolved_loader)
+                    .map(|cap| (cap.access, cap.is_file)),
+                Some((AccessMode::Read, true))
+            );
+            assert_eq!(
+                listed
+                    .iter()
+                    .find(|cap| cap.resolved == resolved_root)
+                    .map(|cap| (cap.access, cap.is_file)),
+                Some((AccessMode::Read, false))
+            );
+            assert!(listed.iter().all(|cap| cap.access != AccessMode::Write));
+        }
+
+        #[test]
+        fn a_body_or_state_file_under_the_library_root_is_not_writable() {
+            let scratch = Scratch::new().expect("scratch");
+            let root = scratch.0.join("usr-lib");
+            fs::create_dir_all(&root).expect("create library root");
+            let loader = root.join("ld-barn.so");
+            fs::write(&loader, b"loader").expect("write loader");
+            let body = root.join("stall-body");
+            fs::write(&body, b"body").expect("write body");
+            let state = root.join("state.json");
+            fs::write(&state, b"{}").expect("write state");
+
+            let caps = grant_non_multiarch(CapabilitySet::new(), &loader).expect("grant");
+
+            assert!(caps.path_covered_with_access(&body, AccessMode::Read));
+            assert!(!caps.path_covered_with_access(&body, AccessMode::Write));
+            assert!(caps.path_covered_with_access(&state, AccessMode::Read));
+            assert!(!caps.path_covered_with_access(&state, AccessMode::Write));
         }
 
         #[test]
@@ -1245,7 +1557,7 @@ mod loader {
         /// An existing Debian multiarch directory and a regular file in it.
         /// The ELF's interpreter is synthetic, but nono grants only real
         /// paths, so the name must resolve to a file on this host.
-        fn multiarch_interpreter() -> (PathBuf, PathBuf) {
+        fn multiarch_interpreter() -> Option<(PathBuf, PathBuf)> {
             for name in ["/usr/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu"] {
                 let Ok(root) = Path::new(name).canonicalize() else {
                     continue;
@@ -1262,16 +1574,23 @@ mod loader {
                         && loader.is_file()
                         && loader.parent() == Some(root.as_path())
                     {
-                        return (interp, loader);
+                        return Some((interp, loader));
                     }
                 }
             }
-            panic!("this host has no Debian multiarch directory with a regular file");
+            None
         }
 
         #[test]
         fn a_multiarch_loader_gets_only_its_file_and_multiarch_dirs() {
-            let (interp, loader) = multiarch_interpreter();
+            // A non-Debian host has no multiarch directory to exercise.
+            let Some((interp, loader)) = multiarch_interpreter() else {
+                assert!(
+                    std::env::var_os("BARN_NON_DEBIAN_LAYOUT").is_some(),
+                    "expected a Debian multiarch directory with a regular file"
+                );
+                return;
+            };
             let interp = interp.as_path();
             let scratch = Scratch::new().expect("scratch");
             let exe = scratch.0.join("stall");
@@ -1322,6 +1641,7 @@ mod loader {
             let mut expected_dirs: Vec<&PathBuf> = expected.iter().collect();
             expected_dirs.sort();
             assert_eq!(dirs, expected_dirs);
+            assert!(listed.iter().all(|cap| cap.access != AccessMode::Write));
 
             assert!(caps.path_covered_with_access(interp, AccessMode::Read));
             assert!(!grant.allows_read(Path::new("/")));
@@ -1372,11 +1692,6 @@ pub enum PolicyError {
     InterpreterOutsideLibraryRoot {
         /// The interpreter path that was refused.
         path: PathBuf,
-    },
-    /// A loader in a library layout barn does not support.
-    UnsupportedLibraryLayout {
-        /// The loader's parent directory.
-        dir: PathBuf,
     },
     /// An ELF file that could not be opened or read.
     InterpreterIo {
@@ -1439,13 +1754,6 @@ impl Display for PolicyError {
                     path.display()
                 )
             }
-            Self::UnsupportedLibraryLayout { dir } => {
-                write!(
-                    f,
-                    "unsupported library layout {}: barn-luau-stall must be statically linked on this host",
-                    dir.display()
-                )
-            }
             Self::InterpreterIo { path, source } => {
                 write!(f, "reading ELF at {}: {source}", path.display())
             }
@@ -1485,7 +1793,6 @@ impl Error for PolicyError {
             }
             Self::RelativePath { .. }
             | Self::InterpreterOutsideLibraryRoot { .. }
-            | Self::UnsupportedLibraryLayout { .. }
             | Self::InterpreterNotAFile { .. }
             | Self::TooManyProgramHeaders { .. }
             | Self::InterpreterTooLong { .. }
