@@ -41,9 +41,10 @@ On failure the line names the reason and barn exits non-zero:
 {"protocol":1,"error":"<named reason>"}
 ```
 
-Both lines reject unknown fields. Two plugin folders with the same file name do
-not collide: while a `run/<stall>` folder is live, a second start for it is
-refused with a named reason.
+The tack-side reader that rejects unknown fields follows in a later slice.
+Two plugin folders with the same file name do not collide: while a
+`run/<stall>` folder is live, a second start for it is refused with a named
+reason.
 
 barn then accepts the stall on `proto.sock` and supervises it for as long as it
 runs. Host-side frame brokering over `host.sock` is a follow-up
