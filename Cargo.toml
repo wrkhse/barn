@@ -4,6 +4,7 @@ members = [
   "crates/barn",
   "crates/barn-exec",
   "crates/barn-luau",
+  "crates/barn-luau-stall",
   "crates/barn-stall",
 ]
 
