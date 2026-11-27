@@ -1057,6 +1057,22 @@ impl HostTransport {
             return Err(SupervisorError::HostDenied(HostDeny::TokenExpiredOrSpent));
         };
 
+        self.accept_host_peer(stream, daemon_pid, stall_name, window, spent)
+            .await
+    }
+
+    /// Completes the post-accept handshake: peer credentials, the early peer
+    /// check, the bounded line read, and the authenticated exchange. The token
+    /// rule and named denies match the caller's; `window` and `spent` are the
+    /// values sampled before the accept so timing does not change the deny.
+    async fn accept_host_peer(
+        &mut self,
+        stream: UnixStream,
+        daemon_pid: u32,
+        stall_name: &str,
+        window: Duration,
+        spent: bool,
+    ) -> Result<BufReader<UnixStream>> {
         let mut reader = BufReader::new(stream);
         let cred = io_at(
             "reading host peer credentials",
@@ -1086,8 +1102,8 @@ impl HostTransport {
             }
         };
 
-        // `remaining` was sampled before the accept and the timed read.
-        // Recompute it so the authenticated exchange cannot run past
+        // `window` was sampled before the accept and the timed read. Recompute
+        // the remaining time so the authenticated exchange cannot run past
         // `expires_at`; an already spent token keeps the handshake window.
         let exchange_limit = if spent {
             HOST_HANDSHAKE_TIMEOUT
@@ -2609,7 +2625,7 @@ mod tests {
 
         let accepted = transport.accept_with_deadline(daemon, "fixture").await;
 
-        assert!(matches!(accepted, Ok(_)));
+        assert!(accepted.is_ok());
         assert!(transport.token.is_none());
         let mut reply = Vec::new();
         timeout(
