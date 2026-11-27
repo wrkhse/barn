@@ -14,7 +14,7 @@ use barn::Grant;
 use barn::supervisor::{HealthCheck, HealthDecision, HealthTracker};
 use barn::supervisor::{HostDeny, HostEndpoint, RunningStall};
 use barn::supervisor::{RestartDecision, RestartOutcome, RestartPolicy};
-use barn::supervisor::{StallSpec, Supervisor, SupervisorError};
+use barn::supervisor::{StallSpec, Supervisor, SupervisorError, spawn_stall_reader};
 use barn_stall::Job;
 use barn_stall::protocol::{deny, method};
 use serde_json::{Value, json};
@@ -763,7 +763,7 @@ async fn a_framed_request_is_forwarded_and_its_exact_reply_returned() {
     }
     let scratch = Scratch::new().expect("scratch folder");
     let pid = std::process::id();
-    let (mut stall, endpoint, mut connection) =
+    let (mut stall, endpoint, connection) =
         host_fixture(&scratch, pid).await.expect("host fixture");
     let mut client = connect_host(&endpoint).expect("connect host.sock");
     writeln!(
@@ -779,8 +779,10 @@ async fn a_framed_request_is_forwarded_and_its_exact_reply_returned() {
     );
 
     writeln!(client.get_mut(), "{HOST_REQUEST}").expect("framed request");
+    let (read_half, mut writer) = connection.into_inner().into_split();
+    let mut rx = spawn_stall_reader(read_half);
     stall
-        .serve_host(&mut server, &mut connection)
+        .serve_host(&mut server, &mut writer, &mut rx)
         .await
         .expect("broker the frame");
 

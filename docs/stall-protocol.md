@@ -46,13 +46,11 @@ Two plugin folders with the same file name do not collide: while a
 `run/<stall>` folder is live, a second start for it is refused with a named
 reason.
 
-Barn starts the stall and prints the endpoint; the accept and supervision loop
-on `proto.sock` is a separate follow-up. Barn stays resident while tack owns
-the process, so the printed endpoint has a live owner until tack ends it.
-Host-side frame brokering over `host.sock` is a follow-up
-([barn#46](https://github.com/wrkhse/barn/issues/46),
-[barn#48](https://github.com/wrkhse/barn/issues/48)); this command does not
-broker tack's frames yet.
+Barn starts the stall, prints the endpoint and accepts the stall on `proto.sock`.
+Barn stays resident while tack owns the process, so the printed endpoint has a
+live owner until tack ends it. barn brokers one host connection over `host.sock`
+to the stall. When tack disconnects cleanly, barn drains the stall and exits 0.
+After a bad frame from the host, barn exits 1 without draining.
 
 ## Transport
 
