@@ -90,6 +90,8 @@ pub mod deny {
     pub const PROTOCOL_MISMATCH: &str = "protocol mismatch";
     /// A line is longer than [`MAX_LINE_BYTES`].
     pub const OVERSIZE_FRAME: &str = "oversize frame";
+    /// A line is not parseable, or its body cannot be measured.
+    pub const BAD_FRAME: &str = "bad frame";
     /// The socket closed before the peer completed the exchange.
     pub const CLOSED_SOCKET: &str = "closed socket";
 }

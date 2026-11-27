@@ -9,7 +9,9 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use barn_stall::protocol::{
@@ -116,6 +118,8 @@ pub enum HostDeny {
     ProtocolMismatch,
     /// A line is longer than the line cap.
     OversizeFrame,
+    /// A line is not valid, or its body cannot be measured.
+    BadFrame,
     /// A body is longer than the body cap.
     OversizeBody,
     /// The peer closed before finishing the exchange.
@@ -137,6 +141,7 @@ impl HostDeny {
             Self::TokenMismatch => deny::TOKEN_MISMATCH,
             Self::ProtocolMismatch => deny::PROTOCOL_MISMATCH,
             Self::OversizeFrame | Self::OversizeBody => deny::OVERSIZE_FRAME,
+            Self::BadFrame => deny::BAD_FRAME,
             Self::ClosedSocket | Self::StalledReply | Self::PeerLoss => deny::CLOSED_SOCKET,
         }
     }
@@ -1035,9 +1040,14 @@ impl HostTransport {
             token.expires_at.saturating_duration_since(Instant::now())
         });
         let spent = remaining.is_zero();
-        let stream = if spent {
-            io_at("accepting host socket", self.listener.accept().await)?.0
-        } else if let Ok(accepted) = timeout(remaining, self.listener.accept()).await {
+        // A spent token still waits for one peer, but only for the handshake
+        // window: no host means no peer to answer and the token stays spent.
+        let accept_limit = if spent {
+            HOST_HANDSHAKE_TIMEOUT
+        } else {
+            remaining
+        };
+        let stream = if let Ok(accepted) = timeout(accept_limit, self.listener.accept()).await {
             io_at("accepting host socket", accepted)?.0
         } else {
             self.token = None;
@@ -1225,6 +1235,25 @@ async fn refuse<T>(
     Err(SupervisorError::HostDenied(host_deny))
 }
 
+/// Denies the host when a frame is malformed or its body is over the cap.
+async fn deny_body_cap(host: &mut (impl AsyncWrite + Unpin), frame: &[u8]) -> Result<()> {
+    match body_within_cap(frame) {
+        BodyCap::Fits => Ok(()),
+        BodyCap::BadFrame => {
+            refuse(host, &Value::Null, HostDeny::BadFrame, DENY_WRITE_TIMEOUT).await
+        }
+        BodyCap::TooLarge => {
+            refuse(
+                host,
+                &Value::Null,
+                HostDeny::OversizeBody,
+                DENY_WRITE_TIMEOUT,
+            )
+            .await
+        }
+    }
+}
+
 /// Forwards one host frame to the stall and copies its reply back, with every
 /// forwarding step bounded by `limit` and every denial by `DENY_WRITE_TIMEOUT`.
 async fn broker_host_frame(
@@ -1248,15 +1277,7 @@ async fn broker_host_frame(
             .await;
         }
     };
-    if !body_within_cap(&frame) {
-        return refuse(
-            host,
-            &Value::Null,
-            HostDeny::OversizeBody,
-            DENY_WRITE_TIMEOUT,
-        )
-        .await;
-    }
+    deny_body_cap(host, &frame).await?;
 
     // A partial write leaves a half frame on the stall stream. That
     // connection is dead from here: no further frame can be brokerable on it,
@@ -1283,33 +1304,70 @@ async fn broker_host_frame(
             .await;
         }
     };
-    if !body_within_cap(&line) {
-        return refuse(
-            host,
-            &Value::Null,
-            HostDeny::OversizeBody,
-            DENY_WRITE_TIMEOUT,
-        )
-        .await;
-    }
+    deny_body_cap(host, &line).await?;
 
     answer_host(host, &line, limit).await
 }
 
-/// Copies one reply line to the host with a single bounded write. A write that
-/// stops after emitting part of the line closes without a deny: appending one
-/// to a half frame would corrupt it. Only a write that emitted nothing gets
-/// the named `StalledReply` deny.
+/// An `AsyncWrite` that counts bytes accepted, so a timed-out reply can
+/// tell whether any of it reached the wire.
+struct CountingWriter<'a, W> {
+    inner: &'a mut W,
+    written: usize,
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for CountingWriter<'_, W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = &mut *self;
+        match Pin::new(&mut *this.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(count)) => {
+                this.written = this.written.saturating_add(count);
+
+                Poll::Ready(Ok(count))
+            }
+            pending => pending,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Copies one reply line to the host under a deadline, then reports the
+/// outcome. A write that emitted any bytes closes without a deny: appending a
+/// denial to a half frame would corrupt it. Only a write that emitted nothing
+/// gets the named `StalledReply` deny.
 async fn answer_host(
     host: &mut (impl AsyncWrite + Unpin),
     line: &[u8],
     limit: Duration,
 ) -> Result<()> {
-    let sent = timeout(limit, host.write(line)).await;
+    let (sent, written) = {
+        let mut counting = CountingWriter {
+            inner: host,
+            written: 0,
+        };
+        let sent = timeout(limit, counting.write_all(line)).await;
+
+        (sent, counting.written)
+    };
 
     match sent {
-        Ok(Ok(count)) if count == line.len() => Ok(()),
-        Ok(Ok(0)) | Err(_) => {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(SupervisorError::Io {
+            operation: "answering host frame",
+            source: error,
+        }),
+        Err(_) if written == 0 => {
             refuse(
                 host,
                 &Value::Null,
@@ -1318,27 +1376,34 @@ async fn answer_host(
             )
             .await
         }
-        Ok(Ok(_)) => Err(SupervisorError::HostDenied(HostDeny::StalledReply)),
-        Ok(Err(error)) => Err(SupervisorError::Io {
-            operation: "answering host frame",
-            source: error,
-        }),
+        Err(_) => Err(SupervisorError::HostDenied(HostDeny::StalledReply)),
     }
+}
+
+/// Why a frame's inline body does not fit, when it does not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BodyCap {
+    /// The decoded body fits the cap.
+    Fits,
+    /// The line is malformed, or its body cannot be measured.
+    BadFrame,
+    /// The decoded body is longer than the cap.
+    TooLarge,
 }
 
 /// Whether a frame's inline body fits the cap after decoding.
 ///
 /// A body barn cannot measure is denied: malformed JSON and a present `body`
 /// that is not a string fail closed, while a frame with no body stays valid.
-fn body_within_cap(frame: &[u8]) -> bool {
+fn body_within_cap(frame: &[u8]) -> BodyCap {
     let Ok(value) = serde_json::from_slice::<Value>(frame) else {
-        return false;
+        return BodyCap::BadFrame;
     };
     let Some(body) = value.get("body") else {
-        return true;
+        return BodyCap::Fits;
     };
     let Some(body) = body.as_str() else {
-        return false;
+        return BodyCap::BadFrame;
     };
     let decoded = if value.get("body_encoding").and_then(Value::as_str) == Some("base64") {
         base64_decoded_len(body)
@@ -1346,7 +1411,11 @@ fn body_within_cap(frame: &[u8]) -> bool {
         body.len()
     };
 
-    decoded <= DEFAULT_MAX_BODY_BYTES
+    if decoded > DEFAULT_MAX_BODY_BYTES {
+        BodyCap::TooLarge
+    } else {
+        BodyCap::Fits
+    }
 }
 
 /// The decoded length of a base64 string, counted without a decoder.
@@ -1873,6 +1942,7 @@ mod tests {
             (HostDeny::TokenMismatch, deny::TOKEN_MISMATCH),
             (HostDeny::ProtocolMismatch, deny::PROTOCOL_MISMATCH),
             (HostDeny::OversizeFrame, deny::OVERSIZE_FRAME),
+            (HostDeny::BadFrame, deny::BAD_FRAME),
             (HostDeny::OversizeBody, deny::OVERSIZE_FRAME),
             (HostDeny::ClosedSocket, deny::CLOSED_SOCKET),
             (HostDeny::StalledReply, deny::CLOSED_SOCKET),
@@ -1942,13 +2012,13 @@ mod tests {
         let mut exact = PREFIX.to_vec();
         exact.resize(PREFIX.len() + DEFAULT_MAX_BODY_BYTES, b'x');
         exact.extend_from_slice(b"\"}");
-        assert!(body_within_cap(&exact));
+        assert_eq!(body_within_cap(&exact), BodyCap::Fits);
 
         exact.truncate(PREFIX.len() + DEFAULT_MAX_BODY_BYTES);
         exact.push(b'x');
         exact.extend_from_slice(b"\"}");
-        assert!(!body_within_cap(&exact));
-        assert!(!body_within_cap(b"not JSON"));
+        assert_eq!(body_within_cap(&exact), BodyCap::TooLarge);
+        assert_eq!(body_within_cap(b"not JSON"), BodyCap::BadFrame);
         assert_eq!(base64_decoded_len("aGk="), 2);
         assert_eq!(base64_decoded_len("aGk"), 2);
     }
@@ -1962,9 +2032,12 @@ mod tests {
             br#"{"body":["x"]}"#.as_slice(),
             b"not JSON".as_slice(),
         ] {
-            assert!(!body_within_cap(frame));
+            assert_eq!(body_within_cap(frame), BodyCap::BadFrame);
         }
-        assert!(body_within_cap(br#"{"jsonrpc":"2.0","method":"x"}"#));
+        assert_eq!(
+            body_within_cap(br#"{"jsonrpc":"2.0","method":"x"}"#),
+            BodyCap::Fits
+        );
     }
 
     /// The accept loop calls `check` until the token deadline, so a flood of
@@ -2207,19 +2280,15 @@ mod tests {
         );
     }
 
-    /// A sink that takes no bytes on the first write and captures the rest.
+    /// A sink that stalls the reply frame but accepts the denial frame.
+    ///
+    /// A timeout re-polls the stalled write when its timer fires, so stalling
+    /// only the first poll lets the reply through and hides the denial. The
+    /// first frame seen is the one that stalls; a different frame is accepted.
+    #[derive(Default)]
     struct StalledWriter {
         written: Vec<u8>,
-        pending: bool,
-    }
-
-    impl StalledWriter {
-        fn new() -> Self {
-            Self {
-                written: Vec::new(),
-                pending: true,
-            }
-        }
+        stalled: Vec<u8>,
     }
 
     impl AsyncWrite for StalledWriter {
@@ -2228,9 +2297,10 @@ mod tests {
             _cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
-            if self.pending {
-                self.pending = false;
-
+            if self.stalled.is_empty() {
+                self.stalled.extend_from_slice(buf);
+            }
+            if buf == self.stalled {
                 return Poll::Pending;
             }
             self.written.extend_from_slice(buf);
@@ -2291,6 +2361,45 @@ mod tests {
         assert_eq!(writer.written, reply.get(..1).expect("one byte"));
     }
 
+    /// A sink that accepts a few bytes per poll, so a large reply needs more
+    /// than one write to finish.
+    #[derive(Default)]
+    struct ChunkedWriter {
+        written: Vec<u8>,
+    }
+
+    impl AsyncWrite for ChunkedWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let count = buf.len().min(1024);
+            self.written.extend_from_slice(&buf[..count]);
+
+            Poll::Ready(Ok(count))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_large_reply_is_written_in_full_before_the_deadline() {
+        let reply = vec![b'x'; 64 * 1024];
+        let mut writer = ChunkedWriter::default();
+
+        let answered = answer_host(&mut writer, &reply, Duration::from_secs(2)).await;
+
+        assert!(matches!(answered, Ok(())));
+        assert_eq!(writer.written, reply);
+    }
+
     /// A sink that never accepts a byte, so only a deadline can end a write.
     struct NeverWriter;
 
@@ -2329,7 +2438,7 @@ mod tests {
     #[tokio::test]
     async fn a_host_that_stops_taking_the_reply_gets_the_stalled_reply_deny() {
         let reply = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n";
-        let mut writer = StalledWriter::new();
+        let mut writer = StalledWriter::default();
 
         let stalled = answer_host(&mut writer, reply, Duration::from_millis(20)).await;
 
@@ -2383,11 +2492,11 @@ mod tests {
 
             assert!(matches!(
                 result,
-                Err(SupervisorError::HostDenied(HostDeny::OversizeBody))
+                Err(SupervisorError::HostDenied(HostDeny::BadFrame))
             ));
             assert_eq!(
                 read_deny(&mut host_peer).await,
-                denied(&Value::Null, deny::OVERSIZE_FRAME)
+                denied(&Value::Null, deny::BAD_FRAME)
             );
         }
     }
@@ -2456,15 +2565,17 @@ mod tests {
         let (stall_barn, stall_peer) = UnixStream::pair().expect("stall pair");
         let mut host = BufReader::new(host_barn);
         let mut stall = BufReader::new(stall_barn);
-        // Far more than a socket buffer: the timed write gets part way in.
-        let mut frame = vec![b'x'; 1 << 20];
-        frame.push(b'\n');
+        // A valid request with a body far larger than a socket buffer: the
+        // timed write to the silent stall gets part way in.
+        let mut frame = br#"{"jsonrpc":"2.0","id":1,"method":"request","body":""#.to_vec();
+        frame.resize(frame.len() + (1 << 20), b'x');
+        frame.extend_from_slice(b"\"}\n");
         let writing = async {
             host_peer.write_all(&frame).await.expect("large host frame");
         };
 
         let (result, ()) = tokio::join!(
-            broker_host_frame(&mut host, &mut stall, Duration::from_millis(20)),
+            broker_host_frame(&mut host, &mut stall, Duration::from_millis(500)),
             writing
         );
         drop(host);

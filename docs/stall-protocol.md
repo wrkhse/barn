@@ -14,8 +14,8 @@ The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
   `0600` in a directory with mode `0700`. The stall's environment holds only
   `PATH`, `HOME`, `LANG`, the socket path in `BARN_SOCKET`, and the single-use
   token in `BARN_TOKEN`. Before binding the socket, barn removes only
-  `proto.sock` and `policy.json` from a stale run directory, leaving the
-  stall's state folder intact. Any other entry in that directory makes the
+  `proto.sock`, `host.sock` and `policy.json` from a stale run directory,
+  leaving the stall's state folder intact. Any other entry in that directory makes the
   start fail with `removing stale stall run directory` (`DirectoryNotEmpty`).
 - barn also binds `state_dir/run/<stall>/host.sock` before spawning the
   stall, a Unix socket with mode `0600` in the same directory with mode
@@ -119,9 +119,23 @@ A host whose peer pid differs from the pid barn was given is denied:
 ```
 
 The other named reasons are `wrong peer uid`, `token expired or spent`,
-`token mismatch`, `protocol mismatch`, `oversize frame` and `closed socket`.
-Each travels in `data.reason` with `DENIED_CODE`; `barn-stall`'s `deny`
-module names every reason.
+`token mismatch`, `protocol mismatch`, `oversize frame`, `bad frame` and
+`closed socket`. Each travels in `data.reason` with `DENIED_CODE`;
+`barn-stall`'s `deny` module names every reason.
+
+A malformed or unmeasurable frame is denied as a bad frame:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 23,
+  "error": {
+    "code": -32001,
+    "message": "denied",
+    "data": { "reason": "bad frame" }
+  }
+}
+```
 
 A reply too long to fit is replaced by one error line:
 
