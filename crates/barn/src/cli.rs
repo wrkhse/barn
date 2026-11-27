@@ -6,13 +6,38 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
+use barn_stall::protocol::{DRAIN_DEADLINE_MS, method};
 use barn_stall::{LAUNCH_PROTOCOL, MAX_LAUNCH_LINE_BYTES};
 use clap::{Parser, Subcommand};
+use serde_json::Value;
 use thiserror::Error;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::time::timeout;
 
 use crate::Grant;
-use crate::supervisor::{HostEndpoint, StallSpec, Supervisor, SupervisorError};
+use crate::supervisor::{
+    HostDeny, HostEndpoint, RunningStall, StallEvent, StallReceiver, StallSpec, StallWriter,
+    Supervisor, SupervisorError, spawn_stall_reader,
+};
+
+/// How long a stall may take to connect back after the endpoint is written.
+const STALL_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The id of the single drain request barn sends on the stall connection.
+const DRAIN_ID: u64 = 3;
+
+/// How long a clean host close waits to tell a live stall from a dead one.
+const STALL_PROBE_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// The margin barn adds to the stall's drain budget for its own read loop.
+const DRAIN_MARGIN_MS: u64 = 500;
+
+/// How long barn waits for the stall's drain and the child's own exit: the
+/// stall's budget plus a margin for barn's read loop.
+const DRAIN_WAIT_TIMEOUT: Duration =
+    Duration::from_millis(DRAIN_DEADLINE_MS.saturating_add(DRAIN_MARGIN_MS));
 
 /// barn: the only daemon on a wrkhse machine.
 #[derive(Debug, Parser)]
@@ -180,6 +205,31 @@ enum StartError {
     /// The supervisor refused or lost the stall.
     #[error(transparent)]
     Supervisor(#[from] SupervisorError),
+    /// The stall did not connect back before the handshake deadline.
+    #[error("stall handshake timed out")]
+    StallHandshakeTimeout,
+    /// The stall's connection ended while the host was parked.
+    #[error("stall exited while the host connection was parked")]
+    StallExited,
+    /// The stall's connection ended, or its child exited, while no host frame
+    /// was in flight.
+    #[error("stall exited while the host was idle")]
+    StallDeathIdle,
+    /// The stall kept writing to its socket with no host frame in flight.
+    #[error("stall streamed unsolicited data while idle")]
+    StallFlood,
+    /// The stall's reader reported a failed connection while barn was idle.
+    #[error("stall connection lost while idle")]
+    StallLoss,
+    /// The stall wrote a line past the protocol limit while barn was idle.
+    #[error("stall wrote an oversized line while idle")]
+    StallOversize,
+    /// The stall did not acknowledge the drain, or its child exit wait failed.
+    #[error("stall drain was unacknowledged or failed")]
+    DrainFailed,
+    /// The host's connection failed before it sent a frame.
+    #[error("host connection lost")]
+    HostLoss,
     /// The endpoint line could not be encoded.
     #[error("encoding the endpoint line: {0}")]
     EndpointJson(#[from] serde_json::Error),
@@ -210,6 +260,14 @@ impl StartError {
             Self::RunDirInUse => "stall run directory in use",
             Self::SocketPath => "socket path not UTF-8",
             Self::Supervisor(_) => "stall did not start",
+            Self::StallHandshakeTimeout => "stall handshake timed out",
+            Self::StallExited => "stall exited while parked",
+            Self::StallDeathIdle => "stall exited while idle",
+            Self::StallFlood => "stall streamed unsolicited data",
+            Self::StallLoss => "stall connection lost",
+            Self::StallOversize => "stall line oversized",
+            Self::DrainFailed => "stall drain unacknowledged or failed",
+            Self::HostLoss => "host connection lost",
             Self::EndpointJson(_) => "encoding endpoint line",
             Self::Io { operation, .. } => operation,
             Self::EndpointTooLong => "endpoint line too long",
@@ -247,6 +305,115 @@ impl From<StartError> for StartFailure {
     /// Outside the endpoint write, an error happens before any line is written.
     fn from(error: StartError) -> Self {
         Self::before(error)
+    }
+}
+
+/// A supervisor failure after the endpoint reached stdout: the named line is
+/// already there, so the failure is only reported on stderr.
+fn after_supervisor(error: SupervisorError) -> StartFailure {
+    StartFailure::after(StartError::from(error))
+}
+
+/// Names the failure a stall event reports while the host is parked waiting
+/// for its one connection. A line with no frame in flight is unsolicited
+/// data; an ended reader is stall death.
+const fn parked_event_failure(event: Option<&StallEvent>) -> StartError {
+    match event {
+        Some(StallEvent::Line(_)) => StartError::StallFlood,
+        Some(StallEvent::Exited) | None => StartError::StallExited,
+        Some(StallEvent::Loss) => StartError::StallLoss,
+        Some(StallEvent::Oversize) => StartError::StallOversize,
+    }
+}
+
+/// Names the failure a stall event reports while the host is idle between
+/// frames. The events name stall death while idle instead of parked.
+const fn idle_event_failure(event: Option<&StallEvent>) -> StartError {
+    match event {
+        Some(StallEvent::Line(_)) => StartError::StallFlood,
+        Some(StallEvent::Exited) | None => StartError::StallDeathIdle,
+        Some(StallEvent::Loss) => StartError::StallLoss,
+        Some(StallEvent::Oversize) => StartError::StallOversize,
+    }
+}
+
+/// Whether the reader has already reported stall death at a host boundary.
+///
+/// The bounded wait keeps a live but idle stall from holding the exit open.
+/// Any line taken here is unsolicited: no frame was sent to the stall.
+async fn stall_died(rx: &mut StallReceiver) -> bool {
+    matches!(
+        timeout(STALL_PROBE_TIMEOUT, rx.recv()).await,
+        Ok(None | Some(StallEvent::Exited | StallEvent::Loss))
+    )
+}
+
+/// Whether a line is the success reply to the drain this side sent. A
+/// `stall draining` deny for an in-flight call is not that reply.
+fn is_drain_reply(line: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(line) else {
+        return false;
+    };
+
+    value.get("jsonrpc").and_then(Value::as_str) == Some("2.0")
+        && value.get("id").and_then(Value::as_u64) == Some(DRAIN_ID)
+        && value.get("result").is_some()
+        && value.get("error").is_none()
+}
+
+/// Sends one `stall.drain` and reads until its success reply arrives.
+///
+/// Lines before the reply, such as a `stall draining` deny for a call that
+/// did not finish, are skipped. The reader caps each line, and a terminal
+/// event fails the drain; the whole exchange is bounded by the caller's
+/// deadline.
+async fn drain_reply(stall: &mut StallWriter, rx: &mut StallReceiver) -> bool {
+    let request = format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{DRAIN_ID},\"method\":\"{}\"}}\n",
+        method::STALL_DRAIN
+    )
+    .into_bytes();
+
+    if stall.write_all(&request).await.is_err() {
+        return false;
+    }
+
+    loop {
+        match rx.recv().await {
+            Some(StallEvent::Line(line)) if is_drain_reply(&line) => return true,
+            Some(StallEvent::Line(_)) => {}
+            Some(StallEvent::Exited | StallEvent::Loss | StallEvent::Oversize) | None => {
+                return false;
+            }
+        }
+    }
+}
+
+/// Asks the stall to finish its in-flight work, then waits for the child to
+/// leave on its own before the drop can send SIGKILL. One deadline bounds the
+/// whole exit, so a stall that never answers cannot hold it open.
+///
+/// Returns `DrainFailed` on the timeout, an unacknowledged drain, a failed
+/// child exit wait, or a non-zero child exit; `Ok(())` only when the reply and
+/// the exit both succeeded.
+async fn drain_stall(
+    stall: &mut StallWriter,
+    rx: &mut StallReceiver,
+    running: &mut RunningStall,
+) -> Result<(), StartError> {
+    let draining = async {
+        let replied = drain_reply(stall, rx).await;
+        let exited = running
+            .stall_exit()
+            .await
+            .is_ok_and(|status| status.success());
+
+        replied && exited
+    };
+
+    match timeout(DRAIN_WAIT_TIMEOUT, draining).await {
+        Ok(true) => Ok(()),
+        Ok(false) | Err(_) => Err(StartError::DrainFailed),
     }
 }
 
@@ -329,7 +496,7 @@ async fn start_async(
 ) -> Result<(), StartFailure> {
     let launch = prepare_launch(plugin, &program, daemon_pid, helper, state_dir)?;
     let supervisor = Supervisor::new(launch.state_dir, launch.helper);
-    let running = supervisor
+    let mut running = supervisor
         .start_for_host(launch.stall, launch.daemon_pid)
         .await
         .map_err(StartError::from)?;
@@ -337,12 +504,71 @@ async fn start_async(
 
     write_endpoint(&mut io::stdout().lock(), &endpoint)?;
 
-    // The accept/supervise loop is a later slice; tack owns the process
-    // lifetime. Park so `running` stays alive and keeps `host.sock`, the
-    // token and the child that own the endpoint printed above.
-    std::future::pending::<()>().await;
+    // Keep the endpoint's owner resident: tack drives the host socket. The
+    // stall connects back at launch, so accept it before the host that will
+    // send frames for it. Both waits are bounded, so a stall that dies after
+    // the endpoint line cannot leave barn waiting for a peer that never comes.
+    let stall_stream = timeout(STALL_HANDSHAKE_TIMEOUT, running.accept())
+        .await
+        .map_err(|_| StartFailure::after(StartError::StallHandshakeTimeout))?
+        .map_err(after_supervisor)?;
+    let (read_half, write_half) = stall_stream.into_inner().into_split();
+    let mut stall: StallWriter = write_half;
+    let mut rx = spawn_stall_reader(read_half);
+    let mut host = tokio::select! {
+        biased;
+        event = rx.recv() => return Err(StartFailure::after(parked_event_failure(event.as_ref()))),
+        accepted = running.accept_host_or_stall_exit() => match accepted.map_err(after_supervisor)? {
+            Some(host) => host,
+            None => return Err(StartFailure::after(StartError::StallExited)),
+        },
+    };
+    // tack owns exactly one host connection. Closing the listener here makes
+    // any second peer fail at connect time rather than reach the stall.
+    running.close_host_listener();
 
-    Ok(())
+    // tack owns one host connection. Park until a frame's first byte arrives:
+    // an idle host is not a failure, and only a stall death ends the wait.
+    // Once a byte arrives the frame has started, so the reply timeout covers
+    // the rest of the frame and the stall's answer. Every failure after the
+    // endpoint line is reported on stderr only.
+    loop {
+        tokio::select! {
+            biased;
+            readable = host.fill_buf() => match readable {
+                Ok(bytes) if !bytes.is_empty() => {}
+                Ok(_) => {
+                    if stall_died(&mut rx).await {
+                        return Err(StartFailure::after(StartError::StallExited));
+                    }
+                    drain_stall(&mut stall, &mut rx, &mut running)
+                        .await
+                        .map_err(StartFailure::after)?;
+
+                    return Ok(());
+                }
+                Err(_) => return Err(StartFailure::after(StartError::HostLoss)),
+            },
+            event = rx.recv() => {
+                return Err(StartFailure::after(idle_event_failure(event.as_ref())));
+            }
+            _ = running.stall_exit() => {
+                return Err(StartFailure::after(StartError::StallDeathIdle));
+            }
+        }
+
+        match running.serve_host(&mut host, &mut stall, &mut rx).await {
+            Ok(()) => {}
+            Err(SupervisorError::HostDenied(HostDeny::PeerLoss)) => {
+                if stall_died(&mut rx).await {
+                    return Err(StartFailure::after(StartError::StallExited));
+                }
+
+                return Err(StartFailure::after(StartError::HostLoss));
+            }
+            Err(error) => return Err(after_supervisor(error)),
+        }
+    }
 }
 
 /// Builds the stall and refuses a live run directory for its name.
@@ -509,14 +735,23 @@ mod tests {
     use std::fs;
     use std::fs::File;
     use std::io::{self, Write};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
+    use barn_stall::MAX_LINE_BYTES;
     use clap::Parser;
+    use tokio::net::UnixStream;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
 
     use super::{
-        Cli, CliCommand, Grant, HostEndpoint, MAX_LAUNCH_LINE_BYTES, StallCommand, StallsCommand,
-        StartError, StartFailure, endpoint_line, error_line, helper_from, locked_run_dir,
-        opened_run_dir, prepare_launch, report_failure, runtime_from, stall_spec, start,
+        Cli, CliCommand, DRAIN_DEADLINE_MS, DRAIN_MARGIN_MS, DRAIN_WAIT_TIMEOUT, Grant, HostDeny,
+        HostEndpoint, MAX_LAUNCH_LINE_BYTES, StallCommand, StallEvent, StallReceiver, StallSpec,
+        StallWriter, StallsCommand, StartError, StartFailure, Supervisor, SupervisorError,
+        drain_reply, drain_stall, endpoint_line, error_line, helper_from, idle_event_failure,
+        is_drain_reply, locked_run_dir, opened_run_dir, parked_event_failure, prepare_launch,
+        report_failure, runtime_from, spawn_stall_reader, stall_died, stall_spec, start,
         start_async, state_dir, state_dir_from, write_endpoint, write_endpoint_to, write_line,
     };
 
@@ -1023,5 +1258,597 @@ mod tests {
                 .map(|error| error.reason()),
             Some("endpoint line too long")
         );
+    }
+
+    #[test]
+    fn a_stall_handshake_timeout_is_a_named_after_failure() {
+        let failure = StartFailure::after(StartError::StallHandshakeTimeout);
+
+        assert_eq!(failure.error.reason(), "stall handshake timed out");
+        assert!(failure.endpoint_written);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        report_failure(&mut stdout, &mut stderr, &failure);
+
+        assert_eq!(stdout, b"".to_vec());
+        assert_eq!(
+            stderr,
+            b"barn stall start: stall handshake timed out\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn a_lost_stall_is_a_named_after_failure() {
+        let failure = StartFailure::after(StartError::StallExited);
+
+        assert_eq!(failure.error.reason(), "stall exited while parked");
+        assert!(failure.endpoint_written);
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        report_failure(&mut stdout, &mut stderr, &failure);
+
+        assert_eq!(stdout, b"".to_vec());
+        assert_eq!(
+            stderr,
+            b"barn stall start: stall exited while the host connection was parked\n".to_vec()
+        );
+    }
+
+    /// Splits a stall socket into the writer barn keeps and the reader task.
+    fn stall_halves(stream: UnixStream) -> (StallWriter, StallReceiver) {
+        let (read_half, write_half) = stream.into_split();
+        (write_half, spawn_stall_reader(read_half))
+    }
+
+    #[tokio::test]
+    async fn a_closed_stall_is_detected_without_a_live_peer() {
+        let (barn_side, peer) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (_stall, mut rx) = stall_halves(barn_side);
+        drop(peer);
+
+        let event = rx.recv().await;
+
+        assert_eq!(event, Some(StallEvent::Exited));
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_peer_is_detected_by_the_stall_probe() {
+        let (barn_side, peer) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (_stall, mut rx) = stall_halves(barn_side);
+        drop(peer);
+
+        let died = timeout(Duration::from_secs(2), stall_died(&mut rx))
+            .await
+            .expect("the stall probe answered before the deadline");
+
+        assert!(died, "a dropped peer must read as stall death");
+    }
+
+    #[tokio::test]
+    async fn a_live_stall_keeps_its_buffered_reply() {
+        let (barn_side, mut peer) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let reply = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n";
+        tokio::io::AsyncWriteExt::write_all(&mut peer, reply)
+            .await
+            .expect("a reply on the stall socket");
+        let (_stall, mut rx) = stall_halves(barn_side);
+
+        let event = rx.recv().await;
+
+        assert!(matches!(event, Some(StallEvent::Line(line)) if line == reply.to_vec()));
+    }
+
+    /// Small, newline-terminated lines whose total length is exactly `total`.
+    fn newline_terminated_bytes(total: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(total);
+        while bytes.len().saturating_add(2) <= total {
+            bytes.extend_from_slice(b"x\n");
+        }
+        if bytes.len() < total {
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    #[tokio::test]
+    async fn a_flooding_stall_is_named_instead_of_drained_forever() {
+        let (barn_side, mut peer) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (_stall, mut rx) = stall_halves(barn_side);
+
+        let writing = tokio::spawn(async move {
+            let mut flood = vec![b'x'; MAX_LINE_BYTES];
+            flood.push(b'\n');
+
+            tokio::io::AsyncWriteExt::write_all(&mut peer, &flood)
+                .await
+                .expect("the peer wrote a flood");
+        });
+
+        let event = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the reader named the flood before the deadline");
+
+        writing.abort();
+
+        assert!(matches!(event, Some(StallEvent::Oversize)));
+        assert!(matches!(
+            idle_event_failure(Some(&StallEvent::Oversize)),
+            StartError::StallOversize
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_stream_of_complete_lines_ends_cleanly() {
+        let (barn_side, mut peer) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (_stall, mut rx) = stall_halves(barn_side);
+
+        let at_limit = newline_terminated_bytes(64 * 1024);
+        let total = at_limit.len();
+
+        let exchange = async {
+            let writing = async {
+                tokio::io::AsyncWriteExt::write_all(&mut peer, &at_limit)
+                    .await
+                    .expect("the peer wrote the limit");
+                drop(peer);
+            };
+
+            let draining = async {
+                let mut drained = 0usize;
+                loop {
+                    match rx.recv().await {
+                        Some(StallEvent::Line(line)) => {
+                            drained = drained.saturating_add(line.len());
+                        }
+                        Some(StallEvent::Exited) | None => break,
+                        Some(StallEvent::Oversize | StallEvent::Loss) => {
+                            panic!("a line at the drain limit must not be named a failure")
+                        }
+                    }
+                }
+                drained
+            };
+
+            let ((), drained) = tokio::join!(writing, draining);
+            drained
+        };
+
+        let drained = timeout(Duration::from_secs(10), exchange)
+            .await
+            .expect("the reader drained the limit before the deadline");
+
+        assert_eq!(drained, total);
+    }
+
+    #[tokio::test]
+    async fn a_closed_peer_mid_line_is_a_named_failure() {
+        let (barn_side, mut peer) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (_stall, mut rx) = stall_halves(barn_side);
+
+        // The reader must never hand a truncated fragment to serve_host as a
+        // reply; it names the loss instead.
+        tokio::io::AsyncWriteExt::write_all(&mut peer, b"{\"jsonrpc\":")
+            .await
+            .expect("a partial stall line");
+        drop(peer);
+
+        let event = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the reader ended within the deadline");
+
+        assert_eq!(event, Some(StallEvent::Exited));
+        assert!(matches!(
+            idle_event_failure(event.as_ref()),
+            StartError::StallDeathIdle
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_partial_line_stays_with_the_reader_when_cancelled() {
+        let (barn_side, mut peer) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let prefix = b"{\"jsonrpc\":\"2.0\",\"id\":1,";
+        tokio::io::AsyncWriteExt::write_all(&mut peer, prefix)
+            .await
+            .expect("a partial stall line");
+        let (_stall, mut rx) = stall_halves(barn_side);
+
+        // The rest of the line arrives only after the timeout cancels recv.
+        let (release_tx, release_rx) = oneshot::channel();
+        let writing = tokio::spawn(async move {
+            release_rx.await.expect("the release signal");
+            tokio::io::AsyncWriteExt::write_all(&mut peer, b"\"result\":null}\n")
+                .await
+                .expect("the rest of the stall line");
+        });
+
+        let cancelled = timeout(Duration::from_millis(20), rx.recv()).await;
+        assert!(cancelled.is_err(), "recv was cancelled mid-line");
+
+        release_tx
+            .send(())
+            .expect("the peer is still waiting to write");
+        writing.await.expect("the peer finished writing");
+
+        // The reader kept the fragment, so the next recv returns the whole
+        // line, not a fragment read as a reply.
+        let event = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the completed line arrives before the deadline");
+
+        assert!(matches!(
+            event,
+            Some(StallEvent::Line(line))
+                if line == b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n".to_vec()
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_frame_split_across_writes_is_delivered_completely() {
+        let (barn_side, mut peer) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (_stall, mut rx) = stall_halves(barn_side);
+
+        let frame = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n";
+        let (head, tail) = frame.split_at(12);
+
+        // The reader sees the fragment while the peer waits to write the
+        // rest, so it must accumulate before emitting a line.
+        let writing = tokio::spawn(async move {
+            tokio::io::AsyncWriteExt::write_all(&mut peer, head)
+                .await
+                .expect("the first half of the frame");
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tokio::io::AsyncWriteExt::write_all(&mut peer, tail)
+                .await
+                .expect("the second half of the frame");
+        });
+
+        let event = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("the whole frame arrives before the deadline");
+
+        writing.await.expect("the peer finished writing");
+
+        assert!(matches!(event, Some(StallEvent::Line(line)) if line == frame.to_vec()));
+    }
+
+    #[test]
+    fn a_stall_event_names_a_failure_in_each_host_state() {
+        assert!(matches!(
+            parked_event_failure(Some(&StallEvent::Line(Vec::new()))),
+            StartError::StallFlood
+        ));
+        assert!(matches!(
+            idle_event_failure(Some(&StallEvent::Line(Vec::new()))),
+            StartError::StallFlood
+        ));
+        assert!(matches!(
+            parked_event_failure(Some(&StallEvent::Exited)),
+            StartError::StallExited
+        ));
+        assert!(matches!(
+            idle_event_failure(Some(&StallEvent::Exited)),
+            StartError::StallDeathIdle
+        ));
+        assert!(matches!(
+            parked_event_failure(None),
+            StartError::StallExited
+        ));
+        assert!(matches!(
+            idle_event_failure(None),
+            StartError::StallDeathIdle
+        ));
+        assert!(matches!(
+            parked_event_failure(Some(&StallEvent::Loss)),
+            StartError::StallLoss
+        ));
+        assert!(matches!(
+            idle_event_failure(Some(&StallEvent::Loss)),
+            StartError::StallLoss
+        ));
+        assert!(matches!(
+            idle_event_failure(Some(&StallEvent::Oversize)),
+            StartError::StallOversize
+        ));
+        assert!(matches!(
+            parked_event_failure(Some(&StallEvent::Oversize)),
+            StartError::StallOversize
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_partial_host_frame_from_a_closed_peer_is_a_named_denial() {
+        // This starts a child with `barn-exec`, so it runs in CI only.
+        if std::env::var_os("CI").is_none() {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!("barn-cli-host-{}", std::process::id()));
+        let helper = root.join("fixture-exec");
+        fs::create_dir_all(&root).expect("a scratch state root");
+        fs::write(&helper, "#!/bin/sh\nshift\nexec \"$@\"\n").expect("a helper script");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).expect("helper mode");
+
+        let supervisor = Supervisor::new(root.join("state"), helper);
+        let program = PathBuf::from("/usr/bin/true");
+        let spec = StallSpec {
+            name: "host".to_owned(),
+            program: program.clone(),
+            args: Vec::new(),
+            grant: Grant {
+                executable: Some(program),
+                ..Grant::default()
+            },
+        };
+        let running = supervisor
+            .start_for_host(spec, std::process::id())
+            .await
+            .expect("a running stall");
+        let (host_barn, mut host_peer) = tokio::net::UnixStream::pair().expect("a host pair");
+        let (stall_barn, _stall_peer) = tokio::net::UnixStream::pair().expect("a stall pair");
+        let mut host = tokio::io::BufReader::new(host_barn);
+        let (mut stall, mut rx) = stall_halves(stall_barn);
+
+        // The line never ends, and the peer's write half closes: the broker
+        // reads a partial line and a clean EOF, naming `closed socket`.
+        let truncated = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"request\"";
+        tokio::io::AsyncWriteExt::write_all(&mut host_peer, truncated)
+            .await
+            .expect("a truncated host frame");
+        tokio::io::AsyncWriteExt::shutdown(&mut host_peer)
+            .await
+            .expect("the host peer's write half-close");
+
+        let denied = running.serve_host(&mut host, &mut stall, &mut rx).await;
+
+        assert!(matches!(
+            denied,
+            Err(SupervisorError::HostDenied(HostDeny::ClosedSocket))
+        ));
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn a_drain_sends_the_exact_frame_and_skips_denials_to_the_reply() {
+        let (barn_side, peer) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (mut stall, mut rx) = stall_halves(barn_side);
+        let mut peer = tokio::io::BufReader::new(peer);
+
+        let serving = async {
+            let mut request = Vec::new();
+            tokio::io::AsyncBufReadExt::read_until(&mut peer, b'\n', &mut request)
+                .await
+                .expect("the drain frame");
+            assert_eq!(
+                request,
+                b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"stall.drain\"}\n"
+            );
+
+            tokio::io::AsyncWriteExt::write_all(
+                &mut peer,
+                b"{\"jsonrpc\":\"2.0\",\"id\":9,\"error\":{\"code\":-32001,\"message\":\"denied\",\"data\":{\"reason\":\"stall draining\"}}}\n",
+            )
+            .await
+            .expect("a stall draining denial");
+            tokio::io::AsyncWriteExt::write_all(
+                &mut peer,
+                b"{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":null}\n",
+            )
+            .await
+            .expect("the drain reply");
+        };
+
+        // Bound the whole exchange: a drain that never writes the request
+        // leaves the peer waiting in read_until forever.
+        let (replied, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                timeout(Duration::from_secs(2), drain_reply(&mut stall, &mut rx)),
+                serving
+            )
+        })
+        .await
+        .expect("the drain exchange finished within the deadline");
+
+        assert!(replied.expect("drain reply within deadline"));
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_line_does_not_end_the_drain_wait() {
+        let (barn_side, peer) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (mut stall, mut rx) = stall_halves(barn_side);
+        let mut peer = tokio::io::BufReader::new(peer);
+
+        // The peer answers the frame with one unrelated JSON-RPC line, then
+        // stays open: no drain reply and no close. The wait must keep going.
+        let serving = async {
+            let mut request = Vec::new();
+            tokio::io::AsyncBufReadExt::read_until(&mut peer, b'\n', &mut request)
+                .await
+                .expect("the drain frame");
+            assert_eq!(
+                request,
+                b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"stall.drain\"}\n"
+            );
+            tokio::io::AsyncWriteExt::write_all(
+                &mut peer,
+                b"{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":null}\n",
+            )
+            .await
+            .expect("an unrelated JSON-RPC line");
+        };
+
+        let (drained, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                timeout(Duration::from_millis(300), drain_reply(&mut stall, &mut rx)),
+                serving
+            )
+        })
+        .await
+        .expect("the drain exchange finished within the deadline");
+
+        assert!(
+            drained.is_err(),
+            "the drain wait outlives an unrelated line"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_drain_ends_when_the_stall_closes_without_a_reply() {
+        let (barn_side, peer) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (mut stall, mut rx) = stall_halves(barn_side);
+        drop(peer);
+
+        assert!(
+            !timeout(Duration::from_secs(2), drain_reply(&mut stall, &mut rx))
+                .await
+                .expect("drain reply within deadline")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stall_that_never_acknowledges_the_drain_is_a_failure() {
+        // This starts a child with `barn-exec`, so it runs in CI only.
+        if std::env::var_os("CI").is_none() {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!("barn-cli-drain-{}", std::process::id()));
+        let helper = root.join("fixture-exec");
+        fs::create_dir_all(&root).expect("a scratch state root");
+        fs::write(&helper, "#!/bin/sh\nshift\nexec \"$@\"\n").expect("a helper script");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).expect("helper mode");
+
+        let supervisor = Supervisor::new(root.join("state"), helper);
+        let program = PathBuf::from("/usr/bin/true");
+        let spec = StallSpec {
+            name: "drain".to_owned(),
+            program: program.clone(),
+            args: Vec::new(),
+            grant: Grant {
+                executable: Some(program),
+                ..Grant::default()
+            },
+        };
+        let mut running = supervisor
+            .start_for_host(spec, std::process::id())
+            .await
+            .expect("a running stall");
+        let (barn_side, peer) = tokio::net::UnixStream::pair().expect("a socket pair");
+        drop(peer);
+        let (mut stall, mut rx) = stall_halves(barn_side);
+
+        let outcome = timeout(
+            Duration::from_secs(2),
+            drain_stall(&mut stall, &mut rx, &mut running),
+        )
+        .await
+        .expect("the drain finished within the deadline");
+
+        assert!(matches!(outcome, Err(StartError::DrainFailed)));
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn a_stall_that_exits_non_zero_after_the_drain_is_a_failure() {
+        // This starts a child with `barn-exec`, so it runs in CI only.
+        if std::env::var_os("CI").is_none() {
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!("barn-d-{}", std::process::id()));
+        let helper = root.join("fixture-exec");
+        fs::create_dir_all(&root).expect("a scratch state root");
+        fs::write(&helper, "#!/bin/sh\nshift\nexit 1\n").expect("a helper script");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o700)).expect("helper mode");
+
+        let supervisor = Supervisor::new(root.join("state"), helper);
+        let program = PathBuf::from("/usr/bin/true");
+        let spec = StallSpec {
+            name: "drain".to_owned(),
+            program: program.clone(),
+            args: Vec::new(),
+            grant: Grant {
+                executable: Some(program),
+                ..Grant::default()
+            },
+        };
+        let mut running = supervisor
+            .start_for_host(spec, std::process::id())
+            .await
+            .expect("a running stall");
+        let (barn_side, peer) = tokio::net::UnixStream::pair().expect("a socket pair");
+        let (mut stall, mut rx) = stall_halves(barn_side);
+        let mut peer = tokio::io::BufReader::new(peer);
+
+        let serving = async {
+            let mut request = Vec::new();
+            tokio::io::AsyncBufReadExt::read_until(&mut peer, b'\n', &mut request)
+                .await
+                .expect("the drain frame");
+            assert_eq!(
+                request,
+                b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"stall.drain\"}\n"
+            );
+
+            tokio::io::AsyncWriteExt::write_all(
+                &mut peer,
+                b"{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":null}\n",
+            )
+            .await
+            .expect("the drain reply");
+        };
+
+        let (outcome, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(drain_stall(&mut stall, &mut rx, &mut running), serving)
+        })
+        .await
+        .expect("the drain exchange finished within the deadline");
+
+        assert!(matches!(outcome, Err(StartError::DrainFailed)));
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn only_the_drain_success_reply_ends_the_wait() {
+        assert!(is_drain_reply(
+            b"{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":null}\n"
+        ));
+        assert!(!is_drain_reply(
+            b"{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32001,\"message\":\"denied\"}}\n"
+        ));
+        assert!(!is_drain_reply(
+            b"{\"jsonrpc\":\"2.0\",\"id\":9,\"result\":null}\n"
+        ));
+        assert!(!is_drain_reply(
+            b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"log\"}\n"
+        ));
+        assert!(!is_drain_reply(b"not JSON\n"));
+    }
+
+    #[test]
+    fn an_idle_stall_death_and_a_host_loss_are_named_after_failures() {
+        let idle = StartFailure::after(StartError::StallDeathIdle);
+        let host = StartFailure::after(StartError::HostLoss);
+
+        assert_eq!(idle.error.reason(), "stall exited while idle");
+        assert!(idle.endpoint_written);
+        assert_eq!(host.error.reason(), "host connection lost");
+        assert!(host.endpoint_written);
+    }
+
+    #[test]
+    fn the_drain_wait_has_a_margin_over_the_stall_budget() {
+        assert_eq!(
+            DRAIN_WAIT_TIMEOUT,
+            Duration::from_millis(DRAIN_DEADLINE_MS.saturating_add(DRAIN_MARGIN_MS))
+        );
+        assert!(DRAIN_WAIT_TIMEOUT > Duration::from_millis(DRAIN_DEADLINE_MS));
+    }
+
+    #[test]
+    fn the_drain_line_cap_is_the_protocol_line_limit() {
+        assert_eq!(MAX_LINE_BYTES, 8_388_608);
     }
 }
