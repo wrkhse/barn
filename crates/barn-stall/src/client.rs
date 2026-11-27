@@ -200,6 +200,7 @@ fn decode_reply(line: &[u8], id: &Value) -> Result<StallStartResult, ClientError
 mod tests {
     use super::*;
     use std::thread;
+    use std::time::Duration;
 
     /// Runs a handshake against a fake barn on the other end of a socket pair.
     ///
@@ -338,5 +339,146 @@ mod tests {
             .expect_err("the reply filled the line limit");
 
         assert!(matches!(error, ClientError::Oversize));
+    }
+
+    #[test]
+    fn an_oversize_write_is_refused_before_it_reaches_the_socket() {
+        let (mut writer, _peer) = UnixStream::pair().expect("a socket pair");
+        writer.set_nonblocking(true).expect("a nonblocking writer");
+
+        let padding = "x".repeat(MAX_LINE_BYTES);
+        let oversize = json!(padding);
+
+        let error = write_line(&mut writer, &oversize).expect_err("the line exceeds the cap");
+
+        assert!(matches!(error, ClientError::Oversize), "got {error:?}");
+    }
+
+    #[test]
+    fn a_small_write_reaches_the_peer_as_one_newline_terminated_line() {
+        let (mut writer, peer) = UnixStream::pair().expect("a socket pair");
+        let mut reader = BufReader::new(peer);
+        reader
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("a read deadline");
+
+        let expected = b"{\"a\":1}\n".to_vec();
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut received = Vec::new();
+                reader
+                    .read_until(b'\n', &mut received)
+                    .expect("the peer reads the whole line");
+                assert_eq!(received, expected);
+            });
+
+            write_line(&mut writer, &json!({"a": 1})).expect("the small write succeeds");
+        });
+    }
+
+    #[test]
+    fn errors_display_their_exact_messages() {
+        let connect = io::Error::new(io::ErrorKind::ConnectionRefused, "cannot connect");
+        let connect_message = connect.to_string();
+        let write = io::Error::new(io::ErrorKind::BrokenPipe, "cannot write");
+        let write_message = write.to_string();
+        let read = io::Error::new(io::ErrorKind::UnexpectedEof, "cannot read");
+        let read_message = read.to_string();
+        let malformed = serde_json::from_str::<Value>("{").expect_err("invalid JSON");
+        let malformed_message = malformed.to_string();
+        let reply = json!({"code": -32001, "message": "denied"});
+        let reply_message = reply.to_string();
+
+        assert_eq!(
+            ClientError::MissingSocket.to_string(),
+            "BARN_SOCKET is not set"
+        );
+        assert_eq!(
+            ClientError::MissingToken.to_string(),
+            "BARN_TOKEN is not set"
+        );
+        assert_eq!(
+            ClientError::Connect(connect).to_string(),
+            format!("connecting to barn: {connect_message}")
+        );
+        assert_eq!(
+            ClientError::Write(write).to_string(),
+            format!("writing stall start: {write_message}")
+        );
+        assert_eq!(
+            ClientError::Read(read).to_string(),
+            format!("reading the start reply: {read_message}")
+        );
+        assert_eq!(
+            ClientError::Eof.to_string(),
+            "the start reply closed before its newline"
+        );
+        assert_eq!(
+            ClientError::Oversize.to_string(),
+            "a start line exceeded MAX_LINE_BYTES"
+        );
+        assert_eq!(
+            ClientError::Malformed(malformed).to_string(),
+            format!("a start line is malformed: {malformed_message}")
+        );
+        assert_eq!(
+            ClientError::ErrorReply(reply).to_string(),
+            format!("barn refused stall start: {reply_message}")
+        );
+        assert_eq!(
+            ClientError::IdMismatch.to_string(),
+            "the start reply carried another id"
+        );
+        assert_eq!(
+            ClientError::VersionMismatch.to_string(),
+            "the start reply used another protocol version"
+        );
+    }
+
+    #[test]
+    fn connect_write_read_and_malformed_expose_their_source() {
+        let connect = io::Error::new(io::ErrorKind::ConnectionRefused, "cannot connect");
+        let connect_message = connect.to_string();
+        let error = ClientError::Connect(connect);
+        let source = std::error::Error::source(&error).expect("connect has a source");
+        assert_eq!(source.to_string(), connect_message);
+
+        let write = io::Error::new(io::ErrorKind::BrokenPipe, "cannot write");
+        let write_message = write.to_string();
+        let error = ClientError::Write(write);
+        let source = std::error::Error::source(&error).expect("write has a source");
+        assert_eq!(source.to_string(), write_message);
+
+        let read = io::Error::new(io::ErrorKind::UnexpectedEof, "cannot read");
+        let read_message = read.to_string();
+        let error = ClientError::Read(read);
+        let source = std::error::Error::source(&error).expect("read has a source");
+        assert_eq!(source.to_string(), read_message);
+
+        let malformed = serde_json::from_str::<Value>("{").expect_err("invalid JSON");
+        let malformed_message = malformed.to_string();
+        let error = ClientError::Malformed(malformed);
+        let source = std::error::Error::source(&error).expect("malformed has a source");
+        assert_eq!(source.to_string(), malformed_message);
+    }
+
+    #[test]
+    fn errors_without_a_source_return_none() {
+        let reply = json!({"code": -32001, "message": "denied"});
+        let cases = [
+            ClientError::MissingSocket,
+            ClientError::MissingToken,
+            ClientError::Eof,
+            ClientError::Oversize,
+            ClientError::ErrorReply(reply),
+            ClientError::IdMismatch,
+            ClientError::VersionMismatch,
+        ];
+
+        for error in cases {
+            assert!(std::error::Error::source(&error).is_none());
+        }
     }
 }
