@@ -1098,7 +1098,14 @@ impl HostTransport {
         };
         let exchanged = timeout(
             exchange_limit,
-            self.exchange(&mut reader, cred.pid(), cred.uid(), daemon_pid, stall_name, &line),
+            self.exchange(
+                &mut reader,
+                cred.pid(),
+                cred.uid(),
+                daemon_pid,
+                stall_name,
+                &line,
+            ),
         )
         .await;
 
@@ -1157,7 +1164,9 @@ impl HostTransport {
             return self.refuse_host(reader, &id, HostDeny::WrongPeerPid).await;
         }
         if params.protocol != PROTOCOL_VERSION {
-            return self.refuse_host(reader, &id, HostDeny::ProtocolMismatch).await;
+            return self
+                .refuse_host(reader, &id, HostDeny::ProtocolMismatch)
+                .await;
         }
         if let Some(host_deny) = host_token_deny(&mut self.token, &params.token, Instant::now()) {
             return self.refuse_host(reader, &id, host_deny).await;
@@ -1504,17 +1513,21 @@ fn valid_base64(body: &str) -> bool {
         .count();
     let padding = bytes.len().saturating_sub(symbols);
 
-    if padding > 2 || !bytes[symbols..].iter().all(|byte| *byte == b'=') {
+    if padding > 2
+        || !bytes
+            .get(symbols..)
+            .is_none_or(|tail| tail.iter().all(|byte| *byte == b'='))
+    {
         return false;
     }
 
     let remainder = symbols % 4;
 
-    remainder != 1 && (padding == 0 || remainder + padding == 4)
+    remainder != 1 && (padding == 0 || remainder.checked_add(padding) == Some(4))
 }
 
 /// Whether a byte is a standard base64 symbol, excluding `=` padding.
-fn is_base64_symbol(byte: u8) -> bool {
+const fn is_base64_symbol(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'
 }
 
@@ -2589,7 +2602,7 @@ mod tests {
         );
 
         // The real daemon gets the live token.
-        let mut peer = UnixStream::connect(&socket).await.expect("host connects");
+        let mut peer = BufReader::new(UnixStream::connect(&socket).await.expect("host connects"));
         peer.write_all(&host_start(daemon, "secret"))
             .await
             .expect("host.start");
@@ -2599,10 +2612,13 @@ mod tests {
         assert!(matches!(accepted, Ok(_)));
         assert!(transport.token.is_none());
         let mut reply = Vec::new();
-        timeout(Duration::from_millis(500), peer.read_until(b'\n', &mut reply))
-            .await
-            .expect("host.start reply")
-            .expect("read reply");
+        timeout(
+            Duration::from_millis(500),
+            peer.read_until(b'\n', &mut reply),
+        )
+        .await
+        .expect("host.start reply")
+        .expect("read reply");
         assert_eq!(
             serde_json::from_slice::<Value>(&reply).expect("reply JSON")["result"],
             json!({"stall": "fixture"})
