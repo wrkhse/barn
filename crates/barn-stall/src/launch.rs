@@ -168,3 +168,37 @@ fn string_field(object: &Map<String, Value>, key: &'static str) -> Result<String
         .map(str::to_owned)
         .ok_or(LaunchError::WrongType(key))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::LaunchError;
+
+    #[test]
+    fn every_launch_error_has_an_exact_display() {
+        assert_eq!(LaunchError::Empty.to_string(), "the launch line is empty");
+        assert_eq!(
+            LaunchError::Malformed("bad json".to_owned()).to_string(),
+            "malformed launch line: bad json"
+        );
+        assert_eq!(
+            LaunchError::Oversize.to_string(),
+            "the launch line exceeded MAX_LAUNCH_LINE_BYTES"
+        );
+        assert_eq!(
+            LaunchError::WrongProtocol.to_string(),
+            "the launch line used another protocol"
+        );
+        assert_eq!(
+            LaunchError::UnknownField("extra".to_owned()).to_string(),
+            "unknown launch field: extra"
+        );
+        assert_eq!(
+            LaunchError::MissingField("token").to_string(),
+            "missing launch field: token"
+        );
+        assert_eq!(
+            LaunchError::WrongType("token").to_string(),
+            "launch field token has the wrong type"
+        );
+    }
+}

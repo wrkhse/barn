@@ -26,7 +26,7 @@ barn's state lives in `BARN_STATE_DIR`. tack sets it to `<tack state>/barn`;
 a standalone barn defaults to `HOME/.local/state/barn`.
 
 stdout carries exactly one newline-terminated JSON line, bounded by
-`MAX_LINE_BYTES`, and logs go only to stderr. On success the line is the
+`MAX_LAUNCH_LINE_BYTES`, and logs go only to stderr. On success the line is the
 endpoint tack reads for the stall it just started:
 
 <!-- prettier-ignore -->
@@ -300,6 +300,7 @@ access to a tool or a session.
 | ------------------------ | --------- | ---------------------------------------- |
 | `PROTOCOL_VERSION`       | `1`       | the version barn speaks                  |
 | `MAX_LINE_BYTES`         | `8388608` | 8 MiB per line, including the newline    |
+| `MAX_LAUNCH_LINE_BYTES`  | `8192`    | 8 KiB for the launch line on stdout      |
 | `DEFAULT_MAX_BODY_BYTES` | `4194304` | 4 MiB, the default body cap a grant sets |
 | `DENIED_CODE`            | `-32001`  | the error code for `denied`              |
 | `TOKEN_TTL_SECS`         | `30`      | seconds before a start token expires     |

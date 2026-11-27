@@ -1,7 +1,7 @@
 //! barn's command line: the surface the supervisor answers.
 
 use std::env;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -125,8 +125,9 @@ impl CliCommand {
 /// Runs the command a person typed.
 ///
 /// The launch command writes exactly one protocol line to stdout: the endpoint
-/// on success, or a named failure. Other commands are still stubs: each says
-/// so on stderr and exits non-zero.
+/// once the stall starts, or a named failure if it never does. A later failure
+/// reaches stderr only, leaving that one line intact. Other commands are still
+/// stubs: each says so on stderr and exits non-zero.
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
 
@@ -135,10 +136,8 @@ pub fn run() -> ExitCode {
             action: StallCommand::Start { plugin, daemon_pid },
         } => match start(&plugin, daemon_pid) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                let line = error_line(error.reason());
-                let _ = write_line(io::stdout().lock(), &line);
-                eprintln!("barn stall start: {error}");
+            Err(failure) => {
+                report_failure(&mut io::stdout().lock(), &mut io::stderr().lock(), &failure);
                 ExitCode::FAILURE
             }
         },
@@ -217,6 +216,33 @@ impl StartError {
     }
 }
 
+/// A launch failure, with whether stdout already holds the endpoint line.
+///
+/// Once that line is written the pipe is complete, so a later failure is
+/// reported on stderr only and tack never reads a second line.
+struct StartFailure {
+    error: StartError,
+    endpoint_written: bool,
+}
+
+impl StartFailure {
+    /// A failure while no endpoint line has reached stdout.
+    const fn before(error: StartError) -> Self {
+        Self {
+            error,
+            endpoint_written: false,
+        }
+    }
+
+    /// A failure after the endpoint line reached stdout.
+    const fn after(error: StartError) -> Self {
+        Self {
+            error,
+            endpoint_written: true,
+        }
+    }
+}
+
 /// The launch inputs barn derives from its own process and the environment.
 struct Launch {
     stall: StallSpec,
@@ -225,21 +251,27 @@ struct Launch {
     daemon_pid: u32,
 }
 
-fn start(plugin: &Path, daemon_pid: u32) -> Result<(), StartError> {
-    let current = env::current_exe().map_err(|source| StartError::Io {
-        operation: "finding the barn executable",
-        source,
+fn start(plugin: &Path, daemon_pid: u32) -> Result<(), StartFailure> {
+    let current = env::current_exe().map_err(|source| {
+        StartFailure::before(StartError::Io {
+            operation: "finding the barn executable",
+            source,
+        })
     })?;
-    let dir = current.parent().ok_or(StartError::BinaryDir)?;
-    let helper = helper_from(dir)?;
-    let program = runtime_from(dir)?;
-    let state_dir = state_dir()?;
+    let dir = current
+        .parent()
+        .ok_or_else(|| StartFailure::before(StartError::BinaryDir))?;
+    let helper = helper_from(dir).map_err(StartFailure::before)?;
+    let program = runtime_from(dir).map_err(StartFailure::before)?;
+    let state_dir = state_dir().map_err(StartFailure::before)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|source| StartError::Io {
-            operation: "building the tokio runtime",
-            source,
+        .map_err(|source| {
+            StartFailure::before(StartError::Io {
+                operation: "building the tokio runtime",
+                source,
+            })
         })?;
 
     runtime.block_on(start_async(plugin, program, daemon_pid, helper, state_dir))
@@ -269,11 +301,20 @@ fn runtime_from(dir: &Path) -> Result<PathBuf, StartError> {
 
 /// Tack's `<tack state>/barn`, or the standalone default under `HOME`.
 fn state_dir() -> Result<PathBuf, StartError> {
-    if let Some(root) = env::var_os("BARN_STATE_DIR").filter(|value| !value.is_empty()) {
+    state_dir_from(env::var_os("BARN_STATE_DIR"), env::var_os("HOME"))
+}
+
+/// Resolves the state directory from already-read values, so the choice is
+/// testable without changing the process environment.
+fn state_dir_from(
+    configured: Option<OsString>,
+    home: Option<OsString>,
+) -> Result<PathBuf, StartError> {
+    if let Some(root) = configured.filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(root));
     }
 
-    let home = env::var_os("HOME").ok_or(StartError::StateDirMissing)?;
+    let home = home.ok_or(StartError::StateDirMissing)?;
 
     Ok(Path::new(&home).join(".local").join("state").join("barn"))
 }
@@ -284,18 +325,29 @@ async fn start_async(
     daemon_pid: u32,
     helper: PathBuf,
     state_dir: PathBuf,
-) -> Result<(), StartError> {
-    let launch = prepare_launch(plugin, &program, daemon_pid, helper, state_dir)?;
+) -> Result<(), StartFailure> {
+    let launch = prepare_launch(plugin, &program, daemon_pid, helper, state_dir)
+        .map_err(StartFailure::before)?;
     let supervisor = Supervisor::new(launch.state_dir, launch.helper);
     let mut running = supervisor
         .start_for_host(launch.stall, launch.daemon_pid)
-        .await?;
+        .await
+        .map_err(StartError::from)
+        .map_err(StartFailure::before)?;
     let endpoint = running.host_endpoint();
 
-    write_endpoint(&endpoint)?;
+    write_endpoint(&mut io::stdout().lock(), &endpoint).map_err(StartFailure::before)?;
 
-    let connection = running.accept().await?;
-    running.supervise(connection, |_| {}).await?;
+    let connection = running
+        .accept()
+        .await
+        .map_err(StartError::from)
+        .map_err(StartFailure::after)?;
+    running
+        .supervise(connection, |_| {})
+        .await
+        .map_err(StartError::from)
+        .map_err(StartFailure::after)?;
 
     Ok(())
 }
@@ -349,14 +401,19 @@ fn stall_spec(plugin: &Path, program: &Path) -> Result<StallSpec, StartError> {
     })
 }
 
-fn write_endpoint(endpoint: &HostEndpoint) -> Result<(), StartError> {
+fn write_endpoint(writer: &mut impl Write, endpoint: &HostEndpoint) -> Result<(), StartError> {
+    write_endpoint_to(writer, endpoint)
+}
+
+/// Writes the one success line to a caller-supplied sink.
+fn write_endpoint_to(writer: &mut impl Write, endpoint: &HostEndpoint) -> Result<(), StartError> {
     let socket_path = endpoint
         .socket_path
         .to_str()
         .ok_or(StartError::SocketPath)?;
     let line = endpoint_line(socket_path, &endpoint.token)?;
 
-    write_line(io::stdout().lock(), &line)
+    write_line(writer, &line)
 }
 
 /// The exact success line: protocol, socket path and token, then one newline.
@@ -393,6 +450,19 @@ fn write_line(mut stdout: impl Write, line: &[u8]) -> Result<(), StartError> {
     })
 }
 
+/// Reports a failure once the stdout contract is settled.
+///
+/// A failure before the endpoint still owes the pipe one named error line.
+/// After the endpoint stdout is complete, and stderr carries the whole report.
+fn report_failure(stdout: &mut impl Write, stderr: &mut impl Write, failure: &StartFailure) {
+    if !failure.endpoint_written {
+        let line = error_line(failure.error.reason());
+        let _ = write_line(stdout, &line);
+    }
+
+    let _ = writeln!(stderr, "barn stall start: {}", failure.error);
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
@@ -402,8 +472,10 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        Cli, CliCommand, Grant, StallCommand, StallsCommand, endpoint_line, error_line,
-        prepare_launch, runtime_from, stall_spec,
+        Cli, CliCommand, Grant, HostEndpoint, StallCommand, StallsCommand, StartError,
+        StartFailure, endpoint_line, error_line, helper_from, prepare_launch, report_failure,
+        runtime_from, stall_spec, start, start_async, state_dir_from, write_endpoint,
+        write_endpoint_to, write_line,
     };
 
     #[test]
@@ -564,6 +636,187 @@ mod tests {
         let path = format!("/{}", "p".repeat(barn_stall::MAX_LAUNCH_LINE_BYTES));
         assert_eq!(
             endpoint_line(&path, "token")
+                .err()
+                .map(|error| error.reason()),
+            Some("endpoint line too long")
+        );
+    }
+
+    #[test]
+    fn start_refuses_when_the_sandbox_helper_is_absent() {
+        let failure = start(Path::new("/opt/plugins/sourcefed"), 4321)
+            .expect_err("a launch without barn-exec must fail");
+
+        assert!(!failure.endpoint_written);
+        assert_eq!(failure.error.reason(), "barn-exec not found");
+    }
+
+    #[test]
+    fn start_async_refuses_a_relative_plugin_folder() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime");
+        let failure = runtime
+            .block_on(start_async(
+                Path::new("plugins/sourcefed"),
+                PathBuf::from("/usr/local/bin/barn-luau-stall"),
+                4321,
+                PathBuf::from("/usr/local/bin/barn-exec"),
+                PathBuf::from("/var/lib/barn/state"),
+            ))
+            .expect_err("a relative plugin folder must fail");
+
+        assert!(!failure.endpoint_written);
+        assert_eq!(failure.error.reason(), "plugin path not absolute");
+    }
+
+    #[test]
+    fn write_line_writes_the_exact_bytes() {
+        let line = b"{\"protocol\":1}\n";
+        let mut output = Vec::new();
+
+        write_line(&mut output, line).expect("a line write");
+
+        assert_eq!(output, line.to_vec());
+    }
+
+    #[test]
+    fn write_endpoint_writes_the_exact_success_line() {
+        let endpoint = HostEndpoint {
+            socket_path: PathBuf::from("/run/host.sock"),
+            token: "one-use".to_owned(),
+        };
+        let mut output = Vec::new();
+
+        write_endpoint_to(&mut output, &endpoint).expect("an endpoint write");
+
+        let expected = concat!(
+            r#"{"protocol":1,"socket_path":"/run/host.sock","token":"one-use"}"#,
+            "\n"
+        );
+        assert_eq!(output, expected.as_bytes());
+    }
+
+    #[test]
+    fn write_endpoint_writes_the_exact_success_line_to_its_sink() {
+        let endpoint = HostEndpoint {
+            socket_path: PathBuf::from("/run/host.sock"),
+            token: "one-use".to_owned(),
+        };
+        let mut output = Vec::new();
+
+        write_endpoint(&mut output, &endpoint).expect("an endpoint write");
+
+        let expected = concat!(
+            r#"{"protocol":1,"socket_path":"/run/host.sock","token":"one-use"}"#,
+            "\n"
+        );
+        assert_eq!(output, expected.as_bytes());
+    }
+
+    #[test]
+    fn a_missing_sandbox_helper_is_a_named_failure() {
+        let dir = std::env::temp_dir().join(format!("barn-helper-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("an empty binary folder");
+
+        assert_eq!(
+            helper_from(&dir).err().map(|error| error.reason()),
+            Some("barn-exec not found")
+        );
+        fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn an_unset_state_directory_is_a_named_failure() {
+        assert_eq!(
+            state_dir_from(None, None).err().map(|error| error.reason()),
+            Some("state directory unavailable")
+        );
+    }
+
+    #[test]
+    fn an_empty_state_dir_setting_falls_back_to_home() {
+        let home = OsString::from("/home/barn");
+
+        assert_eq!(
+            state_dir_from(Some(OsString::new()), Some(home.clone())).expect("a state dir"),
+            PathBuf::from("/home/barn/.local/state/barn")
+        );
+        assert_eq!(
+            state_dir_from(Some(OsString::from("/custom/state")), Some(home)).expect("a state dir"),
+            PathBuf::from("/custom/state")
+        );
+    }
+
+    #[test]
+    fn a_pre_endpoint_failure_writes_the_named_error_line() {
+        let failure = StartFailure::before(StartError::RelativePlugin);
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        report_failure(&mut stdout, &mut stderr, &failure);
+
+        assert_eq!(
+            stdout,
+            b"{\"protocol\":1,\"error\":\"plugin path not absolute\"}\n".to_vec()
+        );
+        assert_eq!(
+            stderr,
+            b"barn stall start: plugin path is not absolute\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn a_post_endpoint_failure_keeps_stdout_to_one_line() {
+        let endpoint = HostEndpoint {
+            socket_path: PathBuf::from("/run/host.sock"),
+            token: "one-use".to_owned(),
+        };
+        let mut stdout = Vec::new();
+        write_endpoint_to(&mut stdout, &endpoint).expect("the endpoint line");
+        let failure = StartFailure::after(StartError::EndpointTooLong);
+        let mut stderr = Vec::new();
+
+        report_failure(&mut stdout, &mut stderr, &failure);
+
+        let expected = concat!(
+            r#"{"protocol":1,"socket_path":"/run/host.sock","token":"one-use"}"#,
+            "\n"
+        );
+        assert_eq!(stdout, expected.as_bytes());
+        assert_eq!(
+            stderr,
+            b"barn stall start: endpoint line exceeds the launch line limit\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn an_endpoint_line_at_the_byte_cap_is_accepted_and_one_over_is_refused() {
+        let socket = "/run/host.sock";
+        // The JSON frame around the two string bodies is 43 bytes; this socket
+        // path is 14, so the token makes up the rest of the cap.
+        let frame = 43_usize.saturating_add(socket.len());
+        let token = "x".repeat(barn_stall::MAX_LAUNCH_LINE_BYTES.saturating_sub(frame));
+        let at_cap = endpoint_line(socket, &token).expect("a line at the cap");
+        let expected = format!(r#"{{"protocol":1,"socket_path":"{socket}","token":"{token}"}}"#);
+
+        assert_eq!(at_cap.len(), barn_stall::MAX_LAUNCH_LINE_BYTES);
+        assert_eq!(at_cap, format!("{expected}\n").into_bytes());
+
+        let over_token = "x".repeat(
+            barn_stall::MAX_LAUNCH_LINE_BYTES
+                .saturating_sub(frame)
+                .saturating_add(1),
+        );
+        let over = format!(r#"{{"protocol":1,"socket_path":"{socket}","token":"{over_token}"}}"#);
+
+        assert_eq!(
+            over.len().saturating_add(1),
+            barn_stall::MAX_LAUNCH_LINE_BYTES.saturating_add(1)
+        );
+        assert_eq!(
+            endpoint_line(socket, &over_token)
                 .err()
                 .map(|error| error.reason()),
             Some("endpoint line too long")
