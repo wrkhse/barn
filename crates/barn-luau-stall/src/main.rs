@@ -258,4 +258,18 @@ mod tests {
 
         assert_eq!(folder, absolute);
     }
+
+    // This test kills the mutant that replaces the whole body of `main` with
+    // `Ok(())`: from a test process there is no valid plugin folder or socket,
+    // so success can only come from that replacement. CI only, like exit.rs --
+    // `main` may touch the socket named by `BARN_SOCKET`, which must stay off
+    // the owner's Mac.
+    #[test]
+    fn main_never_reports_success_in_ci() {
+        if std::env::var_os("CI").is_none() {
+            return;
+        }
+
+        assert!(!matches!(main(), Ok(())));
+    }
 }

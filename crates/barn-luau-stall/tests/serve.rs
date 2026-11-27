@@ -7,8 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use barn_luau::{Capabilities, Limits, Sandbox};
 use barn_luau_stall::bridge::real_clock;
-use barn_luau_stall::serve::{ServeError, serve};
-use barn_stall::{MAX_LINE_BYTES, Reply, protocol::DRAIN_DEADLINE_MS};
+use barn_luau_stall::serve::{MAX_IN_FLIGHT, ServeError, serve};
+use barn_stall::protocol::deny::{
+    BAD_FRAME, OVERSIZE_FRAME, OVERSIZE_REPLY, STALL_BUSY, STALL_DRAINING,
+};
+use barn_stall::{DENIED_CODE, MAX_LINE_BYTES, Reply, protocol::DRAIN_DEADLINE_MS};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -18,6 +21,10 @@ use tokio::time::Duration;
 const FRAMES: &str = include_str!("../../barn-stall/fixtures/frames.jsonl");
 const MEMORY_BYTES: usize = 16 * 1024 * 1024;
 const CALL_MS: u64 = 1000;
+/// Above the 500 ms drain deadline, so the engine cannot time out first.
+const DRAIN_CALL_MS: u64 = 2000;
+/// Short enough that an unbounded loop reaches the engine's deadline limit.
+const LIMIT_CALL_MS: u64 = 100;
 const WAIT: Duration = Duration::from_secs(2);
 
 type BoxError = Box<dyn std::error::Error>;
@@ -71,6 +78,23 @@ return {
 }
 "#;
 
+/// A tool whose result fills the engine's output budget, making the framed
+/// reply longer than one line can carry. The engine charges the two quotes
+/// around the string, so the result stops two bytes short of the budget.
+const BIG_PLUGIN: &str = r#"
+return {
+    name = "oversize",
+    tools = {
+        big = {
+            name = "big",
+            run = function()
+                return string.rep("x", 8 * 1024 * 1024 - 2)
+            end,
+        },
+    },
+}
+"#;
+
 struct PluginFolder(PathBuf);
 
 impl PluginFolder {
@@ -106,9 +130,13 @@ struct Peer {
 }
 
 fn peer() -> Result<Peer, BoxError> {
+    peer_with(PLUGIN, CALL_MS)
+}
+
+fn peer_with(plugin: &str, call_ms: u64) -> Result<Peer, BoxError> {
     let folder = PluginFolder::new()?;
-    folder.write("plugin.luau", PLUGIN)?;
-    let limits = Limits::new(MEMORY_BYTES, CALL_MS)?;
+    folder.write("plugin.luau", plugin)?;
+    let limits = Limits::new(MEMORY_BYTES, call_ms)?;
     let sandbox = Sandbox::new(folder.path(), limits, Capabilities::default(), real_clock())?;
     let (client, stall) = UnixStream::pair()?;
 
@@ -153,12 +181,6 @@ fn wires() -> Result<Vec<Value>, serde_json::Error> {
     FRAMES.lines().map(serde_json::from_str).collect()
 }
 
-const fn request_id(reply: &Reply) -> u64 {
-    match reply {
-        Reply::Hook { id, .. } | Reply::Tool { id, .. } | Reply::Error { id, .. } => *id,
-    }
-}
-
 #[tokio::test]
 async fn every_fixture_pair_travels_through_serve() {
     let frames = wires().expect("fixture frames");
@@ -166,8 +188,10 @@ async fn every_fixture_pair_travels_through_serve() {
     let mut peer = peer().expect("a peer");
 
     for pair in frames.as_chunks::<2>().0 {
-        // Pair 7 belongs to the fail-closed slice: it is the tack-side named
-        // deny for a dead stall, which the Luau engine cannot produce.
+        // Pair 7 is the `stall_unavailable` deny for a worker that failed
+        // before answering. `handle_request` returns a Reply for every engine
+        // outcome and never panics, so this fake peer cannot lose a worker the
+        // way barn does when a stall process dies.
         if pair[0]["id"] == 7 {
             continue;
         }
@@ -226,7 +250,7 @@ async fn drain_replies_null_and_stops_within_the_deadline() {
 
 #[tokio::test]
 async fn a_call_at_drain_finishes_or_gets_a_named_deny() {
-    let mut peer = peer().expect("a peer");
+    let mut peer = peer_with(PLUGIN, DRAIN_CALL_MS).expect("a peer");
     let request = json!({
         "type": "hook",
         "id": 99,
@@ -244,25 +268,20 @@ async fn a_call_at_drain_finishes_or_gets_a_named_deny() {
     peer.send("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"stall.drain\"}")
         .await
         .expect("send drain");
+
+    let reply = peer.reply().await.expect("the call's reply");
+    assert_eq!(
+        reply,
+        Reply::Error {
+            id: 99,
+            error: STALL_DRAINING.into(),
+            message: "in-flight call did not finish before the drain deadline".into(),
+        }
+    );
     assert_eq!(
         peer.json().await.expect("a drain reply"),
         json!({"jsonrpc": "2.0", "id": 3, "result": null})
     );
-
-    let reply = peer.reply().await.expect("the call's reply");
-    if let Reply::Error { id, error, .. } = &reply
-        && error == "stall_draining"
-    {
-        assert_eq!(
-            reply,
-            Reply::Error {
-                id: *id,
-                error: "stall_draining".into(),
-                message: "in-flight call did not finish before the drain deadline".into(),
-            }
-        );
-    }
-    assert_eq!(request_id(&reply), 99, "the original call is answered");
 
     let outcome = tokio::time::timeout(
         Duration::from_millis(DRAIN_DEADLINE_MS.saturating_mul(2)),
@@ -282,6 +301,20 @@ async fn an_oversize_line_is_named() {
         .await
         .expect("write an unbounded line");
 
+    let error = peer.json().await.expect("an oversize error line");
+    assert_eq!(
+        error,
+        json!({
+            "jsonrpc": "2.0",
+            "id": Value::Null,
+            "error": {
+                "code": DENIED_CODE,
+                "message": "denied",
+                "data": {"reason": OVERSIZE_FRAME},
+            },
+        })
+    );
+
     let outcome = finish(peer.task).await.expect("serve stops");
     assert!(matches!(outcome, Err(ServeError::Oversize)));
 }
@@ -293,6 +326,20 @@ async fn a_malformed_line_is_named() {
         .await
         .expect("send an unknown frame");
 
+    let error = peer.json().await.expect("a malformed error line");
+    assert_eq!(
+        error,
+        json!({
+            "jsonrpc": "2.0",
+            "id": Value::Null,
+            "error": {
+                "code": DENIED_CODE,
+                "message": "denied",
+                "data": {"reason": BAD_FRAME},
+            },
+        })
+    );
+
     let outcome = finish(peer.task).await.expect("serve stops");
     assert!(matches!(outcome, Err(ServeError::Malformed(_))));
 }
@@ -302,6 +349,152 @@ async fn a_closed_peer_is_named() {
     let peer = peer().expect("a peer");
     drop(peer.wire);
 
+    let outcome = finish(peer.task).await.expect("serve stops");
+    assert!(matches!(outcome, Err(ServeError::Closed)));
+}
+
+#[tokio::test]
+async fn a_call_over_its_deadline_is_named() {
+    let mut peer = peer_with(PLUGIN, LIMIT_CALL_MS).expect("a peer");
+    peer.send(
+        &json!({
+            "type": "hook",
+            "id": 50,
+            "version": 1,
+            "hook": "PreToolUse",
+            "call": {"tool": "bash", "name": "run", "input": {"command": "echo loop"}},
+        })
+        .to_string(),
+    )
+    .await
+    .expect("send the call");
+
+    assert_eq!(
+        peer.reply().await.expect("a reply"),
+        Reply::Error {
+            id: 50,
+            error: "limit".into(),
+            message: "script deadline exceeded".into(),
+        }
+    );
+
+    drop(peer.wire);
+    let outcome = finish(peer.task).await.expect("serve stops");
+    assert!(matches!(outcome, Err(ServeError::Closed)));
+}
+
+#[tokio::test]
+async fn a_peer_closing_mid_line_is_named() {
+    let mut peer = peer().expect("a peer");
+    peer.wire
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":5,")
+        .await
+        .expect("write a partial line");
+
+    drop(peer.wire);
+    let outcome = finish(peer.task).await.expect("serve stops");
+    assert!(matches!(outcome, Err(ServeError::Closed)));
+}
+
+#[tokio::test]
+async fn health_is_answered_while_a_call_is_in_flight() {
+    let mut peer = peer().expect("a peer");
+    peer.send(
+        &json!({
+            "type": "hook",
+            "id": 40,
+            "version": 1,
+            "hook": "PreToolUse",
+            "call": {"tool": "bash", "name": "run", "input": {"command": "echo loop"}},
+        })
+        .to_string(),
+    )
+    .await
+    .expect("send the long call");
+
+    peer.wire
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":41,")
+        .await
+        .expect("write the first half of health");
+    peer.wire
+        .write_all(b"\"method\":\"stall.health\"}\n")
+        .await
+        .expect("write the rest of health");
+
+    let health = tokio::time::timeout(Duration::from_secs(1), peer.json())
+        .await
+        .expect("health is answered while the call runs")
+        .expect("a health reply");
+    assert_eq!(health, json!({"jsonrpc": "2.0", "id": 41, "result": null}));
+
+    drop(peer.wire);
+    let outcome = finish(peer.task).await.expect("serve stops");
+    assert!(matches!(outcome, Err(ServeError::Closed)));
+}
+
+#[tokio::test]
+async fn a_call_past_the_in_flight_cap_is_busy() {
+    let mut peer = peer().expect("a peer");
+    let busy_id = u64::try_from(MAX_IN_FLIGHT).expect("the cap fits an id") + 1;
+
+    for id in 1..=busy_id {
+        let frame = json!({
+            "type": "hook",
+            "id": id,
+            "version": 1,
+            "hook": "PreToolUse",
+            "call": {"tool": "bash", "name": "run", "input": {"command": "echo loop"}},
+        });
+        peer.send(&frame.to_string()).await.expect("send a call");
+    }
+
+    assert_eq!(
+        peer.reply().await.expect("a reply"),
+        Reply::Error {
+            id: busy_id,
+            error: STALL_BUSY.into(),
+            message: "too many in-flight calls".into(),
+        }
+    );
+
+    drop(peer.wire);
+    let outcome = finish(peer.task).await.expect("serve stops");
+    assert!(matches!(outcome, Err(ServeError::Closed)));
+}
+
+#[tokio::test]
+async fn an_oversized_reply_is_denied_and_serving_continues() {
+    let mut peer = peer_with(BIG_PLUGIN, CALL_MS).expect("a peer");
+    peer.send(
+        &json!({
+            "type": "tool",
+            "id": 60,
+            "version": 1,
+            "call": {"tool": "notes", "name": "big", "input": {}},
+        })
+        .to_string(),
+    )
+    .await
+    .expect("send the tool call");
+
+    assert_eq!(
+        peer.reply().await.expect("a reply"),
+        Reply::Error {
+            id: 60,
+            error: OVERSIZE_REPLY.into(),
+            message: "the reply exceeds MAX_LINE_BYTES".into(),
+        }
+    );
+
+    peer.send("{\"jsonrpc\":\"2.0\",\"id\":61,\"method\":\"stall.health\"}")
+        .await
+        .expect("send health after the deny");
+    assert_eq!(
+        peer.json().await.expect("a health reply"),
+        json!({"jsonrpc": "2.0", "id": 61, "result": null})
+    );
+
+    drop(peer.wire);
     let outcome = finish(peer.task).await.expect("serve stops");
     assert!(matches!(outcome, Err(ServeError::Closed)));
 }
