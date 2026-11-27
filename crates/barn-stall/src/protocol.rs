@@ -25,6 +25,13 @@ pub const MAX_LINE_BYTES: usize = 8_388_608;
 /// Seconds after launch before the single-use `BARN_TOKEN` expires.
 pub const TOKEN_TTL_SECS: u64 = 30;
 
+/// Milliseconds in-flight calls get to finish when barn drains a stall: 500.
+///
+/// A call still running at the deadline is answered with a named deny, so a
+/// drain never waits on work the stall cannot finish. The deadline is fixed
+/// here and on the protocol page, and both are pinned by the page's tests.
+pub const DRAIN_DEADLINE_MS: u64 = 500;
+
 /// The default cap on an inline body, counted in decoded bytes: 4 MiB.
 ///
 /// The side that sends a body uses UTF-8 when the bytes are valid UTF-8 and the
@@ -350,5 +357,61 @@ mod tests {
                 "data": {"reason": deny::WRONG_PEER_PID},
             })
         );
+    }
+
+    /// The protocol page's constants table, read as name and pinned value.
+    fn constants() -> Vec<(String, i64)> {
+        PAGE.lines()
+            .filter(|line| line.starts_with("| `"))
+            .filter_map(|line| {
+                let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+                let name = cells.get(1)?.strip_prefix('`')?.strip_suffix('`')?;
+                let value: i64 = cells
+                    .get(2)?
+                    .strip_prefix('`')?
+                    .strip_suffix('`')?
+                    .parse()
+                    .ok()?;
+
+                Some((name.to_owned(), value))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stall_drain_writes_the_pages_request_and_reply() {
+        let messages = lines();
+        let request = messages
+            .iter()
+            .find(|message| {
+                message.get("method").and_then(Value::as_str) == Some(method::STALL_DRAIN)
+            })
+            .expect("the page sends stall.drain");
+        let id = request.get("id").cloned().expect("drain carries an id");
+        let reply = messages
+            .iter()
+            .find(|message| message.get("id") == Some(&id) && message.get("result").is_some())
+            .expect("the page answers stall.drain");
+
+        assert_eq!(
+            request,
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "stall.drain"})
+        );
+        assert_eq!(reply, &json!({"jsonrpc": "2.0", "id": 3, "result": null}));
+    }
+
+    #[test]
+    fn the_pages_table_pins_the_drain_deadline() {
+        let pinned = constants()
+            .into_iter()
+            .find(|(name, _)| name == "DRAIN_DEADLINE_MS")
+            .map(|(_, value)| value)
+            .expect("the page pins DRAIN_DEADLINE_MS");
+
+        assert_eq!(
+            pinned,
+            i64::try_from(DRAIN_DEADLINE_MS).expect("fits an i64")
+        );
+        assert_eq!(DRAIN_DEADLINE_MS, 500);
     }
 }

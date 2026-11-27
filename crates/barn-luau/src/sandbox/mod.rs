@@ -1,9 +1,10 @@
 //! One mlua VM per plugin, bounded by a memory ceiling and a per-call clock.
 //!
 //! The plugin is a Luau table at plugin.luau: named hook functions and a tools
-//! table. A hook returns nil for allow, a deny table or a rewrite table; a
-//! runnable returns a JSON-compatible value. Every input crossing the boundary is
-//! converted under both a depth and a table-size ceiling.
+//! table. A hook returns nil for allow, or a table with exactly one verdict:
+//! deny, rewrite, annotate or drop, built by the matching `ctx` helper. A
+//! runnable returns a JSON-compatible value. Every input crossing the boundary
+//! is converted under both a depth and a table-size ceiling.
 
 use std::collections::HashSet;
 use std::path::Path;

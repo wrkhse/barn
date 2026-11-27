@@ -1,7 +1,7 @@
 //! Values passed between a host and a Luau plugin.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// A host invocation supplied to a named hook.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,4 +24,8 @@ pub enum Outcome {
     Deny { reason: String },
     /// The invocation can proceed with a replacement payload.
     Rewrite { payload: Value },
+    /// The invocation can proceed with additional annotation fields.
+    Annotate { fields: Map<String, Value> },
+    /// The invocation must be removed from the run.
+    Drop,
 }

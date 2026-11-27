@@ -40,6 +40,28 @@ impl super::Sandbox {
             })?,
         )?;
         ctx.set(
+            "annotate",
+            self.lua.create_function(|lua, fields: LuaValue| {
+                let LuaValue::Table(fields) = fields else {
+                    return Err(mlua::Error::external(EngineError::InvalidResult(
+                        "annotate fields must be a table".into(),
+                    )));
+                };
+
+                let result = lua.create_table()?;
+                result.raw_set("annotate", fields)?;
+                Ok(result)
+            })?,
+        )?;
+        ctx.set(
+            "drop",
+            self.lua.create_function(|lua, ()| {
+                let result = lua.create_table()?;
+                result.raw_set("drop", true)?;
+                Ok(result)
+            })?,
+        )?;
+        ctx.set(
             "allow",
             self.lua.create_function(|_, ()| Ok(LuaValue::Nil))?,
         )?;
