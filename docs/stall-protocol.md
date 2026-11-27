@@ -8,6 +8,50 @@ jobs it runs and the events it emits. barn starts it, restarts it, holds its
 listeners, and gives it no network and no secrets. The two speak this protocol.
 The plan is [wrkhse/barn#1](https://github.com/wrkhse/barn/issues/1).
 
+## Launching a stall from tack
+
+tack runs barn as a separate program; its only barn dependency is
+`barn-stall`. tack writes a spec file and launches one stall with:
+
+```sh
+barn stalls start /path/to/stall.json \
+  --helper /path/to/barn-exec \
+  --state-dir /var/lib/barn \
+  --host-pid 4321
+```
+
+The spec is one JSON object. Every field is required, and every path in it is
+absolute:
+
+```json
+{
+  "name": "sourcefed",
+  "program": "/usr/local/bin/sourcefed",
+  "args": [],
+  "grant": {
+    "executable": "/usr/local/bin/sourcefed",
+    "read_paths": ["/usr/local/bin/sourcefed"],
+    "write_paths": ["/var/lib/barn/sourcefed"],
+    "network_hosts": ["api.github.com"]
+  }
+}
+```
+
+barn writes one newline-terminated line to stdout, the endpoint tack reads for
+the stall it just started:
+
+<!-- prettier-ignore -->
+```json
+{"socket_path":"/var/lib/barn/run/sourcefed/host.sock","token":"…"}
+```
+
+The line is bounded by `MAX_LINE_BYTES`, including its newline. barn then
+accepts the stall on `proto.sock` and supervises it for as long as it runs.
+Host-side frame brokering over `host.sock` is a follow-up
+([barn#46](https://github.com/wrkhse/barn/issues/46),
+[barn#48](https://github.com/wrkhse/barn/issues/48)); this command does not
+broker tack's frames yet.
+
 ## Transport
 
 - barn listens at `state_dir/run/<stall>/proto.sock`, a Unix socket with mode
