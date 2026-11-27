@@ -2435,6 +2435,134 @@ mod tests {
         assert!(matches!(refused, Err(SupervisorError::DenialTimeout)));
     }
 
+    /// An inner sink that records whether the adapter forwarded flush and
+    /// shutdown, and can return a chosen error from either on demand.
+    #[derive(Default)]
+    struct RecordingWriter {
+        flushed: bool,
+        shut_down: bool,
+        flush_error: Option<io::ErrorKind>,
+        shutdown_error: Option<io::ErrorKind>,
+    }
+
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushed = true;
+
+            Poll::Ready(
+                self.flush_error
+                    .take()
+                    .map_or(Ok(()), |kind| Err(io::Error::from(kind))),
+            )
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.shut_down = true;
+
+            Poll::Ready(
+                self.shutdown_error
+                    .take()
+                    .map_or(Ok(()), |kind| Err(io::Error::from(kind))),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn counting_writer_forwards_flush_to_the_inner_writer() {
+        let mut inner = RecordingWriter::default();
+
+        let flushed = {
+            let mut counting = CountingWriter {
+                inner: &mut inner,
+                written: 0,
+            };
+
+            timeout(Duration::from_secs(1), counting.flush()).await
+        };
+
+        assert!(matches!(flushed, Ok(Ok(()))));
+        assert!(inner.flushed);
+        assert!(!inner.shut_down);
+    }
+
+    #[tokio::test]
+    async fn counting_writer_forwards_shutdown_to_the_inner_writer() {
+        let mut inner = RecordingWriter::default();
+
+        let shut_down = {
+            let mut counting = CountingWriter {
+                inner: &mut inner,
+                written: 0,
+            };
+
+            timeout(Duration::from_secs(1), counting.shutdown()).await
+        };
+
+        assert!(matches!(shut_down, Ok(Ok(()))));
+        assert!(inner.shut_down);
+        assert!(!inner.flushed);
+    }
+
+    #[tokio::test]
+    async fn counting_writer_propagates_an_inner_flush_error() {
+        let mut inner = RecordingWriter {
+            flush_error: Some(io::ErrorKind::BrokenPipe),
+            ..RecordingWriter::default()
+        };
+
+        let failed = {
+            let mut counting = CountingWriter {
+                inner: &mut inner,
+                written: 0,
+            };
+
+            timeout(Duration::from_secs(1), counting.flush()).await
+        };
+
+        assert_eq!(
+            failed
+                .expect("flush within deadline")
+                .expect_err("inner flush error")
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(inner.flushed);
+    }
+
+    #[tokio::test]
+    async fn counting_writer_propagates_an_inner_shutdown_error() {
+        let mut inner = RecordingWriter {
+            shutdown_error: Some(io::ErrorKind::ConnectionReset),
+            ..RecordingWriter::default()
+        };
+
+        let failed = {
+            let mut counting = CountingWriter {
+                inner: &mut inner,
+                written: 0,
+            };
+
+            timeout(Duration::from_secs(1), counting.shutdown()).await
+        };
+
+        assert_eq!(
+            failed
+                .expect("shutdown within deadline")
+                .expect_err("inner shutdown error")
+                .kind(),
+            io::ErrorKind::ConnectionReset
+        );
+        assert!(inner.shut_down);
+    }
+
     #[tokio::test]
     async fn a_host_that_stops_taking_the_reply_gets_the_stalled_reply_deny() {
         let reply = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n";
