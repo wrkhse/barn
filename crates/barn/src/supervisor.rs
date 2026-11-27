@@ -2,16 +2,21 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{OsStr, OsString};
+use std::fmt::{self, Debug, Formatter};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::hint::black_box;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{ExitStatus, Stdio};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use barn_stall::protocol::TOKEN_TTL_SECS;
+use barn_stall::protocol::{
+    DEFAULT_MAX_BODY_BYTES, DENIED_CODE, HostStartParams, HostStartResult, TOKEN_TTL_SECS, deny,
+};
 use barn_stall::{Job, StallStartParams, StallStartResult};
 use barn_stall::{MAX_LINE_BYTES, PROTOCOL_VERSION, method};
 use nono::{AccessMode, CapabilitySet, NonoError, SandboxState, UnixSocketMode};
@@ -38,11 +43,15 @@ const MAX_EXIT_DRAIN_FRAMES: usize = 64;
 const MAX_EXIT_DRAIN_BYTES: usize = 64 * 1024;
 const EXIT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const HOST_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+const HOST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const DENY_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const TOKEN_BYTES: usize = 32;
 const TOKEN_TTL: Duration = Duration::from_secs(TOKEN_TTL_SECS);
 const PRIVATE_DIR: u32 = 0o700;
 const PRIVATE_FILE: u32 = 0o600;
 const SOCKET_FILE: &str = "proto.sock";
+const HOST_SOCKET_FILE: &str = "host.sock";
 const POLICY_FILE: &str = "policy.json";
 /// The shell shim; a grant that lets a stall execute it gets `SHELL_GRANTS`.
 const SHELL_SHIM: &str = "/bin/sh";
@@ -72,6 +81,72 @@ pub struct StallSpec {
     pub grant: Grant,
 }
 
+/// The socket and single-use token tack uses to reach a running stall.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HostEndpoint {
+    /// The Unix socket tack connects to.
+    pub socket_path: PathBuf,
+    /// The single-use token tack offers in `host.start`.
+    pub token: String,
+}
+
+impl Debug for HostEndpoint {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HostEndpoint")
+            .field("socket_path", &self.socket_path)
+            .field("token", &"[redacted]")
+            .finish()
+    }
+}
+
+/// Why barn refuses a host or stops brokering one of its frames.
+///
+/// Every variant writes the reason fixed on the protocol page into a
+/// `denied` reply before the connection closes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostDeny {
+    /// The peer is not the tack daemon barn was told to expect.
+    WrongPeerPid,
+    /// The peer does not own the host socket.
+    WrongPeerUid,
+    /// The host token is gone or past its deadline.
+    TokenExpiredOrSpent,
+    /// The offered host token does not match.
+    TokenMismatch,
+    /// The version or envelope of `host.start` does not match.
+    ProtocolMismatch,
+    /// A line is longer than the line cap.
+    OversizeFrame,
+    /// A line is not valid, or its body cannot be measured.
+    BadFrame,
+    /// A body is longer than the body cap.
+    OversizeBody,
+    /// The peer closed before finishing the exchange.
+    ClosedSocket,
+    /// The stall did not answer within the reply deadline.
+    StalledReply,
+    /// The stall's connection ended before it answered.
+    PeerLoss,
+}
+
+impl HostDeny {
+    /// The reason fixed on the protocol page for this denial.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::WrongPeerPid => deny::WRONG_PEER_PID,
+            Self::WrongPeerUid => deny::WRONG_PEER_UID,
+            Self::TokenExpiredOrSpent => deny::TOKEN_EXPIRED_OR_SPENT,
+            Self::TokenMismatch => deny::TOKEN_MISMATCH,
+            Self::ProtocolMismatch => deny::PROTOCOL_MISMATCH,
+            Self::OversizeFrame | Self::OversizeBody => deny::OVERSIZE_FRAME,
+            Self::BadFrame => deny::BAD_FRAME,
+            Self::ClosedSocket | Self::StalledReply | Self::PeerLoss => deny::CLOSED_SOCKET,
+        }
+    }
+}
+
 /// Starts stalls with the named `barn-exec` helper under a trusted state root.
 #[derive(Clone)]
 pub struct Supervisor {
@@ -84,6 +159,7 @@ pub struct RunningStall {
     child: Child,
     pid: u32,
     transport: Transport,
+    host: HostTransport,
     supervisor: Supervisor,
     spec: StallSpec,
     started: Instant,
@@ -101,6 +177,14 @@ struct Transport {
     jobs: BTreeMap<String, Job>,
 }
 
+/// The host listener, its single-use token and the tack daemon it expects.
+struct HostTransport {
+    listener: UnixListener,
+    token: Option<Token>,
+    daemon_pid: Option<u32>,
+    uid: u32,
+}
+
 /// A start token and the moment it stops being accepted.
 struct Token {
     secret: String,
@@ -109,10 +193,12 @@ struct Token {
 
 struct Prepared {
     listener: StdUnixListener,
+    host_listener: StdUnixListener,
     run_dir: RunDir,
     state: String,
     uid: u32,
     token: String,
+    host_token: String,
     program: PathBuf,
 }
 
@@ -338,6 +424,12 @@ pub enum SupervisorError {
     /// The token has already been spent.
     #[error("stall token already spent")]
     TokenSpent,
+    /// A host request is refused with the reason named on the protocol page.
+    #[error("host denied: {0:?}")]
+    HostDenied(HostDeny),
+    /// A named denial could not be written before its deadline.
+    #[error("host denial timed out")]
+    DenialTimeout,
     /// The token's deadline has passed; it is dropped unspent.
     #[error("stall token expired")]
     TokenExpired,
@@ -360,13 +452,31 @@ impl Supervisor {
     /// Returns the stage that fails while preparing or starting the child.
     pub async fn start(&self, spec: StallSpec) -> Result<RunningStall> {
         self.clone()
-            .launch(spec, Instant::now(), RestartPolicy::default())
+            .launch(spec, None, Instant::now(), RestartPolicy::default())
+            .await
+    }
+
+    /// Starts one child and records the tack daemon allowed on `host.sock`.
+    ///
+    /// Run this on a Tokio runtime with I/O and time enabled.
+    ///
+    /// # Errors
+    /// Returns the stage that fails while preparing or starting the child.
+    pub async fn start_for_host(&self, spec: StallSpec, daemon_pid: u32) -> Result<RunningStall> {
+        self.clone()
+            .launch(
+                spec,
+                Some(daemon_pid),
+                Instant::now(),
+                RestartPolicy::default(),
+            )
             .await
     }
 
     async fn launch(
         self,
         spec: StallSpec,
+        daemon_pid: Option<u32>,
         epoch: Instant,
         restart: RestartPolicy,
     ) -> Result<RunningStall> {
@@ -381,6 +491,10 @@ impl Supervisor {
         let listener = io_at(
             "registering stall listener",
             UnixListener::from_std(prepared.listener),
+        )?;
+        let host_listener = io_at(
+            "registering host listener",
+            UnixListener::from_std(prepared.host_listener),
         )?;
         let env = ["PATH", "HOME", "LANG"]
             .into_iter()
@@ -416,6 +530,15 @@ impl Supervisor {
                 }),
                 jobs: BTreeMap::new(),
             },
+            host: HostTransport {
+                listener: host_listener,
+                token: Some(Token {
+                    secret: prepared.host_token,
+                    expires_at,
+                }),
+                daemon_pid,
+                uid: prepared.uid,
+            },
             supervisor: self,
             spec,
             started,
@@ -443,6 +566,55 @@ impl RunningStall {
     #[must_use]
     pub fn socket_path(&self) -> PathBuf {
         self.transport.run_dir.path(SOCKET_FILE)
+    }
+
+    /// The socket and token tack uses to reach this stall.
+    #[must_use]
+    pub fn host_endpoint(&self) -> HostEndpoint {
+        HostEndpoint {
+            socket_path: self.transport.run_dir.path(HOST_SOCKET_FILE),
+            token: self
+                .host
+                .token
+                .as_ref()
+                .map_or_else(String::new, |token| token.secret.clone()),
+        }
+    }
+
+    /// Accepts tack on `host.sock` and answers `host.start`.
+    ///
+    /// Every refusal is written to the peer as a named `denied` reply before
+    /// the connection closes; wrong peers are never retried in a loop. A spent
+    /// or expired token still answers the next host with `TokenExpiredOrSpent`
+    /// on the wire, and only a restart issues a new one.
+    ///
+    /// # Errors
+    /// Returns the named denial, a timeout, or the failing I/O stage.
+    pub async fn accept_host(&mut self) -> Result<BufReader<UnixStream>> {
+        let Some(daemon_pid) = self.host.daemon_pid else {
+            return Err(SupervisorError::HostDenied(HostDeny::WrongPeerPid));
+        };
+
+        self.host
+            .accept_with_deadline(daemon_pid, &self.spec.name)
+            .await
+    }
+
+    /// Brokers one framed request from `host` to the stall and its reply back.
+    ///
+    /// The frame bytes travel unchanged: no hook payload is read or changed.
+    /// A stalled or failed write to the stall leaves that connection dead: no
+    /// further frame can be brokered on it, and the host is denied.
+    ///
+    /// # Errors
+    /// Returns a named denial for an oversize frame, a lost peer or a stalled
+    /// reply, else the failing I/O stage.
+    pub async fn serve_host(
+        &self,
+        host: &mut BufReader<UnixStream>,
+        stall: &mut BufReader<UnixStream>,
+    ) -> Result<()> {
+        broker_host_frame(host, stall, HOST_REPLY_TIMEOUT).await
     }
 
     /// Accepts a connection from the child and responds to its start request.
@@ -556,7 +728,7 @@ impl RunningStall {
 
         let stall = self
             .supervisor
-            .launch(self.spec, self.epoch, self.restart)
+            .launch(self.spec, self.host.daemon_pid, self.epoch, self.restart)
             .await?;
 
         Ok(RestartOutcome::Restarted {
@@ -850,6 +1022,418 @@ impl Transport {
     }
 }
 
+impl HostTransport {
+    /// Accepts one host connection within the token's remaining lifetime.
+    ///
+    /// A token that is already spent or past its deadline takes the next
+    /// connection and lets the handshake write the named deny on the wire;
+    /// the token stays spent. When no host arrives before the deadline, the
+    /// token is dropped with no peer to answer. Every read and write after
+    /// the accept runs under a deadline; a peer that stalls is denied before
+    /// the connection closes.
+    async fn accept_with_deadline(
+        &mut self,
+        daemon_pid: u32,
+        stall_name: &str,
+    ) -> Result<BufReader<UnixStream>> {
+        let remaining = self.token.as_ref().map_or(Duration::ZERO, |token| {
+            token.expires_at.saturating_duration_since(Instant::now())
+        });
+        let spent = remaining.is_zero();
+        // A spent token still waits for one peer, but only for the handshake
+        // window: no host means no peer to answer and the token stays spent.
+        let accept_limit = if spent {
+            HOST_HANDSHAKE_TIMEOUT
+        } else {
+            remaining
+        };
+        let stream = if let Ok(accepted) = timeout(accept_limit, self.listener.accept()).await {
+            io_at("accepting host socket", accepted)?.0
+        } else {
+            self.token = None;
+
+            return Err(SupervisorError::HostDenied(HostDeny::TokenExpiredOrSpent));
+        };
+
+        let (deadline, timeout_deny) = if spent {
+            (HOST_HANDSHAKE_TIMEOUT, HostDeny::TokenExpiredOrSpent)
+        } else {
+            (remaining, HostDeny::StalledReply)
+        };
+        let mut reader = BufReader::new(stream);
+        let exchanged = timeout(deadline, self.exchange(&mut reader, daemon_pid, stall_name)).await;
+
+        match exchanged {
+            Ok(Ok(())) => Ok(reader),
+            Ok(Err(error)) => Err(error),
+            Err(_) => {
+                self.token = None;
+
+                refuse(&mut reader, &Value::Null, timeout_deny, DENY_WRITE_TIMEOUT).await
+            }
+        }
+    }
+
+    /// Completes the `host.start` exchange on an accepted connection.
+    async fn exchange(
+        &mut self,
+        reader: &mut BufReader<UnixStream>,
+        daemon_pid: u32,
+        stall_name: &str,
+    ) -> Result<()> {
+        let cred = io_at(
+            "reading host peer credentials",
+            reader.get_ref().peer_cred(),
+        )?;
+        let line = match read_line_bounded(reader).await {
+            Ok(line) => line,
+            Err(host_deny) => {
+                return refuse(reader, &Value::Null, host_deny, DENY_WRITE_TIMEOUT).await;
+            }
+        };
+        let id = request_id(&line);
+
+        if let Err(host_deny) = host_peer(cred.pid(), cred.uid(), daemon_pid, self.uid) {
+            return refuse(reader, &id, host_deny, DENY_WRITE_TIMEOUT).await;
+        }
+        let (id, params) = match decode_host_start(&line) {
+            Ok(start) => start,
+            Err(host_deny) => return refuse(reader, &id, host_deny, DENY_WRITE_TIMEOUT).await,
+        };
+        if params.pid != daemon_pid {
+            return refuse(reader, &id, HostDeny::WrongPeerPid, DENY_WRITE_TIMEOUT).await;
+        }
+        if params.protocol != PROTOCOL_VERSION {
+            return refuse(reader, &id, HostDeny::ProtocolMismatch, DENY_WRITE_TIMEOUT).await;
+        }
+        if let Some(host_deny) = host_token_deny(&mut self.token, &params.token, Instant::now()) {
+            return refuse(reader, &id, host_deny, DENY_WRITE_TIMEOUT).await;
+        }
+        let reply = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": HostStartResult { stall: stall_name.to_owned() }
+        });
+        let frame = bounded_frame(&reply)?;
+        io_at("answering host start", reader.write_all(&frame).await)?;
+
+        Ok(())
+    }
+}
+
+/// Maps a host peer's credentials to the named reason for a refusal.
+fn host_peer(
+    pid: Option<i32>,
+    uid: u32,
+    child: u32,
+    owner: u32,
+) -> std::result::Result<(), HostDeny> {
+    match verify_peer(pid, uid, child, owner) {
+        Ok(()) => Ok(()),
+        Err(SupervisorError::MissingPeerPid | SupervisorError::PeerPidMismatch) => {
+            Err(HostDeny::WrongPeerPid)
+        }
+        Err(SupervisorError::PeerUidMismatch) => Err(HostDeny::WrongPeerUid),
+        Err(_) => Err(HostDeny::ClosedSocket),
+    }
+}
+
+/// Spends a host token, naming the reason for a mismatch, expiry or reuse.
+fn host_token_deny(saved: &mut Option<Token>, offer: &str, now: Instant) -> Option<HostDeny> {
+    match spend_token(saved, offer, now) {
+        Ok(()) => None,
+        Err(SupervisorError::InvalidToken) => Some(HostDeny::TokenMismatch),
+        Err(SupervisorError::TokenExpired | SupervisorError::TokenSpent) => {
+            Some(HostDeny::TokenExpiredOrSpent)
+        }
+        Err(_) => Some(HostDeny::ClosedSocket),
+    }
+}
+
+/// Reads one bounded line, naming the reason it cannot be read.
+async fn read_line_bounded(
+    reader: &mut (impl AsyncBufRead + Unpin),
+) -> std::result::Result<Vec<u8>, HostDeny> {
+    let limit = u64::try_from(MAX_LINE_BYTES).unwrap_or(u64::MAX);
+    let mut line = Vec::new();
+
+    if reader
+        .take(limit)
+        .read_until(b'\n', &mut line)
+        .await
+        .is_err()
+    {
+        return Err(HostDeny::PeerLoss);
+    }
+
+    if line.last() == Some(&b'\n') {
+        Ok(line)
+    } else if line.len() == MAX_LINE_BYTES {
+        Err(HostDeny::OversizeFrame)
+    } else {
+        Err(HostDeny::ClosedSocket)
+    }
+}
+
+/// The id a denial echoes, or null when the line has no usable id.
+fn request_id(frame: &[u8]) -> Value {
+    serde_json::from_slice::<Value>(frame)
+        .ok()
+        .and_then(|line| line.get("id").cloned())
+        .filter(|id| id.is_string() || id.is_i64() || id.is_u64())
+        .unwrap_or(Value::Null)
+}
+
+/// The `host.start` request, with the id used in its reply or denial.
+fn decode_host_start(frame: &[u8]) -> std::result::Result<(Value, HostStartParams), HostDeny> {
+    let mut request: Value =
+        serde_json::from_slice(frame).map_err(|_| HostDeny::ProtocolMismatch)?;
+
+    if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+        || request.get("method").and_then(Value::as_str) != Some(method::HOST_START)
+    {
+        return Err(HostDeny::ProtocolMismatch);
+    }
+    let request = request.as_object_mut().ok_or(HostDeny::ProtocolMismatch)?;
+    let id = request
+        .remove("id")
+        .filter(|value| value.is_string() || value.is_i64() || value.is_u64())
+        .ok_or(HostDeny::ProtocolMismatch)?;
+    let params = request.remove("params").ok_or(HostDeny::ProtocolMismatch)?;
+    let params: HostStartParams =
+        serde_json::from_value(params).map_err(|_| HostDeny::ProtocolMismatch)?;
+
+    Ok((id, params))
+}
+
+/// Writes one named `denied` reply within `limit` and closes the connection.
+///
+/// A denial that cannot be written in time fails closed with `DenialTimeout`;
+/// no denial is claimed to be on the wire in that case.
+async fn refuse<T>(
+    host: &mut (impl AsyncWrite + Unpin),
+    id: &Value,
+    host_deny: HostDeny,
+    limit: Duration,
+) -> Result<T> {
+    let frame = bounded_frame(&json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": DENIED_CODE,
+            "message": "denied",
+            "data": {"reason": host_deny.reason()}
+        }
+    }))?;
+    let written = timeout(limit, host.write_all(&frame)).await;
+
+    match written {
+        Ok(result) => io_at("answering host denial", result)?,
+        Err(_) => return Err(SupervisorError::DenialTimeout),
+    }
+
+    Err(SupervisorError::HostDenied(host_deny))
+}
+
+/// Denies the host when a frame is malformed or its body is over the cap.
+async fn deny_body_cap(host: &mut (impl AsyncWrite + Unpin), frame: &[u8]) -> Result<()> {
+    match body_within_cap(frame) {
+        BodyCap::Fits => Ok(()),
+        BodyCap::BadFrame => {
+            refuse(host, &Value::Null, HostDeny::BadFrame, DENY_WRITE_TIMEOUT).await
+        }
+        BodyCap::TooLarge => {
+            refuse(
+                host,
+                &Value::Null,
+                HostDeny::OversizeBody,
+                DENY_WRITE_TIMEOUT,
+            )
+            .await
+        }
+    }
+}
+
+/// Forwards one host frame to the stall and copies its reply back, with every
+/// forwarding step bounded by `limit` and every denial by `DENY_WRITE_TIMEOUT`.
+async fn broker_host_frame(
+    host: &mut BufReader<UnixStream>,
+    stall: &mut BufReader<UnixStream>,
+    limit: Duration,
+) -> Result<()> {
+    let read = timeout(limit, read_line_bounded(host)).await;
+    let frame = match read {
+        Ok(Ok(frame)) => frame,
+        Ok(Err(host_deny)) => {
+            return refuse(host, &Value::Null, host_deny, DENY_WRITE_TIMEOUT).await;
+        }
+        Err(_) => {
+            return refuse(
+                host,
+                &Value::Null,
+                HostDeny::StalledReply,
+                DENY_WRITE_TIMEOUT,
+            )
+            .await;
+        }
+    };
+    deny_body_cap(host, &frame).await?;
+
+    // A partial write leaves a half frame on the stall stream. That
+    // connection is dead from here: no further frame can be brokerable on it,
+    // so barn denies this host instead of trying to resynchronize.
+    let sent = timeout(limit, stall.write_all(&frame)).await;
+
+    if !matches!(sent, Ok(Ok(()))) {
+        return refuse(host, &Value::Null, HostDeny::PeerLoss, DENY_WRITE_TIMEOUT).await;
+    }
+
+    let reply = timeout(limit, read_line_bounded(stall)).await;
+    let line = match reply {
+        Ok(Ok(line)) => line,
+        Ok(Err(host_deny)) => {
+            return refuse(host, &Value::Null, host_deny, DENY_WRITE_TIMEOUT).await;
+        }
+        Err(_) => {
+            return refuse(
+                host,
+                &Value::Null,
+                HostDeny::StalledReply,
+                DENY_WRITE_TIMEOUT,
+            )
+            .await;
+        }
+    };
+    deny_body_cap(host, &line).await?;
+
+    answer_host(host, &line, limit).await
+}
+
+/// An `AsyncWrite` that counts bytes accepted, so a timed-out reply can
+/// tell whether any of it reached the wire.
+struct CountingWriter<'a, W> {
+    inner: &'a mut W,
+    written: usize,
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for CountingWriter<'_, W> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = &mut *self;
+        match Pin::new(&mut *this.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(count)) => {
+                this.written = this.written.saturating_add(count);
+
+                Poll::Ready(Ok(count))
+            }
+            pending => pending,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Copies one reply line to the host under a deadline, then reports the
+/// outcome. A write that emitted any bytes closes without a deny: appending a
+/// denial to a half frame would corrupt it. Only a write that emitted nothing
+/// gets the named `StalledReply` deny.
+async fn answer_host(
+    host: &mut (impl AsyncWrite + Unpin),
+    line: &[u8],
+    limit: Duration,
+) -> Result<()> {
+    let (sent, written) = {
+        let mut counting = CountingWriter {
+            inner: host,
+            written: 0,
+        };
+        let sent = timeout(limit, counting.write_all(line)).await;
+
+        (sent, counting.written)
+    };
+
+    match sent {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(SupervisorError::Io {
+            operation: "answering host frame",
+            source: error,
+        }),
+        Err(_) if written == 0 => {
+            refuse(
+                host,
+                &Value::Null,
+                HostDeny::StalledReply,
+                DENY_WRITE_TIMEOUT,
+            )
+            .await
+        }
+        Err(_) => Err(SupervisorError::HostDenied(HostDeny::StalledReply)),
+    }
+}
+
+/// Why a frame's inline body does not fit, when it does not.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BodyCap {
+    /// The decoded body fits the cap.
+    Fits,
+    /// The line is malformed, or its body cannot be measured.
+    BadFrame,
+    /// The decoded body is longer than the cap.
+    TooLarge,
+}
+
+/// Whether a frame's inline body fits the cap after decoding.
+///
+/// A body barn cannot measure is denied: malformed JSON and a present `body`
+/// that is not a string fail closed, while a frame with no body stays valid.
+fn body_within_cap(frame: &[u8]) -> BodyCap {
+    let Ok(value) = serde_json::from_slice::<Value>(frame) else {
+        return BodyCap::BadFrame;
+    };
+    let Some(body) = value.get("body") else {
+        return BodyCap::Fits;
+    };
+    let Some(body) = body.as_str() else {
+        return BodyCap::BadFrame;
+    };
+    let decoded = if value.get("body_encoding").and_then(Value::as_str) == Some("base64") {
+        base64_decoded_len(body)
+    } else {
+        body.len()
+    };
+
+    if decoded > DEFAULT_MAX_BODY_BYTES {
+        BodyCap::TooLarge
+    } else {
+        BodyCap::Fits
+    }
+}
+
+/// The decoded length of a base64 string, counted without a decoder.
+fn base64_decoded_len(body: &str) -> usize {
+    let padding = body.bytes().rev().take_while(|byte| *byte == b'=').count();
+    let symbols = body.len().saturating_sub(padding);
+    let tail = match symbols % 4 {
+        2 => 1,
+        3 => 2,
+        _ => 0,
+    };
+
+    symbols
+        .saturating_div(4)
+        .saturating_mul(3)
+        .saturating_add(tail)
+}
+
 /// Writes the `stall.start` reply, or the oversize error when it cannot fit.
 async fn send_reply<W>(
     out: &mut W,
@@ -1036,6 +1620,14 @@ fn prepare(state_dir: &Path, spec: &StallSpec) -> Result<Prepared> {
     chmod(&socket, PRIVATE_FILE)?;
     let uid = io_at("reading stall socket owner", fs::metadata(&socket))?.uid();
 
+    let host_socket = run_dir.path(HOST_SOCKET_FILE);
+    let host_listener = io_at("binding host socket", StdUnixListener::bind(&host_socket))?;
+    io_at(
+        "setting host socket nonblocking",
+        host_listener.set_nonblocking(true),
+    )?;
+    chmod(&host_socket, PRIVATE_FILE)?;
+
     let caps = caps
         .allow_unix_socket(socket, UnixSocketMode::Connect)
         .map_err(SupervisorError::SocketPolicy)?;
@@ -1051,13 +1643,16 @@ fn prepare(state_dir: &Path, spec: &StallSpec) -> Result<Prepared> {
 
     write_policy(&run_dir.path(POLICY_FILE), &state_policy)?;
     let token = new_token()?;
+    let host_token = new_token()?;
 
     Ok(Prepared {
         listener,
+        host_listener,
         run_dir,
         state,
         uid,
         token,
+        host_token,
         program,
     })
 }
@@ -1242,7 +1837,7 @@ fn check_locked_dir(
 
 fn remove_run_dir(path: &Path) -> io::Result<()> {
     // Only remove the files barn owns; never traverse the stall's state.
-    for name in [SOCKET_FILE, POLICY_FILE] {
+    for name in [SOCKET_FILE, POLICY_FILE, HOST_SOCKET_FILE] {
         match fs::remove_file(path.join(name)) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             result => result?,
@@ -1306,6 +1901,8 @@ fn io_at<T>(operation: &'static str, result: io::Result<T>) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::FileTypeExt as _;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
 
     use super::*;
 
@@ -1314,6 +1911,19 @@ mod tests {
         r#""params":{"protocol":1,"token":"secret"}}"#,
     )
     .as_bytes();
+
+    #[test]
+    fn host_endpoint_debug_names_the_struct_and_redacts_the_token() {
+        let endpoint = HostEndpoint {
+            socket_path: PathBuf::from("/tmp/barn-host.sock"),
+            token: "a1b2c3d4e5f60718293a4b5c6d7e8f90".to_owned(),
+        };
+
+        assert_eq!(
+            format!("{endpoint:?}"),
+            r#"HostEndpoint { socket_path: "/tmp/barn-host.sock", token: "[redacted]" }"#
+        );
+    }
 
     #[test]
     fn peer_credentials_require_both_a_matching_pid_and_uid() {
@@ -1336,6 +1946,123 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn every_host_deny_carries_the_reason_fixed_on_the_protocol_page() {
+        for (host_deny, reason) in [
+            (HostDeny::WrongPeerPid, deny::WRONG_PEER_PID),
+            (HostDeny::WrongPeerUid, deny::WRONG_PEER_UID),
+            (HostDeny::TokenExpiredOrSpent, deny::TOKEN_EXPIRED_OR_SPENT),
+            (HostDeny::TokenMismatch, deny::TOKEN_MISMATCH),
+            (HostDeny::ProtocolMismatch, deny::PROTOCOL_MISMATCH),
+            (HostDeny::OversizeFrame, deny::OVERSIZE_FRAME),
+            (HostDeny::BadFrame, deny::BAD_FRAME),
+            (HostDeny::OversizeBody, deny::OVERSIZE_FRAME),
+            (HostDeny::ClosedSocket, deny::CLOSED_SOCKET),
+            (HostDeny::StalledReply, deny::CLOSED_SOCKET),
+            (HostDeny::PeerLoss, deny::CLOSED_SOCKET),
+        ] {
+            assert_eq!(host_deny.reason(), reason);
+        }
+    }
+
+    // WrongPeerUid cannot be produced from an end-to-end test: peer
+    // credentials come from the OS socket, and every host the harness can
+    // connect from this process has the socket owner's uid. Only a peer
+    // running as a different uid (a second user or a setuid helper) would
+    // differ, which the CI fixture cannot create. This unit test drives
+    // `host_peer` with an explicit uid and covers the reason and its reply.
+    #[test]
+    fn a_host_peer_needs_both_the_expected_pid_and_owner_uid() {
+        assert_eq!(host_peer(Some(17), 42, 17, 42), Ok(()));
+        assert_eq!(host_peer(None, 42, 17, 42), Err(HostDeny::WrongPeerPid));
+        assert_eq!(host_peer(Some(18), 42, 17, 42), Err(HostDeny::WrongPeerPid));
+        assert_eq!(host_peer(Some(17), 43, 17, 42), Err(HostDeny::WrongPeerUid));
+    }
+
+    #[test]
+    fn a_host_token_expires_at_its_deadline_and_spends_only_once() {
+        let start = Instant::now();
+        let deadline = start.checked_add(TOKEN_TTL).expect("deadline fits");
+        let before = deadline
+            .checked_sub(Duration::from_nanos(1))
+            .expect("instant before fits");
+        let after = deadline
+            .checked_add(Duration::from_secs(1))
+            .expect("instant after fits");
+        let issued = || Token {
+            secret: "secret".to_owned(),
+            expires_at: deadline,
+        };
+
+        let mut saved = Some(issued());
+        assert_eq!(host_token_deny(&mut saved, "secret", before), None);
+        assert_eq!(
+            host_token_deny(&mut saved, "secret", before),
+            Some(HostDeny::TokenExpiredOrSpent)
+        );
+
+        for now in [deadline, after] {
+            let mut saved = Some(issued());
+
+            assert_eq!(
+                host_token_deny(&mut saved, "secret", now),
+                Some(HostDeny::TokenExpiredOrSpent)
+            );
+            assert!(saved.is_none());
+        }
+
+        let mut saved = Some(issued());
+        assert_eq!(
+            host_token_deny(&mut saved, "other", before),
+            Some(HostDeny::TokenMismatch)
+        );
+        assert!(saved.is_some());
+    }
+
+    #[test]
+    fn a_host_body_fits_the_cap_only_after_decoding() {
+        const PREFIX: &[u8] = br#"{"body":""#;
+        let mut exact = PREFIX.to_vec();
+        exact.resize(PREFIX.len() + DEFAULT_MAX_BODY_BYTES, b'x');
+        exact.extend_from_slice(b"\"}");
+        assert_eq!(body_within_cap(&exact), BodyCap::Fits);
+
+        exact.truncate(PREFIX.len() + DEFAULT_MAX_BODY_BYTES);
+        exact.push(b'x');
+        exact.extend_from_slice(b"\"}");
+        assert_eq!(body_within_cap(&exact), BodyCap::TooLarge);
+        assert_eq!(body_within_cap(b"not JSON"), BodyCap::BadFrame);
+        assert_eq!(base64_decoded_len("aGk="), 2);
+        assert_eq!(base64_decoded_len("aGk"), 2);
+    }
+
+    #[test]
+    fn a_base64_tail_of_two_symbols_decodes_to_one_byte() {
+        assert_eq!(base64_decoded_len("ag=="), 1);
+    }
+
+    #[test]
+    fn a_base64_tail_of_three_symbols_decodes_to_two_bytes() {
+        assert_eq!(base64_decoded_len("aGk="), 2);
+    }
+
+    #[test]
+    fn a_body_that_cannot_be_measured_is_denied() {
+        for frame in [
+            br#"{"body":42}"#.as_slice(),
+            br#"{"body":null}"#.as_slice(),
+            br#"{"body":{}}"#.as_slice(),
+            br#"{"body":["x"]}"#.as_slice(),
+            b"not JSON".as_slice(),
+        ] {
+            assert_eq!(body_within_cap(frame), BodyCap::BadFrame);
+        }
+        assert_eq!(
+            body_within_cap(br#"{"jsonrpc":"2.0","method":"x"}"#),
+            BodyCap::Fits
+        );
+    }
+
     /// The accept loop calls `check` until the token deadline, so a flood of
     /// wrong peers cannot keep the child's own start from being accepted.
     #[test]
@@ -1355,6 +2082,822 @@ mod tests {
             secret: "secret".to_owned(),
             expires_at,
         }
+    }
+
+    /// A complete `host.start` line for the daemon barn expects.
+    fn host_start(pid: u32, token: &str) -> Vec<u8> {
+        let mut line = serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": method::HOST_START,
+            "params": {"protocol": PROTOCOL_VERSION, "token": token, "pid": pid}
+        }))
+        .expect("host.start JSON");
+        line.push(b'\n');
+
+        line
+    }
+
+    /// A `host.start` line with the given id and fixed, valid parameters.
+    fn host_start_with_id(id: &Value) -> String {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method::HOST_START,
+            "params": {"protocol": PROTOCOL_VERSION, "token": "secret", "pid": 21}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn request_id_keeps_string_i64_and_u64_ids_and_nulls_a_bool() {
+        for (id, expected) in [
+            (json!("host-7"), json!("host-7")),
+            (json!(-42_i64), json!(-42)),
+            (json!(u64::MAX), json!(u64::MAX)),
+            (json!(true), Value::Null),
+        ] {
+            let frame = host_start_with_id(&id);
+
+            assert_eq!(request_id(frame.as_bytes()), expected, "{frame}");
+        }
+    }
+
+    #[test]
+    fn host_start_denies_a_wrong_version_or_method_and_accepts_both_right() {
+        for (version, named_method, denied) in [
+            (json!("1.0"), method::HOST_START.to_owned(), true),
+            (json!("2.0"), "other.method".to_owned(), true),
+            (json!("2.0"), method::HOST_START.to_owned(), false),
+        ] {
+            let frame = json!({
+                "jsonrpc": version,
+                "id": 21,
+                "method": named_method,
+                "params": {"protocol": PROTOCOL_VERSION, "token": "secret", "pid": 21}
+            })
+            .to_string();
+            let decoded = decode_host_start(frame.as_bytes());
+
+            if denied {
+                assert_eq!(decoded.err(), Some(HostDeny::ProtocolMismatch), "{frame}");
+            } else {
+                let (id, params) = decoded.expect("a valid host.start");
+                assert_eq!(id, json!(21), "{frame}");
+                assert_eq!(
+                    params,
+                    HostStartParams {
+                        protocol: PROTOCOL_VERSION,
+                        token: "secret".to_owned(),
+                        pid: 21,
+                    },
+                    "{frame}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn host_start_decodes_every_id_kind_and_refuses_a_bool_id() {
+        for (id, expected) in [
+            (json!("host-7"), Some(json!("host-7"))),
+            (json!(-42_i64), Some(json!(-42))),
+            (json!(u64::MAX), Some(json!(u64::MAX))),
+            (json!(true), None),
+        ] {
+            let frame = host_start_with_id(&id);
+            let decoded = decode_host_start(frame.as_bytes());
+
+            match expected {
+                Some(wanted) => {
+                    let (got, params) = decoded.expect("a decodable host.start");
+                    assert_eq!(got, wanted, "{frame}");
+                    assert_eq!(
+                        params,
+                        HostStartParams {
+                            protocol: PROTOCOL_VERSION,
+                            token: "secret".to_owned(),
+                            pid: 21,
+                        },
+                        "{frame}"
+                    );
+                }
+                None => assert_eq!(decoded.err(), Some(HostDeny::ProtocolMismatch), "{frame}"),
+            }
+        }
+    }
+
+    /// A host transport bound to `root/host.sock`, expecting this process.
+    fn test_host_transport(root: &Path, token: Option<Token>) -> HostTransport {
+        let socket = root.join(HOST_SOCKET_FILE);
+        let std_listener = StdUnixListener::bind(&socket).expect("host socket");
+        std_listener
+            .set_nonblocking(true)
+            .expect("nonblocking host socket");
+        let owner = fs::metadata(&socket).expect("socket owner").uid();
+        let listener = UnixListener::from_std(std_listener).expect("host listener");
+
+        HostTransport {
+            listener,
+            token,
+            daemon_pid: Some(std::process::id()),
+            uid: owner,
+        }
+    }
+
+    /// The exact `denied` reply, with the id the request carried.
+    fn denied(id: &Value, reason: &str) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": DENIED_CODE,
+                "message": "denied",
+                "data": {"reason": reason}
+            }
+        })
+    }
+
+    /// The one deny line a host reads before barn closes its connection.
+    async fn read_deny(peer: &mut UnixStream) -> Value {
+        let mut reply = Vec::new();
+        timeout(Duration::from_millis(500), peer.read_to_end(&mut reply))
+            .await
+            .expect("deny arrives")
+            .expect("read deny");
+        assert_eq!(reply.last(), Some(&b'\n'));
+        let line = reply.strip_suffix(b"\n").expect("newline");
+        assert!(!line.contains(&b'\n'), "one line only");
+
+        serde_json::from_slice(line).expect("deny JSON")
+    }
+
+    #[tokio::test]
+    async fn a_spent_host_token_still_writes_the_named_deny_on_the_wire() {
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("the past deadline fits");
+
+        for token in [Some(issued(past)), None] {
+            let fixture = PrepareFixture::new();
+            let socket = fixture.0.join(HOST_SOCKET_FILE);
+            let mut transport = test_host_transport(&fixture.0, token);
+            let daemon = std::process::id();
+            let mut peer = UnixStream::connect(&socket).await.expect("host connects");
+            peer.write_all(&host_start(daemon, "secret"))
+                .await
+                .expect("host.start");
+
+            let refused = transport.accept_with_deadline(daemon, "fixture").await;
+
+            assert!(matches!(
+                refused,
+                Err(SupervisorError::HostDenied(HostDeny::TokenExpiredOrSpent))
+            ));
+            assert!(transport.token.is_none());
+            assert_eq!(
+                read_deny(&mut peer).await,
+                denied(&json!(21), deny::TOKEN_EXPIRED_OR_SPENT)
+            );
+        }
+    }
+
+    /// Drives the real host socket through `host.start` and one broker step
+    /// against a stall peer that stays quiet, returning the broker outcome and
+    /// the one deny line the host reads after the accepted reply.
+    async fn host_session(frame: &[u8]) -> (Result<()>, Value) {
+        let fixture = PrepareFixture::new();
+        let socket = fixture.0.join(HOST_SOCKET_FILE);
+        let deadline = Instant::now()
+            .checked_add(TOKEN_TTL)
+            .expect("the token deadline fits");
+        let mut transport = test_host_transport(&fixture.0, Some(issued(deadline)));
+        let daemon = std::process::id();
+        let mut peer = BufReader::new(UnixStream::connect(&socket).await.expect("host connects"));
+        peer.write_all(&host_start(daemon, "secret"))
+            .await
+            .expect("host.start");
+
+        let mut host = transport
+            .accept_with_deadline(daemon, "fixture")
+            .await
+            .expect("host.start accepted");
+        let mut accepted = Vec::new();
+        timeout(
+            Duration::from_millis(500),
+            peer.read_until(b'\n', &mut accepted),
+        )
+        .await
+        .expect("host.start reply")
+        .expect("read reply");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&accepted).expect("reply JSON")["result"],
+            json!({"stall": "fixture"})
+        );
+
+        let (stall_barn, _stall_peer) = UnixStream::pair().expect("stall pair");
+        let mut stall = BufReader::new(stall_barn);
+        let writing = async { peer.write_all(frame).await.expect("host frame") };
+        let (result, ()) = tokio::join!(
+            broker_host_frame(&mut host, &mut stall, Duration::from_secs(2)),
+            writing
+        );
+        drop(host);
+
+        (result, read_deny(peer.get_mut()).await)
+    }
+
+    #[tokio::test]
+    async fn an_oversize_frame_is_denied_end_to_end_on_the_host_endpoint() {
+        let frame = vec![b'x'; MAX_LINE_BYTES];
+
+        let (result, deny) = host_session(&frame).await;
+
+        assert!(matches!(
+            result,
+            Err(SupervisorError::HostDenied(HostDeny::OversizeFrame))
+        ));
+        assert_eq!(deny, denied(&Value::Null, deny::OVERSIZE_FRAME));
+    }
+
+    #[tokio::test]
+    async fn an_oversize_body_is_denied_end_to_end_on_the_host_endpoint() {
+        let prefix = br#"{"body":""#;
+        let mut frame = prefix.to_vec();
+        frame.resize(prefix.len() + DEFAULT_MAX_BODY_BYTES + 1, b'x');
+        frame.extend_from_slice(b"\"}\n");
+
+        let (result, deny) = host_session(&frame).await;
+
+        assert!(matches!(
+            result,
+            Err(SupervisorError::HostDenied(HostDeny::OversizeBody))
+        ));
+        assert_eq!(deny, denied(&Value::Null, deny::OVERSIZE_FRAME));
+    }
+
+    #[tokio::test]
+    async fn a_slow_host_is_denied_on_the_wire_when_the_exchange_deadline_passes() {
+        let fixture = PrepareFixture::new();
+        let soon = Instant::now()
+            .checked_add(Duration::from_millis(200))
+            .expect("the near deadline fits");
+        let socket = fixture.0.join(HOST_SOCKET_FILE);
+        let mut transport = test_host_transport(&fixture.0, Some(issued(soon)));
+        let daemon = std::process::id();
+        let mut peer = UnixStream::connect(&socket).await.expect("host connects");
+
+        // The peer connects but sends no `host.start`; the deadline ends the
+        // exchange and the named deny still reaches the wire.
+        let accepted = timeout(
+            Duration::from_secs(1),
+            transport.accept_with_deadline(daemon, "fixture"),
+        )
+        .await;
+
+        assert!(matches!(
+            accepted,
+            Ok(Err(SupervisorError::HostDenied(HostDeny::StalledReply)))
+        ));
+        assert!(transport.token.is_none());
+        assert_eq!(
+            read_deny(&mut peer).await,
+            denied(&Value::Null, deny::CLOSED_SOCKET)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_spent_host_that_sends_no_line_is_denied_without_hanging() {
+        let fixture = PrepareFixture::new();
+        let socket = fixture.0.join(HOST_SOCKET_FILE);
+        let mut transport = test_host_transport(&fixture.0, None);
+        let daemon = std::process::id();
+        let mut peer = UnixStream::connect(&socket).await.expect("host connects");
+
+        let accepted = timeout(
+            Duration::from_secs(5),
+            transport.accept_with_deadline(daemon, "fixture"),
+        )
+        .await;
+
+        assert!(matches!(
+            accepted,
+            Ok(Err(SupervisorError::HostDenied(
+                HostDeny::TokenExpiredOrSpent
+            )))
+        ));
+        assert_eq!(
+            read_deny(&mut peer).await,
+            denied(&Value::Null, deny::TOKEN_EXPIRED_OR_SPENT)
+        );
+    }
+
+    /// A sink that stalls the reply frame but accepts the denial frame.
+    ///
+    /// A timeout re-polls the stalled write when its timer fires, so stalling
+    /// only the first poll lets the reply through and hides the denial. The
+    /// first frame seen is the one that stalls; a different frame is accepted.
+    #[derive(Default)]
+    struct StalledWriter {
+        written: Vec<u8>,
+        stalled: Vec<u8>,
+    }
+
+    impl AsyncWrite for StalledWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.stalled.is_empty() {
+                self.stalled.extend_from_slice(buf);
+            }
+            if buf == self.stalled {
+                return Poll::Pending;
+            }
+            self.written.extend_from_slice(buf);
+
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A sink that takes one byte of a reply, then stalls forever.
+    #[derive(Default)]
+    struct PartialWriter {
+        written: Vec<u8>,
+    }
+
+    impl AsyncWrite for PartialWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.written.is_empty() && !buf.is_empty() {
+                let first = buf.get(..1).unwrap_or(buf);
+                self.written.extend_from_slice(first);
+
+                return Poll::Ready(Ok(first.len()));
+            }
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_partial_reply_is_closed_without_appending_a_deny() {
+        let reply = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n";
+        let mut writer = PartialWriter::default();
+
+        let result = answer_host(&mut writer, reply, Duration::from_millis(50)).await;
+
+        assert!(matches!(
+            result,
+            Err(SupervisorError::HostDenied(HostDeny::StalledReply))
+        ));
+        assert_eq!(writer.written, reply.get(..1).expect("one byte"));
+    }
+
+    /// A sink that accepts a few bytes per poll, so a large reply needs more
+    /// than one write to finish.
+    #[derive(Default)]
+    struct ChunkedWriter {
+        written: Vec<u8>,
+    }
+
+    impl AsyncWrite for ChunkedWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let count = buf.len().min(1024);
+            self.written.extend_from_slice(&buf[..count]);
+
+            Poll::Ready(Ok(count))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_large_reply_is_written_in_full_before_the_deadline() {
+        let reply = vec![b'x'; 64 * 1024];
+        let mut writer = ChunkedWriter::default();
+
+        let answered = answer_host(&mut writer, &reply, Duration::from_secs(2)).await;
+
+        assert!(matches!(answered, Ok(())));
+        assert_eq!(writer.written, reply);
+    }
+
+    /// A sink that never accepts a byte, so only a deadline can end a write.
+    struct NeverWriter;
+
+    impl AsyncWrite for NeverWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_denial_to_a_host_that_never_takes_bytes_fails_closed() {
+        let mut writer = NeverWriter;
+        let refused: Result<()> = refuse(
+            &mut writer,
+            &Value::Null,
+            HostDeny::PeerLoss,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(matches!(refused, Err(SupervisorError::DenialTimeout)));
+    }
+
+    /// An inner sink that records whether the adapter forwarded flush and
+    /// shutdown, and can return a chosen error from either on demand.
+    #[derive(Default)]
+    struct RecordingWriter {
+        flushed: bool,
+        shut_down: bool,
+        flush_error: Option<io::ErrorKind>,
+        shutdown_error: Option<io::ErrorKind>,
+    }
+
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushed = true;
+
+            Poll::Ready(
+                self.flush_error
+                    .take()
+                    .map_or(Ok(()), |kind| Err(io::Error::from(kind))),
+            )
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.shut_down = true;
+
+            Poll::Ready(
+                self.shutdown_error
+                    .take()
+                    .map_or(Ok(()), |kind| Err(io::Error::from(kind))),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn counting_writer_forwards_flush_to_the_inner_writer() {
+        let mut inner = RecordingWriter::default();
+
+        let flushed = {
+            let mut counting = CountingWriter {
+                inner: &mut inner,
+                written: 0,
+            };
+
+            timeout(Duration::from_secs(1), counting.flush()).await
+        };
+
+        assert!(matches!(flushed, Ok(Ok(()))));
+        assert!(inner.flushed);
+        assert!(!inner.shut_down);
+    }
+
+    #[tokio::test]
+    async fn counting_writer_forwards_shutdown_to_the_inner_writer() {
+        let mut inner = RecordingWriter::default();
+
+        let shut_down = {
+            let mut counting = CountingWriter {
+                inner: &mut inner,
+                written: 0,
+            };
+
+            timeout(Duration::from_secs(1), counting.shutdown()).await
+        };
+
+        assert!(matches!(shut_down, Ok(Ok(()))));
+        assert!(inner.shut_down);
+        assert!(!inner.flushed);
+    }
+
+    #[tokio::test]
+    async fn counting_writer_propagates_an_inner_flush_error() {
+        let mut inner = RecordingWriter {
+            flush_error: Some(io::ErrorKind::BrokenPipe),
+            ..RecordingWriter::default()
+        };
+
+        let failed = {
+            let mut counting = CountingWriter {
+                inner: &mut inner,
+                written: 0,
+            };
+
+            timeout(Duration::from_secs(1), counting.flush()).await
+        };
+
+        assert_eq!(
+            failed
+                .expect("flush within deadline")
+                .expect_err("inner flush error")
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        assert!(inner.flushed);
+    }
+
+    #[tokio::test]
+    async fn counting_writer_propagates_an_inner_shutdown_error() {
+        let mut inner = RecordingWriter {
+            shutdown_error: Some(io::ErrorKind::ConnectionReset),
+            ..RecordingWriter::default()
+        };
+
+        let failed = {
+            let mut counting = CountingWriter {
+                inner: &mut inner,
+                written: 0,
+            };
+
+            timeout(Duration::from_secs(1), counting.shutdown()).await
+        };
+
+        assert_eq!(
+            failed
+                .expect("shutdown within deadline")
+                .expect_err("inner shutdown error")
+                .kind(),
+            io::ErrorKind::ConnectionReset
+        );
+        assert!(inner.shut_down);
+    }
+
+    #[tokio::test]
+    async fn a_host_that_stops_taking_the_reply_gets_the_stalled_reply_deny() {
+        let reply = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}\n";
+        let mut writer = StalledWriter::default();
+
+        let stalled = answer_host(&mut writer, reply, Duration::from_millis(20)).await;
+
+        assert!(matches!(
+            stalled,
+            Err(SupervisorError::HostDenied(HostDeny::StalledReply))
+        ));
+        assert_eq!(writer.written.last(), Some(&b'\n'));
+        let line = writer.written.strip_suffix(b"\n").expect("one line");
+        assert_eq!(
+            serde_json::from_slice::<Value>(line).expect("deny JSON"),
+            denied(&Value::Null, deny::CLOSED_SOCKET)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_that_sends_no_frame_gets_a_stalled_reply_deny() {
+        let (host_barn, mut host_peer) = UnixStream::pair().expect("host pair");
+        let (stall_barn, _stall_peer) = UnixStream::pair().expect("stall pair");
+        let mut host = BufReader::new(host_barn);
+        let mut stall = BufReader::new(stall_barn);
+
+        let result = timeout(
+            Duration::from_secs(1),
+            broker_host_frame(&mut host, &mut stall, Duration::from_millis(50)),
+        )
+        .await;
+        drop(host);
+
+        assert!(matches!(
+            result,
+            Ok(Err(SupervisorError::HostDenied(HostDeny::StalledReply)))
+        ));
+        assert_eq!(
+            read_deny(&mut host_peer).await,
+            denied(&Value::Null, deny::CLOSED_SOCKET)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_host_frame_with_an_unmeasurable_body_is_denied() {
+        for frame in [b"{\"body\":42}\n".as_slice(), b"not JSON\n".as_slice()] {
+            let (host_barn, mut host_peer) = UnixStream::pair().expect("host pair");
+            let (stall_barn, _stall_peer) = UnixStream::pair().expect("stall pair");
+            let mut host = BufReader::new(host_barn);
+            let mut stall = BufReader::new(stall_barn);
+            host_peer.write_all(frame).await.expect("host frame");
+
+            let result = broker_host_frame(&mut host, &mut stall, Duration::from_millis(100)).await;
+            drop(host);
+
+            assert!(matches!(
+                result,
+                Err(SupervisorError::HostDenied(HostDeny::BadFrame))
+            ));
+            assert_eq!(
+                read_deny(&mut host_peer).await,
+                denied(&Value::Null, deny::BAD_FRAME)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_host_frame_with_an_oversize_body_is_denied() {
+        let (host_barn, mut host_peer) = UnixStream::pair().expect("host pair");
+        let (stall_barn, _stall_peer) = UnixStream::pair().expect("stall pair");
+        let mut host = BufReader::new(host_barn);
+        let mut stall = BufReader::new(stall_barn);
+        let prefix = br#"{"body":""#;
+        let mut frame = prefix.to_vec();
+        frame.resize(prefix.len() + DEFAULT_MAX_BODY_BYTES + 1, b'x');
+        frame.extend_from_slice(b"\"}\n");
+
+        let writing = async {
+            host_peer
+                .write_all(&frame)
+                .await
+                .expect("oversize host frame");
+        };
+        let (result, ()) = tokio::join!(
+            broker_host_frame(&mut host, &mut stall, Duration::from_secs(2)),
+            writing
+        );
+        drop(host);
+
+        assert!(matches!(
+            result,
+            Err(SupervisorError::HostDenied(HostDeny::OversizeBody))
+        ));
+        assert_eq!(
+            read_deny(&mut host_peer).await,
+            denied(&Value::Null, deny::OVERSIZE_FRAME)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dead_stall_peer_denies_the_host_with_peer_loss() {
+        let (host_barn, mut host_peer) = UnixStream::pair().expect("host pair");
+        let (stall_barn, stall_peer) = UnixStream::pair().expect("stall pair");
+        drop(stall_peer);
+        let mut host = BufReader::new(host_barn);
+        let mut stall = BufReader::new(stall_barn);
+
+        host_peer
+            .write_all(&host_start(1, "secret"))
+            .await
+            .expect("host frame");
+        let result = broker_host_frame(&mut host, &mut stall, Duration::from_millis(100)).await;
+        drop(host);
+
+        assert!(matches!(
+            result,
+            Err(SupervisorError::HostDenied(HostDeny::PeerLoss))
+        ));
+        assert_eq!(
+            read_deny(&mut host_peer).await,
+            denied(&Value::Null, deny::CLOSED_SOCKET)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partial_stall_write_denies_the_host_with_peer_loss() {
+        let (host_barn, mut host_peer) = UnixStream::pair().expect("host pair");
+        let (stall_barn, stall_peer) = UnixStream::pair().expect("stall pair");
+        let mut host = BufReader::new(host_barn);
+        let mut stall = BufReader::new(stall_barn);
+        // A valid request with a body far larger than a socket buffer: the
+        // timed write to the silent stall gets part way in.
+        let mut frame = br#"{"jsonrpc":"2.0","id":1,"method":"request","body":""#.to_vec();
+        frame.resize(frame.len() + (1 << 20), b'x');
+        frame.extend_from_slice(b"\"}\n");
+        let writing = async {
+            host_peer.write_all(&frame).await.expect("large host frame");
+        };
+
+        let (result, ()) = tokio::join!(
+            broker_host_frame(&mut host, &mut stall, Duration::from_millis(500)),
+            writing
+        );
+        drop(host);
+
+        assert!(matches!(
+            result,
+            Err(SupervisorError::HostDenied(HostDeny::PeerLoss))
+        ));
+        assert_eq!(
+            read_deny(&mut host_peer).await,
+            denied(&Value::Null, deny::CLOSED_SOCKET)
+        );
+        drop(stall_peer);
+    }
+
+    /// A `RunningStall` whose listeners and child are idle: `serve_host`
+    /// borrows `self` without reading it, so only the caller's two streams
+    /// take part in the broker step. Spawning the child makes callers a
+    /// process test.
+    fn idle_stall_for_brokering() -> RunningStall {
+        let fixture = PrepareFixture::new();
+        let deadline = Instant::now()
+            .checked_add(TOKEN_TTL)
+            .expect("the token deadline fits");
+        let child = Command::new("/usr/bin/true").spawn().expect("idle child");
+
+        RunningStall {
+            child,
+            pid: std::process::id(),
+            transport: test_transport(&fixture.0, Some(deadline)),
+            host: test_host_transport(&fixture.0, Some(issued(deadline))),
+            supervisor: Supervisor::new(fixture.0.clone(), PathBuf::from("/usr/bin/true")),
+            spec: PrepareFixture::spec(),
+            started: Instant::now(),
+            epoch: Instant::now(),
+            restart: RestartPolicy::default(),
+            health: HealthTracker::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_host_forwards_one_framed_request_and_returns_the_exact_reply() {
+        // This spawns an idle child, so it runs in CI only.
+        if std::env::var_os("CI").is_none() {
+            return;
+        }
+
+        let stall = idle_stall_for_brokering();
+        let (host_barn, mut host_peer) = UnixStream::pair().expect("host pair");
+        let (stall_barn, mut stall_peer) = UnixStream::pair().expect("stall pair");
+        let mut host = BufReader::new(host_barn);
+        let mut stall_stream = BufReader::new(stall_barn);
+        let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"request\"}\n";
+        let reply = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n";
+        let mut forwarded = Vec::new();
+
+        let exchange = async {
+            host_peer.write_all(request).await.expect("host frame");
+            BufReader::new(&mut stall_peer)
+                .read_until(b'\n', &mut forwarded)
+                .await
+                .expect("forwarded frame");
+            stall_peer.write_all(reply).await.expect("stall reply");
+        };
+        let (served, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(stall.serve_host(&mut host, &mut stall_stream), exchange)
+        })
+        .await
+        .expect("broker and stall finish within the deadline");
+
+        assert!(matches!(served, Ok(())));
+        assert_eq!(forwarded, request.to_vec());
+
+        let mut received = Vec::new();
+        timeout(
+            Duration::from_secs(1),
+            BufReader::new(&mut host_peer).read_until(b'\n', &mut received),
+        )
+        .await
+        .expect("host reply within the deadline")
+        .expect("read host reply");
+        assert_eq!(received, reply.to_vec());
     }
 
     /// A transport bound to `root/proto.sock`, with a token at `expiry`.

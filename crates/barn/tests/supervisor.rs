@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -12,10 +12,15 @@ use std::time::Duration;
 
 use barn::Grant;
 use barn::supervisor::{HealthCheck, HealthDecision, HealthTracker};
+use barn::supervisor::{HostDeny, HostEndpoint, RunningStall};
 use barn::supervisor::{RestartDecision, RestartOutcome, RestartPolicy};
 use barn::supervisor::{StallSpec, Supervisor, SupervisorError};
 use barn_stall::Job;
+use barn_stall::protocol::{deny, method};
 use serde_json::{Value, json};
+use std::ffi::OsStr;
+use tokio::io::BufReader as AsyncBufReader;
+use tokio::net::UnixStream as AsyncUnixStream;
 use tokio::time::timeout;
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -420,4 +425,326 @@ fn assert_health_request(client: &mut BufReader<UnixStream>, id: u64) {
         read_message(client),
         Some(json!({"jsonrpc":"2.0", "id":id, "method":"stall.health"}))
     );
+}
+
+const HOST_REQUEST: &str = concat!(
+    r#"{"type":"hook","id":1,"version":1,"hook":"PreToolUse","#,
+    r#""call":{"tool":"bash","name":"run","input":{"command":"git push"}}}"#,
+);
+const HOST_REPLY: &str = r#"{"type":"hook","id":1,"outcome":{"deny":{"reason":"push blocked"}}}"#;
+
+/// Starts a stall with a host endpoint for `daemon_pid` and authenticates it.
+async fn host_fixture(
+    scratch: &Scratch,
+    daemon_pid: u32,
+) -> Result<(RunningStall, HostEndpoint, AsyncBufReader<AsyncUnixStream>), Box<dyn std::error::Error>>
+{
+    let helper = scratch.dir.join("fixture-exec");
+    fs::write(&helper, "#!/bin/sh\nshift\nexec \"$@\"\n")?;
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o700))?;
+    let program = std::env::current_exe()?;
+    let spec = StallSpec {
+        name: "stall".to_owned(),
+        program: program.clone(),
+        args: ["--exact", "broker_stall_fixture"].map(Into::into).to_vec(),
+        grant: Grant {
+            executable: Some(program),
+            ..Grant::default()
+        },
+    };
+    let supervisor = Supervisor::new(scratch.state(), helper);
+    let mut stall = supervisor.start_for_host(spec, daemon_pid).await?;
+    let endpoint = stall.host_endpoint();
+    let connection = stall.accept().await?;
+
+    Ok((stall, endpoint, connection))
+}
+
+fn host_start(id: u64, token: &str, pid: u32, protocol: u32) -> String {
+    json!({
+        "jsonrpc": "2.0", "id": id, "method": method::HOST_START,
+        "params": {"protocol": protocol, "token": token, "pid": pid}
+    })
+    .to_string()
+}
+
+fn connect_host(endpoint: &HostEndpoint) -> io::Result<BufReader<UnixStream>> {
+    let stream = UnixStream::connect(&endpoint.socket_path)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+
+    Ok(BufReader::new(stream))
+}
+
+fn read_host_line(client: &mut BufReader<UnixStream>) -> serde_json::Result<Value> {
+    let mut line = String::new();
+    client.read_line(&mut line).map_err(serde_json::Error::io)?;
+
+    serde_json::from_str(&line)
+}
+
+fn assert_denied(reply: &Value, reason: &str) {
+    assert_eq!(
+        reply,
+        &json!({
+            "jsonrpc": "2.0", "id": 21,
+            "error": {"code": -32001, "message": "denied",
+                      "data": {"reason": reason}}
+        })
+    );
+}
+
+#[tokio::test]
+async fn the_host_endpoint_exposes_a_private_socket_and_a_fresh_token() {
+    if std::env::var_os("CI").is_none() {
+        return;
+    }
+    let scratch = Scratch::new().expect("scratch folder");
+    let (_stall, endpoint, _connection) = host_fixture(&scratch, std::process::id())
+        .await
+        .expect("host fixture");
+
+    assert_eq!(
+        endpoint.socket_path.file_name().and_then(OsStr::to_str),
+        Some("host.sock")
+    );
+    assert_eq!(endpoint.token.len(), 64);
+    let mode = fs::symlink_metadata(&endpoint.socket_path)
+        .expect("host socket")
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+#[tokio::test]
+async fn host_start_with_the_wrong_peer_pid_is_denied() {
+    if std::env::var_os("CI").is_none() {
+        return;
+    }
+    let scratch = Scratch::new().expect("scratch folder");
+    let wrong = std::process::id().wrapping_add(1);
+    let (mut stall, endpoint, _connection) =
+        host_fixture(&scratch, wrong).await.expect("host fixture");
+    let mut client = connect_host(&endpoint).expect("connect host.sock");
+    writeln!(
+        client.get_mut(),
+        "{}",
+        host_start(21, &endpoint.token, wrong, 1)
+    )
+    .expect("host.start");
+
+    assert!(matches!(
+        stall.accept_host().await,
+        Err(SupervisorError::HostDenied(HostDeny::WrongPeerPid))
+    ));
+    assert_denied(
+        &read_host_line(&mut client).expect("deny"),
+        deny::WRONG_PEER_PID,
+    );
+}
+
+#[tokio::test]
+async fn host_start_with_the_wrong_token_is_denied() {
+    if std::env::var_os("CI").is_none() {
+        return;
+    }
+    let scratch = Scratch::new().expect("scratch folder");
+    let (mut stall, endpoint, _connection) = host_fixture(&scratch, std::process::id())
+        .await
+        .expect("host fixture");
+    let mut client = connect_host(&endpoint).expect("connect host.sock");
+    let wrong = "0".repeat(64);
+    writeln!(
+        client.get_mut(),
+        "{}",
+        host_start(21, &wrong, std::process::id(), 1)
+    )
+    .expect("host.start");
+
+    assert!(matches!(
+        stall.accept_host().await,
+        Err(SupervisorError::HostDenied(HostDeny::TokenMismatch))
+    ));
+    assert_denied(
+        &read_host_line(&mut client).expect("deny"),
+        deny::TOKEN_MISMATCH,
+    );
+}
+
+#[tokio::test]
+async fn a_spent_host_token_is_denied_without_a_retry() {
+    if std::env::var_os("CI").is_none() {
+        return;
+    }
+    let scratch = Scratch::new().expect("scratch folder");
+    let pid = std::process::id();
+    let (mut stall, endpoint, _connection) =
+        host_fixture(&scratch, pid).await.expect("host fixture");
+    let mut client = connect_host(&endpoint).expect("connect host.sock");
+    writeln!(
+        client.get_mut(),
+        "{}",
+        host_start(21, &endpoint.token, pid, 1)
+    )
+    .expect("first host.start");
+    let server = stall
+        .accept_host()
+        .await
+        .expect("first host.start accepted");
+
+    assert_eq!(
+        read_host_line(&mut client).expect("reply")["result"],
+        json!({"stall": "stall"})
+    );
+    drop(server);
+
+    let mut again = connect_host(&endpoint).expect("reconnect host.sock");
+    writeln!(
+        again.get_mut(),
+        "{}",
+        host_start(22, &endpoint.token, pid, 1)
+    )
+    .expect("second host.start");
+
+    assert!(matches!(
+        stall.accept_host().await,
+        Err(SupervisorError::HostDenied(HostDeny::TokenExpiredOrSpent))
+    ));
+    assert_eq!(
+        read_host_line(&mut again).expect("deny")["error"]["data"]["reason"],
+        deny::TOKEN_EXPIRED_OR_SPENT
+    );
+}
+
+#[tokio::test]
+async fn host_start_with_the_wrong_version_is_denied() {
+    if std::env::var_os("CI").is_none() {
+        return;
+    }
+    let scratch = Scratch::new().expect("scratch folder");
+    let pid = std::process::id();
+    let (mut stall, endpoint, _connection) =
+        host_fixture(&scratch, pid).await.expect("host fixture");
+    let mut client = connect_host(&endpoint).expect("connect host.sock");
+    writeln!(
+        client.get_mut(),
+        "{}",
+        host_start(21, &endpoint.token, pid, 2)
+    )
+    .expect("host.start");
+
+    assert!(matches!(
+        stall.accept_host().await,
+        Err(SupervisorError::HostDenied(HostDeny::ProtocolMismatch))
+    ));
+    assert_denied(
+        &read_host_line(&mut client).expect("deny"),
+        deny::PROTOCOL_MISMATCH,
+    );
+}
+
+#[tokio::test]
+async fn a_correct_host_start_returns_the_stall_name() {
+    if std::env::var_os("CI").is_none() {
+        return;
+    }
+    let scratch = Scratch::new().expect("scratch folder");
+    let pid = std::process::id();
+    let (mut stall, endpoint, _connection) =
+        host_fixture(&scratch, pid).await.expect("host fixture");
+    let mut client = connect_host(&endpoint).expect("connect host.sock");
+    writeln!(
+        client.get_mut(),
+        "{}",
+        host_start(21, &endpoint.token, pid, 1)
+    )
+    .expect("host.start");
+
+    let _server = stall.accept_host().await.expect("host.start accepted");
+    assert_eq!(
+        read_host_line(&mut client).expect("reply"),
+        json!({"jsonrpc": "2.0", "id": 21, "result": {"stall": "stall"}})
+    );
+}
+
+#[tokio::test]
+async fn a_framed_request_is_forwarded_and_its_exact_reply_returned() {
+    if std::env::var_os("CI").is_none() {
+        return;
+    }
+    let scratch = Scratch::new().expect("scratch folder");
+    let pid = std::process::id();
+    let (mut stall, endpoint, mut connection) =
+        host_fixture(&scratch, pid).await.expect("host fixture");
+    let mut client = connect_host(&endpoint).expect("connect host.sock");
+    writeln!(
+        client.get_mut(),
+        "{}",
+        host_start(21, &endpoint.token, pid, 1)
+    )
+    .expect("host.start");
+    let mut server = stall.accept_host().await.expect("host.start accepted");
+    assert_eq!(
+        read_host_line(&mut client).expect("reply")["result"],
+        json!({"stall":"stall"})
+    );
+
+    writeln!(client.get_mut(), "{HOST_REQUEST}").expect("framed request");
+    stall
+        .serve_host(&mut server, &mut connection)
+        .await
+        .expect("broker the frame");
+
+    let read = tokio::task::spawn_blocking(move || {
+        let mut reply = String::new();
+        client.read_line(&mut reply).expect("framed reply");
+        reply
+    });
+    let reply = timeout(Duration::from_secs(2), read)
+        .await
+        .expect("framed reply within the deadline")
+        .expect("framed reply task");
+    assert_eq!(reply, format!("{HOST_REPLY}\n"));
+}
+
+#[tokio::test]
+async fn a_host_that_closes_before_start_is_denied() {
+    if std::env::var_os("CI").is_none() {
+        return;
+    }
+    let scratch = Scratch::new().expect("scratch folder");
+    let (mut stall, endpoint, _connection) = host_fixture(&scratch, std::process::id())
+        .await
+        .expect("host fixture");
+    let mut client = connect_host(&endpoint).expect("connect host.sock");
+    client
+        .get_mut()
+        .shutdown(std::net::Shutdown::Write)
+        .expect("half-close the host socket");
+
+    assert!(matches!(
+        stall.accept_host().await,
+        Err(SupervisorError::HostDenied(HostDeny::ClosedSocket))
+    ));
+    assert_eq!(
+        read_host_line(&mut client).expect("deny")["error"]["data"]["reason"],
+        deny::CLOSED_SOCKET
+    );
+}
+
+#[test]
+fn broker_stall_fixture() {
+    let Some(socket) = std::env::var_os("BARN_SOCKET").map(PathBuf::from) else {
+        return;
+    };
+    let token = std::env::var("BARN_TOKEN").expect("start token");
+    let mut client =
+        connect_stall(&socket, &token, &BTreeMap::new()).expect("connect with the token");
+    assert!(read_message(&mut client).is_some());
+
+    let mut request = String::new();
+    client
+        .read_line(&mut request)
+        .expect("read the framed request");
+    assert_eq!(request, format!("{HOST_REQUEST}\n"));
+    writeln!(client.get_mut(), "{HOST_REPLY}").expect("send the framed reply");
 }

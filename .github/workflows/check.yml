@@ -58,6 +58,9 @@ jobs:
           key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # tack links barn as a library with default features off; keep that path
+      # free of the CLI and its clap dependency.
+      - run: cargo clippy -p barn --lib --no-default-features --locked -- -D warnings
 
   test:
     runs-on: ubuntu-latest
