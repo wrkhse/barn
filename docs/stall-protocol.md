@@ -295,6 +295,15 @@ tool adds `call` only. A reply repeats the `id` and carries one of `outcome`,
 `content` or `error`. The `call` holds `tool`, `name`, a JSON `input` and an
 optional `session_id`.
 
+A tool's `content` is the tool result: either a JSON string, used as the text,
+or a table with a `content` list. Every item in that list must have
+`kind: "text"`. barn joins the items' `text` values in order, separated by a
+newline, into the single `text` field of its own tool reply. An empty `content`
+list yields empty text. A table with no `content` field, a result that is
+neither a string nor a table, an item whose `kind` is not `text`, or an item
+whose `text` is not a string is a named `invalid_result` error, never
+stringified.
+
 A hook's `outcome` is `allow`, `deny`, `rewrite`, `annotate` or `drop` (tack#89).
 `deny` carries a `reason`. `rewrite` carries an `input`, JSON of any shape, that
 replaces a call's input for any tool. `annotate` carries `fields`, a JSON object

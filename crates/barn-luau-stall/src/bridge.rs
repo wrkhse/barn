@@ -75,20 +75,55 @@ pub fn handle_request(sandbox: &Sandbox, request: Request) -> Reply {
             // `Sandbox` applies its own `call_deadline_ms` bound: main's
             // `Limits` cap production at 500 ms, while tests inject a longer
             // budget through their own `Limits`.
-            match sandbox.run(&call.name, &call.input, u64::MAX) {
-                Ok(value) => Reply::Tool {
+            match sandbox
+                .run(&call.name, &call.input, u64::MAX)
+                .and_then(decode_tool_content)
+            {
+                Ok(text) => Reply::Tool {
                     id,
                     content: Content {
                         kind: "text".to_owned(),
-                        text: match value {
-                            Value::String(text) => text,
-                            other => other.to_string(),
-                        },
+                        text,
                     },
                 },
                 Err(error) => error_reply(id, &error),
             }
         }
+    }
+}
+
+fn decode_tool_content(value: Value) -> Result<String, EngineError> {
+    match value {
+        Value::String(text) => Ok(text),
+        Value::Object(mut result) => {
+            let content = result.remove("content").ok_or_else(|| {
+                EngineError::InvalidResult("tool result needs content".to_owned())
+            })?;
+
+            if content.as_object().is_some_and(serde_json::Map::is_empty) {
+                return Ok(String::new());
+            }
+
+            let items: Vec<Content> = serde_json::from_value(content).map_err(|error| {
+                EngineError::InvalidResult(format!("invalid tool content: {error}"))
+            })?;
+
+            let mut parts = Vec::with_capacity(items.len());
+            for item in items {
+                let Content { kind, text } = item;
+                if kind != "text" {
+                    return Err(EngineError::InvalidResult(format!(
+                        "invalid tool content: kind {kind} is not text"
+                    )));
+                }
+                parts.push(text);
+            }
+
+            Ok(parts.join("\n"))
+        }
+        _ => Err(EngineError::InvalidResult(
+            "tool must return a string or a table".to_owned(),
+        )),
     }
 }
 
@@ -153,6 +188,14 @@ mod tests {
     const HOOK_PLUGIN: &str = "return { name = 'bridge-hooks', PreToolUse = function(payload, ctx) return ctx.deny(ctx.tool .. ':' .. payload.command) end, tools = {} }";
     const TOOL_PLUGIN: &str = "return { name = 'bridge-tools', tools = { run = { name = 'run', run = function(input, ctx) return 'hello ' .. input.who end } } }";
     const PANIC_HOOK_PLUGIN: &str = "return { name = 'bridge-hook-version', PreToolUse = function() error('the hook must not run') end, tools = {} }";
+    const GUARD_STATUS_PLUGIN: &str = "return { name = 'bridge-guard', tools = { guard_status = { name = 'guard_status', run = function(input, ctx) return { content = { { kind = 'text', text = 'guard_status: daemon ok' } } } end } } }";
+    const TWO_ITEMS_PLUGIN: &str = "return { name = 'bridge-two', tools = { run = { name = 'run', run = function(input, ctx) return { content = { { kind = 'text', text = 'first' }, { kind = 'text', text = 'second' } } } end } } }";
+    const NON_TEXT_PLUGIN: &str = "return { name = 'bridge-non-text', tools = { run = { name = 'run', run = function(input, ctx) return { content = { { kind = 'markdown', text = '# heading' } } } end } } }";
+    const STRING_PLUGIN: &str = "return { name = 'bridge-string', tools = { run = { name = 'run', run = function(input, ctx) return 'plain text' end } } }";
+    const EMPTY_CONTENT_PLUGIN: &str = "return { name = 'bridge-empty', tools = { run = { name = 'run', run = function(input, ctx) return { content = {} } end } } }";
+    const MISSING_CONTENT_PLUGIN: &str = "return { name = 'bridge-missing', tools = { run = { name = 'run', run = function(input, ctx) return { other = 'value' } end } } }";
+    const NUMBER_PLUGIN: &str = "return { name = 'bridge-number', tools = { run = { name = 'run', run = function(input, ctx) return 42 end } } }";
+    const NON_STRING_TEXT_PLUGIN: &str = "return { name = 'bridge-non-string-text', tools = { run = { name = 'run', run = function(input, ctx) return { content = { { kind = 'text', text = 42 } } } end } } }";
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -211,6 +254,19 @@ mod tests {
             real_clock(),
         )
         .expect("fixture loads")
+    }
+
+    fn tool_request(id: u64, name: &str) -> Request {
+        Request::Tool {
+            id,
+            version: FRAMED_VERSION,
+            call: ToolCall {
+                tool: "shell".to_owned(),
+                name: name.to_owned(),
+                input: json!({}),
+                session_id: None,
+            },
+        }
     }
 
     #[test]
@@ -492,6 +548,135 @@ mod tests {
                 message: "expected framed version 1, got 2".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn a_guard_status_content_table_yields_its_exact_text() {
+        let scratch = Scratch::new();
+        let sandbox = fixture_sandbox(&scratch, GUARD_STATUS_PLUGIN);
+        let request = tool_request(20, "guard_status");
+
+        assert_eq!(
+            handle_request(&sandbox, request),
+            Reply::Tool {
+                id: 20,
+                content: Content {
+                    kind: "text".to_owned(),
+                    text: "guard_status: daemon ok".to_owned(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn two_text_items_join_in_order_with_a_newline() {
+        let scratch = Scratch::new();
+        let sandbox = fixture_sandbox(&scratch, TWO_ITEMS_PLUGIN);
+        let request = tool_request(21, "run");
+
+        assert_eq!(
+            handle_request(&sandbox, request),
+            Reply::Tool {
+                id: 21,
+                content: Content {
+                    kind: "text".to_owned(),
+                    text: "first\nsecond".to_owned(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn a_non_text_kind_is_rejected_without_stringifying_the_table() {
+        let scratch = Scratch::new();
+        let sandbox = fixture_sandbox(&scratch, NON_TEXT_PLUGIN);
+        let request = tool_request(22, "run");
+
+        assert_eq!(
+            handle_request(&sandbox, request),
+            Reply::Error {
+                id: 22,
+                error: "invalid_result".to_owned(),
+                message: "invalid tool content: kind markdown is not text".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_plain_string_result_is_the_text() {
+        let scratch = Scratch::new();
+        let sandbox = fixture_sandbox(&scratch, STRING_PLUGIN);
+        let request = tool_request(23, "run");
+
+        assert_eq!(
+            handle_request(&sandbox, request),
+            Reply::Tool {
+                id: 23,
+                content: Content {
+                    kind: "text".to_owned(),
+                    text: "plain text".to_owned(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_content_list_yields_empty_text() {
+        let scratch = Scratch::new();
+        let sandbox = fixture_sandbox(&scratch, EMPTY_CONTENT_PLUGIN);
+        let request = tool_request(24, "run");
+
+        assert_eq!(
+            handle_request(&sandbox, request),
+            Reply::Tool {
+                id: 24,
+                content: Content {
+                    kind: "text".to_owned(),
+                    text: String::new(),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn missing_content_and_a_non_table_result_are_invalid() {
+        let missing = Scratch::new();
+        let sandbox = fixture_sandbox(&missing, MISSING_CONTENT_PLUGIN);
+        let request = tool_request(25, "run");
+
+        assert_eq!(
+            handle_request(&sandbox, request),
+            Reply::Error {
+                id: 25,
+                error: "invalid_result".to_owned(),
+                message: "tool result needs content".to_owned(),
+            }
+        );
+
+        let number = Scratch::new();
+        let sandbox = fixture_sandbox(&number, NUMBER_PLUGIN);
+        let request = tool_request(26, "run");
+
+        assert_eq!(
+            handle_request(&sandbox, request),
+            Reply::Error {
+                id: 26,
+                error: "invalid_result".to_owned(),
+                message: "tool must return a string or a table".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_non_string_text_is_rejected_by_deserialization() {
+        let scratch = Scratch::new();
+        let sandbox = fixture_sandbox(&scratch, NON_STRING_TEXT_PLUGIN);
+        let request = tool_request(27, "run");
+
+        assert!(matches!(
+            handle_request(&sandbox, request),
+            Reply::Error { error, .. } if error == "invalid_result"
+        ));
     }
 
     #[test]
