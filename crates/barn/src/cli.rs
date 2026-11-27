@@ -2,6 +2,7 @@
 
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -216,6 +217,39 @@ impl StartError {
     }
 }
 
+/// A launch failure and whether the protocol line already reached stdout.
+#[derive(Debug)]
+struct StartFailure {
+    error: StartError,
+    endpoint_written: bool,
+}
+
+impl StartFailure {
+    /// No bytes were written, so the named error line is still ours to write.
+    const fn before(error: StartError) -> Self {
+        Self {
+            error,
+            endpoint_written: false,
+        }
+    }
+
+    /// The endpoint line may already have reached stdout; never write a
+    /// second line over it.
+    const fn after(error: StartError) -> Self {
+        Self {
+            error,
+            endpoint_written: true,
+        }
+    }
+}
+
+impl From<StartError> for StartFailure {
+    /// Outside the endpoint write, an error happens before any line is written.
+    fn from(error: StartError) -> Self {
+        Self::before(error)
+    }
+}
+
 /// The launch inputs barn derives from its own process and the environment.
 struct Launch {
     stall: StallSpec,
@@ -224,7 +258,7 @@ struct Launch {
     daemon_pid: u32,
 }
 
-fn start(plugin: &Path, daemon_pid: u32) -> Result<(), StartError> {
+fn start(plugin: &Path, daemon_pid: u32) -> Result<(), StartFailure> {
     let current = env::current_exe().map_err(|source| StartError::Io {
         operation: "finding the barn executable",
         source,
@@ -292,12 +326,13 @@ async fn start_async(
     daemon_pid: u32,
     helper: PathBuf,
     state_dir: PathBuf,
-) -> Result<(), StartError> {
+) -> Result<(), StartFailure> {
     let launch = prepare_launch(plugin, &program, daemon_pid, helper, state_dir)?;
     let supervisor = Supervisor::new(launch.state_dir, launch.helper);
     let running = supervisor
         .start_for_host(launch.stall, launch.daemon_pid)
-        .await?;
+        .await
+        .map_err(StartError::from)?;
     let endpoint = running.host_endpoint();
 
     write_endpoint(&mut io::stdout().lock(), &endpoint)?;
@@ -320,7 +355,7 @@ fn prepare_launch(
 ) -> Result<Launch, StartError> {
     let stall = stall_spec(plugin, program)?;
 
-    if state_dir.join("run").join(&stall.name).exists() {
+    if run_dir_is_live(&state_dir.join("run").join(&stall.name))? {
         return Err(StartError::RunDirInUse);
     }
 
@@ -330,6 +365,37 @@ fn prepare_launch(
         state_dir,
         daemon_pid,
     })
+}
+
+/// Whether another start holds the run directory's lock.
+///
+/// An unheld directory is stale: the supervisor clears it in `RunDir::create`.
+/// Only a live lock blocks a second start.
+fn run_dir_is_live(path: &Path) -> Result<bool, StartError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(StartError::Io {
+                operation: "opening the stall run directory",
+                source,
+            });
+        }
+    };
+
+    match file.try_lock().map_err(io::Error::from) {
+        Err(source) if source.kind() == io::ErrorKind::WouldBlock => Ok(true),
+        Err(source) => Err(StartError::Io {
+            operation: "locking the stall run directory",
+            source,
+        }),
+        Ok(()) => {
+            // We own this lock; release it so the supervisor can relock the
+            // directory for the start this check is allowing.
+            drop(file);
+            Ok(false)
+        }
+    }
 }
 
 /// The runtime is the program; the plugin folder is its first argument and
@@ -359,19 +425,20 @@ fn stall_spec(plugin: &Path, program: &Path) -> Result<StallSpec, StartError> {
     })
 }
 
-fn write_endpoint(writer: &mut impl Write, endpoint: &HostEndpoint) -> Result<(), StartError> {
+fn write_endpoint(writer: &mut impl Write, endpoint: &HostEndpoint) -> Result<(), StartFailure> {
     write_endpoint_to(writer, endpoint)
 }
 
-/// Writes the one success line to a caller-supplied sink.
-fn write_endpoint_to(writer: &mut impl Write, endpoint: &HostEndpoint) -> Result<(), StartError> {
+/// Builds the success line first, then writes it: a build error happens
+/// before any bytes exist, while a write error may have reached stdout.
+fn write_endpoint_to(writer: &mut impl Write, endpoint: &HostEndpoint) -> Result<(), StartFailure> {
     let socket_path = endpoint
         .socket_path
         .to_str()
-        .ok_or(StartError::SocketPath)?;
-    let line = endpoint_line(socket_path, &endpoint.token)?;
+        .ok_or(StartFailure::before(StartError::SocketPath))?;
+    let line = endpoint_line(socket_path, &endpoint.token).map_err(StartFailure::before)?;
 
-    write_line(writer, &line)
+    write_line(writer, &line).map_err(StartFailure::after)
 }
 
 /// The exact success line: protocol, socket path and token, then one newline.
@@ -409,11 +476,16 @@ fn write_line(mut stdout: impl Write, line: &[u8]) -> Result<(), StartError> {
 }
 
 /// Writes the named error line to the pipe and the full report to stderr.
-fn report_failure(stdout: &mut impl Write, stderr: &mut impl Write, failure: &StartError) {
-    let line = error_line(failure.reason());
-    let _ = write_line(stdout, &line);
+///
+/// A line already partly written must not be followed by a second one; the
+/// report on stderr is always written.
+fn report_failure(stdout: &mut impl Write, stderr: &mut impl Write, failure: &StartFailure) {
+    if !failure.endpoint_written {
+        let line = error_line(failure.error.reason());
+        let _ = write_line(stdout, &line);
+    }
 
-    let _ = writeln!(stderr, "barn stall start: {failure}");
+    let _ = writeln!(stderr, "barn stall start: {}", failure.error);
 }
 
 #[cfg(test)]
@@ -421,16 +493,43 @@ mod tests {
     use std::env;
     use std::ffi::OsString;
     use std::fs;
+    use std::fs::File;
+    use std::io::{self, Write};
     use std::path::{Path, PathBuf};
 
     use clap::Parser;
 
     use super::{
         Cli, CliCommand, Grant, HostEndpoint, MAX_LAUNCH_LINE_BYTES, StallCommand, StallsCommand,
-        StartError, endpoint_line, error_line, helper_from, prepare_launch, report_failure,
-        runtime_from, stall_spec, start, start_async, state_dir, state_dir_from, write_endpoint,
-        write_endpoint_to, write_line,
+        StartError, StartFailure, endpoint_line, error_line, helper_from, prepare_launch,
+        report_failure, runtime_from, stall_spec, start, start_async, state_dir, state_dir_from,
+        write_endpoint, write_endpoint_to, write_line,
     };
+
+    /// A sink that writes a prefix, then fails, to model a broken stdout.
+    #[derive(Debug)]
+    struct PartialWriter {
+        bytes: Vec<u8>,
+        fail_after: usize,
+    }
+
+    impl Write for PartialWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let room = self.fail_after.saturating_sub(self.bytes.len());
+
+            if room == 0 {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "partial sink"));
+            }
+
+            let written = buf.len().min(room);
+            self.bytes.extend_from_slice(&buf[..written]);
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn a_command_reads_back_as_it_was_typed() {
@@ -536,9 +635,11 @@ mod tests {
 
     #[test]
     fn a_live_run_directory_refuses_a_second_start() {
-        let root = std::env::temp_dir().join(format!("barn-cli-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("barn-cli-{}-live", std::process::id()));
         let run_dir = root.join("run").join("sourcefed");
         fs::create_dir_all(&run_dir).expect("a live run directory");
+        let lock = File::open(&run_dir).expect("opening the live run directory");
+        lock.try_lock().expect("locking the live run directory");
 
         let second = prepare_launch(
             Path::new("/opt/plugins/sourcefed"),
@@ -552,7 +653,43 @@ mod tests {
             second.err().map(|error| error.reason()),
             Some("stall run directory in use")
         );
+        drop(lock);
         fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_stale_run_directory_does_not_block_a_start() {
+        let root = std::env::temp_dir().join(format!("barn-cli-{}-stale", std::process::id()));
+        let run_dir = root.join("run").join("sourcefed");
+        fs::create_dir_all(&run_dir).expect("an unlocked stale run directory");
+
+        let launch = prepare_launch(
+            Path::new("/opt/plugins/sourcefed"),
+            Path::new("/usr/local/bin/barn-luau-stall"),
+            4321,
+            PathBuf::from("/usr/local/bin/barn-exec"),
+            root.clone(),
+        )
+        .expect("an unlocked stale run directory must not block a start");
+
+        assert_eq!(launch.stall.name, "sourcefed");
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_missing_run_directory_does_not_block_a_start() {
+        let root = std::env::temp_dir().join(format!("barn-cli-{}-missing", std::process::id()));
+
+        let launch = prepare_launch(
+            Path::new("/opt/plugins/sourcefed"),
+            Path::new("/usr/local/bin/barn-luau-stall"),
+            4321,
+            PathBuf::from("/usr/local/bin/barn-exec"),
+            root,
+        )
+        .expect("a missing run directory must not block a start");
+
+        assert_eq!(launch.stall.name, "sourcefed");
     }
 
     #[test]
@@ -605,7 +742,8 @@ mod tests {
         let failure = start(Path::new("/opt/plugins/sourcefed"), 4321)
             .expect_err("a launch without barn-exec must fail");
 
-        assert_eq!(failure.reason(), "barn-exec not found");
+        assert_eq!(failure.error.reason(), "barn-exec not found");
+        assert!(!failure.endpoint_written);
     }
 
     #[test]
@@ -624,7 +762,8 @@ mod tests {
             ))
             .expect_err("a relative plugin folder must fail");
 
-        assert_eq!(failure.reason(), "plugin path not absolute");
+        assert_eq!(failure.error.reason(), "plugin path not absolute");
+        assert!(!failure.endpoint_written);
     }
 
     #[test]
@@ -721,7 +860,7 @@ mod tests {
 
     #[test]
     fn a_pre_endpoint_failure_writes_the_named_error_line() {
-        let failure = StartError::RelativePlugin;
+        let failure = StartFailure::before(StartError::RelativePlugin);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
 
@@ -734,6 +873,63 @@ mod tests {
         assert_eq!(
             stderr,
             b"barn stall start: plugin path is not absolute\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn a_partial_stdout_write_is_after_and_adds_no_second_line() {
+        let endpoint = HostEndpoint {
+            socket_path: PathBuf::from("/run/host.sock"),
+            token: "one-use".to_owned(),
+        };
+        let mut sink = PartialWriter {
+            bytes: Vec::new(),
+            fail_after: 5,
+        };
+
+        let failure = write_endpoint(&mut sink, &endpoint).expect_err("a partial write must fail");
+
+        assert!(failure.endpoint_written);
+        assert_eq!(failure.error.reason(), "writing the launch line");
+        assert_eq!(sink.bytes, b"{\"pro".to_vec());
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        report_failure(&mut stdout, &mut stderr, &failure);
+
+        assert_eq!(stdout, b"".to_vec());
+        assert_eq!(
+            stderr,
+            b"barn stall start: writing the launch line: partial sink\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn a_pre_write_error_is_before_and_writes_the_exact_error_line() {
+        let endpoint = HostEndpoint {
+            socket_path: PathBuf::from("/run/host.sock"),
+            token: "x".repeat(MAX_LAUNCH_LINE_BYTES),
+        };
+        let mut sink = Vec::new();
+
+        let failure =
+            write_endpoint(&mut sink, &endpoint).expect_err("an oversized line must fail");
+
+        assert!(!failure.endpoint_written);
+        assert_eq!(failure.error.reason(), "endpoint line too long");
+        assert_eq!(sink, b"".to_vec());
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        report_failure(&mut stdout, &mut stderr, &failure);
+
+        assert_eq!(
+            stdout,
+            b"{\"protocol\":1,\"error\":\"endpoint line too long\"}\n".to_vec()
+        );
+        assert_eq!(
+            stderr,
+            b"barn stall start: endpoint line exceeds the launch line limit\n".to_vec()
         );
     }
 
