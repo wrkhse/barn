@@ -29,7 +29,18 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const STALL_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(2);
+const BUILD_TIMEOUT: Duration = Duration::from_secs(300);
 const POLL: Duration = Duration::from_millis(20);
+
+/// Removes a scratch directory when dropped, so a fixture build target is
+/// cleared even when a test panics before it finishes.
+struct RemoveOnDrop(PathBuf);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
 
 /// A scratch state root, a plugin folder with a loadable entry, and the barn
 /// child launched from them. stderr is drained on a thread so a named startup
@@ -39,6 +50,7 @@ struct Launch {
     dir: PathBuf,
     plugin: PathBuf,
     state: PathBuf,
+    seq: usize,
     child: Option<Child>,
     stderr: Arc<Mutex<String>>,
 }
@@ -65,7 +77,7 @@ impl Launch {
         let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
             .join(format!("barn-launch-{}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        let plugin = dir.join("plugin");
+        let plugin = dir.join(format!("plugin-{n}"));
         let state = dir.join("state");
         fs::create_dir_all(&plugin)?;
         fs::create_dir_all(&state)?;
@@ -78,6 +90,7 @@ impl Launch {
             dir,
             plugin,
             state,
+            seq: n,
             child: None,
             stderr: Arc::new(Mutex::new(String::new())),
         })
@@ -91,68 +104,128 @@ impl Launch {
         )
     }
 
-    /// cargo-mutants builds only the barn package into its own out dir, so the
-    /// helpers barn expects beside its binary may be absent. Build both once
-    /// into a stable per-process target dir, then copy any missing one into
-    /// place.
-    fn ensure_helpers(siblings: &Path) {
-        let missing: Vec<&str> = ["barn-exec", "barn-luau-stall"]
-            .into_iter()
-            .filter(|name| !siblings.join(*name).is_file())
-            .collect();
+    /// Find a built helper under the per-test target dir. cargo-mutants can
+    /// place binaries under a target triple or another profile folder, so the
+    /// fixed `debug/<name>` path is unreliable. Search at most five directories
+    /// deep, never following symlinks, and stop at a regular file whose name
+    /// matches.
+    fn find_built(root: &Path, name: &str) -> Option<PathBuf> {
+        let mut stack = vec![(root.to_path_buf(), 0usize)];
 
-        if missing.is_empty() {
-            return;
+        while let Some((dir, depth)) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(kind) = entry.file_type() else {
+                    continue;
+                };
+                let entry_depth = depth.saturating_add(1);
+                let path = entry.path();
+
+                if kind.is_file()
+                    && entry_depth <= 5
+                    && path.file_name().and_then(|part| part.to_str()) == Some(name)
+                {
+                    return Some(path);
+                }
+                if kind.is_dir() && entry_depth < 5 {
+                    stack.push((path, entry_depth));
+                }
+            }
         }
 
-        let helpers =
-            std::env::temp_dir().join(format!("barn-launch-helpers-{}", std::process::id()));
-        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        assert!(
-            Command::new("cargo")
-                .args([
-                    "build",
-                    "--locked",
-                    "-p",
-                    "barn-exec",
-                    "-p",
-                    "barn-luau-stall",
-                    "--target-dir",
-                ])
-                .arg(&helpers)
-                .current_dir(workspace)
-                .status()
-                .is_ok_and(|status| status.success()),
-            "build barn-exec and barn-luau-stall failed"
-        );
-
-        for name in missing {
-            let built = helpers.join("debug").join(name);
-            assert!(
-                fs::copy(&built, siblings.join(name)).is_ok(),
-                "copy a built helper beside barn"
-            );
-        }
+        None
     }
 
-    /// Spawn the binary cargo built and return a receiver for one stdout line.
-    /// barn finds its helper and runtime beside that binary, so both must be
-    /// built too; assert it here to make a missing sibling an obvious failure.
-    fn spawn(&mut self) -> Receiver<io::Result<String>> {
-        let binary = PathBuf::from(env!("CARGO_BIN_EXE_barn"));
-        let siblings = must_opt(binary.parent(), "barn has a folder");
+    /// Resolve the two helpers barn expects beside its binary. cargo-mutants
+    /// builds only the barn package, so the helpers may be absent from beside
+    /// the cargo-built barn; build any missing one into this test's own target
+    /// dir rather than a path shared with other tests. Return the resolved
+    /// paths so the caller copies them into its private bin dir.
+    fn ensure_helpers(siblings: &Path, target: &Path) -> (PathBuf, PathBuf) {
+        let needs_build = ["barn-exec", "barn-luau-stall"]
+            .iter()
+            .any(|name| !siblings.join(name).is_file());
 
-        Self::ensure_helpers(siblings);
-
-        for name in ["barn-exec", "barn-luau-stall"] {
+        if needs_build {
+            let _ = fs::remove_dir_all(target);
+            let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
             assert!(
-                siblings.join(name).is_file(),
-                "cargo must build {name} beside barn for the launch to use it"
+                Command::new("cargo")
+                    .args([
+                        "build",
+                        "--locked",
+                        "-p",
+                        "barn-exec",
+                        "-p",
+                        "barn-luau-stall",
+                        "--target-dir",
+                    ])
+                    .arg(target)
+                    .current_dir(workspace)
+                    .status()
+                    .is_ok_and(|status| status.success()),
+                "build barn-exec and barn-luau-stall failed"
             );
         }
 
+        let resolve = |name: &str| {
+            if siblings.join(name).is_file() {
+                siblings.join(name)
+            } else {
+                must_opt(
+                    Self::find_built(target, name),
+                    "find the built helper under the target dir",
+                )
+            }
+        };
+
+        (resolve("barn-exec"), resolve("barn-luau-stall"))
+    }
+
+    /// Copy barn and both helpers into this test's private `bin` dir and
+    /// return the copied barn's path. barn finds its helpers beside the binary
+    /// it runs, so the copy must carry all three; the cargo-built binary's
+    /// folder stays untouched for other tests. `stall` overrides the runtime
+    /// installed as barn-luau-stall, else the built helper is used.
+    fn prepare_bin(&self, stall: Option<PathBuf>) -> PathBuf {
+        let binary = PathBuf::from(env!("CARGO_BIN_EXE_barn"));
+        let siblings = must_opt(binary.parent(), "barn has a folder");
+        let bin = self.dir.join("bin");
+        must_res(fs::create_dir_all(&bin), "the scratch bin dir");
+
+        let target = std::env::temp_dir().join(format!(
+            "barn-launch-helpers-{}-{}",
+            std::process::id(),
+            self.seq
+        ));
+        let _ = fs::remove_dir_all(&target);
+        let _target_guard = RemoveOnDrop(target.clone());
+        let (exec, built_stall) = Self::ensure_helpers(siblings, &target);
+        let stall = stall.unwrap_or(built_stall);
+
+        for (from, name) in [
+            (binary, "barn"),
+            (exec, "barn-exec"),
+            (stall, "barn-luau-stall"),
+        ] {
+            assert!(
+                fs::copy(&from, bin.join(name)).is_ok(),
+                "copy {name} into the scratch bin dir"
+            );
+        }
+
+        bin.join("barn")
+    }
+
+    /// Spawn this test's copied barn and return a receiver for one stdout
+    /// line. The copy and its helpers live together in the private bin dir.
+    fn spawn(&mut self) -> Receiver<io::Result<String>> {
+        let barn = self.prepare_bin(None);
+
         let mut child = must_res(
-            Command::new(&binary)
+            Command::new(&barn)
                 .args(["stall", "start", "--plugin"])
                 .arg(&self.plugin)
                 .args(["--daemon-pid", &std::process::id().to_string()])
@@ -185,6 +258,107 @@ impl Launch {
 
         // A pipe read has no deadline. Read on a thread and bound how long
         // the test waits, so a launch that writes no endpoint fails clearly.
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            let result = reader.read_line(&mut line).map(|_| line);
+            let _ = sender.send(result);
+        });
+
+        receiver
+    }
+
+    /// Build the drain fixture example into a private target dir. A nested
+    /// cargo cannot share the test runner's locked target dir, and an
+    /// unbounded build would hang CI, so the wait is bounded and cargo is
+    /// killed if it runs past the deadline.
+    fn build_fixture(target: &Path) -> io::Result<()> {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut child = Command::new("cargo")
+            .args([
+                "build",
+                "--example",
+                "stall_drain_fixture",
+                "--locked",
+                "--target-dir",
+            ])
+            .arg(target)
+            .current_dir(workspace)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+
+        let started = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait()? {
+                if !status.success() {
+                    return Err(io::Error::other(
+                        "building the drain fixture example failed",
+                    ));
+                }
+                return Ok(());
+            }
+            if started.elapsed() >= BUILD_TIMEOUT {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::other(
+                    "building the drain fixture example exceeded the deadline",
+                ));
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    /// Spawn the copied barn for the SIGTERM test. The drain fixture replaces
+    /// the built stall runtime in the shared bin setup, so barn finds both
+    /// helpers beside the binary it actually runs. Returns the one endpoint
+    /// line.
+    fn spawn_with_drain_fixture(&mut self) -> Receiver<io::Result<String>> {
+        let target = std::env::temp_dir().join(format!(
+            "barn-launch-fixture-{}-{}",
+            std::process::id(),
+            self.seq
+        ));
+        let _ = fs::remove_dir_all(&target);
+        let _fixture_guard = RemoveOnDrop(target.clone());
+        must_res(Self::build_fixture(&target), "the fixture example built");
+        let fixture = target
+            .join("debug")
+            .join("examples")
+            .join("stall_drain_fixture");
+
+        let barn = self.prepare_bin(Some(fixture));
+
+        let mut child = must_res(
+            Command::new(&barn)
+                .args(["stall", "start", "--plugin"])
+                .arg(&self.plugin)
+                .args(["--daemon-pid", &std::process::id().to_string()])
+                .env("BARN_STATE_DIR", &self.state)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn(),
+            "the copied barn stall start spawns",
+        );
+        let stdout = must_opt(child.stdout.take(), "the child's stdout is piped");
+        let stderr = must_opt(child.stderr.take(), "the child's stderr is piped");
+        self.child = Some(child);
+
+        let sink = Arc::clone(&self.stderr);
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => must_res(sink.lock(), "the stderr buffer").push_str(&line),
+                }
+            }
+        });
+
         let (sender, receiver) = mpsc::channel();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -471,6 +645,87 @@ fn a_launched_stall_serves_one_host_connection_then_exits_cleanly() {
         "{}",
         launch.failure("barn exits zero after its host closes")
     );
+    assert!(
+        launch.wait_stall_gone(stall_pid),
+        "{}",
+        launch.failure(&format!("stall {stall_pid} is gone"))
+    );
+
+    launch.cleanup();
+    assert!(
+        launch.stall_pids().is_empty(),
+        "{}",
+        launch.failure("no stall process is left behind")
+    );
+}
+
+#[test]
+fn a_sigterm_drains_the_stall_and_removes_the_run_dir() {
+    if std::env::var_os("CI").is_none() {
+        return;
+    }
+
+    let mut launch = Launch::new().expect("the scratch tree");
+    let line = launch.spawn_with_drain_fixture();
+    let (socket, token) = launch.endpoint(&line);
+    let mut host = connect(&socket);
+
+    let start = json!({
+        "jsonrpc": "2.0",
+        "id": 21,
+        "method": method::HOST_START,
+        "params": HostStartParams {
+            protocol: PROTOCOL_VERSION,
+            token,
+            pid: std::process::id(),
+        },
+    });
+    writeln!(host.get_mut(), "{start}").expect("send host.start");
+
+    assert_eq!(
+        parse(&read_line(&mut host)),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "result": {"stall": launch.stall_name()},
+        })
+    );
+
+    // The fixture is the fake stall; its pid is the process barn drains on
+    // SIGTERM, matched on the unique plugin path in its argv.
+    let running = launch.stall_pids();
+    assert_eq!(
+        running.len(),
+        1,
+        "{}",
+        launch.failure("one stall serves the host before SIGTERM")
+    );
+    let stall_pid = running.first().copied().expect("one stall pid");
+
+    let child_id = launch
+        .child
+        .as_ref()
+        .expect("the copied barn is running")
+        .id();
+    signal("-TERM", child_id);
+
+    assert!(
+        launch.wait_exit().success(),
+        "{}",
+        launch.failure("barn exits zero after SIGTERM")
+    );
+
+    assert_eq!(
+        fs::read_to_string(launch.plugin.join("drain.marker")).expect("the drain marker"),
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"stall.drain\"}\n"
+    );
+
+    assert!(
+        !launch.state.join("run").join(launch.stall_name()).exists(),
+        "{}",
+        launch.failure("the run dir is gone after SIGTERM")
+    );
+
     assert!(
         launch.wait_stall_gone(stall_pid),
         "{}",

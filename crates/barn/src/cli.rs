@@ -13,7 +13,9 @@ use barn_stall::{LAUNCH_PROTOCOL, MAX_LAUNCH_LINE_BYTES};
 use clap::{Parser, Subcommand};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::timeout;
 
 use crate::Grant;
@@ -417,6 +419,89 @@ async fn drain_stall(
     }
 }
 
+/// Drains the stall on SIGTERM, closes the host listener and ends cleanly.
+///
+/// The child leaves on its own during the drain, so `running` can drop its
+/// run directory and socket. The close is idempotent: the listener may still
+/// be open when the signal arrives before tack's host is accepted. A failed
+/// drain stays the named `DrainFailed` failure.
+async fn drain_on_sigterm(
+    stall: &mut StallWriter,
+    rx: &mut StallReceiver,
+    running: &mut RunningStall,
+) -> Result<(), StartFailure> {
+    drain_stall(stall, rx, running)
+        .await
+        .map_err(StartFailure::after)?;
+
+    running.close_host_listener();
+    Ok(())
+}
+
+/// Brokers host frames until the host leaves, SIGTERM arrives or the stall
+/// dies. A clean host close or SIGTERM drains the stall and ends cleanly;
+/// every other end is a named failure reported after the endpoint line.
+async fn broker_host(
+    terminate: &mut Signal,
+    host: &mut BufReader<UnixStream>,
+    stall: &mut StallWriter,
+    rx: &mut StallReceiver,
+    running: &mut RunningStall,
+) -> Result<(), StartFailure> {
+    // tack owns one host connection. Park until a frame's first byte arrives:
+    // an idle host is not a failure, and only a stall death ends the wait.
+    // Once a byte arrives the frame has started, so the reply timeout covers
+    // the rest of the frame and the stall's answer.
+    loop {
+        tokio::select! {
+            biased;
+            _ = terminate.recv() => {
+                return drain_on_sigterm(stall, rx, running).await;
+            }
+            readable = host.fill_buf() => match readable {
+                Ok(bytes) if !bytes.is_empty() => {}
+                Ok(_) => {
+                    if stall_died(rx).await {
+                        return Err(StartFailure::after(StartError::StallExited));
+                    }
+                    drain_stall(stall, rx, running)
+                        .await
+                        .map_err(StartFailure::after)?;
+
+                    return Ok(());
+                }
+                Err(_) => return Err(StartFailure::after(StartError::HostLoss)),
+            },
+            event = rx.recv() => {
+                return Err(StartFailure::after(idle_event_failure(event.as_ref())));
+            }
+            _ = running.stall_exit() => {
+                return Err(StartFailure::after(StartError::StallDeathIdle));
+            }
+        }
+
+        let served = tokio::select! {
+            biased;
+            _ = terminate.recv() => {
+                return drain_on_sigterm(stall, rx, running).await;
+            }
+            served = running.serve_host(host, stall, rx) => served,
+        };
+
+        match served {
+            Ok(()) => {}
+            Err(SupervisorError::HostDenied(HostDeny::PeerLoss)) => {
+                if stall_died(rx).await {
+                    return Err(StartFailure::after(StartError::StallExited));
+                }
+
+                return Err(StartFailure::after(StartError::HostLoss));
+            }
+            Err(error) => return Err(after_supervisor(error)),
+        }
+    }
+}
+
 /// The launch inputs barn derives from its own process and the environment.
 struct Launch {
     stall: StallSpec,
@@ -495,28 +580,60 @@ async fn start_async(
     state_dir: PathBuf,
 ) -> Result<(), StartFailure> {
     let launch = prepare_launch(plugin, &program, daemon_pid, helper, state_dir)?;
+
+    // A terminate signal ends the launch from here on. The stream is cancel
+    // safe, so a signal that loses an accept race stays pending for the next
+    // one; install it before every wait that can end the launch.
+    let mut terminate = signal(SignalKind::terminate()).map_err(|source| {
+        StartFailure::before(StartError::Io {
+            operation: "installing the terminate signal handler",
+            source,
+        })
+    })?;
+
     let supervisor = Supervisor::new(launch.state_dir, launch.helper);
-    let mut running = supervisor
-        .start_for_host(launch.stall, launch.daemon_pid)
-        .await
-        .map_err(StartError::from)?;
+    let mut spawn = std::pin::pin!(supervisor.start_for_host(launch.stall, launch.daemon_pid));
+    let mut running = tokio::select! {
+        biased;
+        _ = terminate.recv() => {
+            // The child is already spawned, so let the spawn finish and own
+            // its run directory before dropping the stall: that drop removes
+            // the run directory, socket and child.
+            let running = spawn.await.map_err(StartError::from)?;
+
+            drop(running);
+            return Ok(());
+        }
+        started = &mut spawn => started.map_err(StartError::from)?,
+    };
     let endpoint = running.host_endpoint();
 
     write_endpoint(&mut io::stdout().lock(), &endpoint)?;
 
     // Keep the endpoint's owner resident: tack drives the host socket. The
     // stall connects back at launch, so accept it before the host that will
-    // send frames for it. Both waits are bounded, so a stall that dies after
-    // the endpoint line cannot leave barn waiting for a peer that never comes.
-    let stall_stream = timeout(STALL_HANDSHAKE_TIMEOUT, running.accept())
-        .await
-        .map_err(|_| StartFailure::after(StartError::StallHandshakeTimeout))?
-        .map_err(after_supervisor)?;
+    // send frames for it. Both waits are bounded, and each races SIGTERM, so
+    // neither a dead stall nor a terminate signal can strand the launch.
+    let stall_stream = tokio::select! {
+        biased;
+        _ = terminate.recv() => {
+            // The stall has not connected yet, so there is no connection to
+            // drain. Close the listener and let `running` drop its run dir.
+            running.close_host_listener();
+            return Ok(());
+        }
+        accepted = timeout(STALL_HANDSHAKE_TIMEOUT, running.accept()) => accepted
+            .map_err(|_| StartFailure::after(StartError::StallHandshakeTimeout))?
+            .map_err(after_supervisor)?,
+    };
     let (read_half, write_half) = stall_stream.into_inner().into_split();
     let mut stall: StallWriter = write_half;
     let mut rx = spawn_stall_reader(read_half);
     let mut host = tokio::select! {
         biased;
+        _ = terminate.recv() => {
+            return drain_on_sigterm(&mut stall, &mut rx, &mut running).await;
+        }
         event = rx.recv() => return Err(StartFailure::after(parked_event_failure(event.as_ref()))),
         accepted = running.accept_host_or_stall_exit() => match accepted.map_err(after_supervisor)? {
             Some(host) => host,
@@ -527,48 +644,7 @@ async fn start_async(
     // any second peer fail at connect time rather than reach the stall.
     running.close_host_listener();
 
-    // tack owns one host connection. Park until a frame's first byte arrives:
-    // an idle host is not a failure, and only a stall death ends the wait.
-    // Once a byte arrives the frame has started, so the reply timeout covers
-    // the rest of the frame and the stall's answer. Every failure after the
-    // endpoint line is reported on stderr only.
-    loop {
-        tokio::select! {
-            biased;
-            readable = host.fill_buf() => match readable {
-                Ok(bytes) if !bytes.is_empty() => {}
-                Ok(_) => {
-                    if stall_died(&mut rx).await {
-                        return Err(StartFailure::after(StartError::StallExited));
-                    }
-                    drain_stall(&mut stall, &mut rx, &mut running)
-                        .await
-                        .map_err(StartFailure::after)?;
-
-                    return Ok(());
-                }
-                Err(_) => return Err(StartFailure::after(StartError::HostLoss)),
-            },
-            event = rx.recv() => {
-                return Err(StartFailure::after(idle_event_failure(event.as_ref())));
-            }
-            _ = running.stall_exit() => {
-                return Err(StartFailure::after(StartError::StallDeathIdle));
-            }
-        }
-
-        match running.serve_host(&mut host, &mut stall, &mut rx).await {
-            Ok(()) => {}
-            Err(SupervisorError::HostDenied(HostDeny::PeerLoss)) => {
-                if stall_died(&mut rx).await {
-                    return Err(StartFailure::after(StartError::StallExited));
-                }
-
-                return Err(StartFailure::after(StartError::HostLoss));
-            }
-            Err(error) => return Err(after_supervisor(error)),
-        }
-    }
+    broker_host(&mut terminate, &mut host, &mut stall, &mut rx, &mut running).await
 }
 
 /// Builds the stall and refuses a live run directory for its name.
