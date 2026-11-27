@@ -47,8 +47,10 @@ Two plugin folders with the same file name do not collide: while a
 reason.
 
 Barn starts the stall and prints the endpoint; the accept and supervision loop
-on `proto.sock` is a separate follow-up. Host-side frame brokering over
-`host.sock` is a follow-up ([barn#46](https://github.com/wrkhse/barn/issues/46),
+on `proto.sock` is a separate follow-up. Barn stays resident while tack owns
+the process, so the printed endpoint has a live owner until tack ends it.
+Host-side frame brokering over `host.sock` is a follow-up
+([barn#46](https://github.com/wrkhse/barn/issues/46),
 [barn#48](https://github.com/wrkhse/barn/issues/48)); this command does not
 broker tack's frames yet.
 

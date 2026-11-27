@@ -302,6 +302,11 @@ async fn start_async(
 
     write_endpoint(&mut io::stdout().lock(), &endpoint)?;
 
+    // The accept/supervise loop is a later slice; tack owns the process
+    // lifetime. Park so `running` stays alive and keeps `host.sock`, the
+    // token and the child that own the endpoint printed above.
+    std::future::pending::<()>().await;
+
     Ok(())
 }
 
