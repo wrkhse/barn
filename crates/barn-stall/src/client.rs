@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn a_start_sends_one_line_and_returns_the_result() {
         let reply =
-            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"state\":\"/state\",\"jobs\":{}}}\n";
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"state\":\"/state\",\"jobs\":{\"poll\":{\"every\":\"15s\"}}}}\n";
         let jobs = BTreeMap::from([(
             "poll".to_owned(),
             Job {
