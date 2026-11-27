@@ -1023,14 +1023,16 @@ impl Transport {
 }
 
 impl HostTransport {
-    /// Accepts one host connection within the token's remaining lifetime.
+    /// Accepts one host connection and reads its `host.start` line within the
+    /// handshake window, then completes the exchange before the token expires.
     ///
     /// A token that is already spent or past its deadline takes the next
     /// connection and lets the handshake write the named deny on the wire;
-    /// the token stays spent. When no host arrives before the deadline, the
-    /// token is dropped with no peer to answer. Every read and write after
-    /// the accept runs under a deadline; a peer that stalls is denied before
-    /// the connection closes.
+    /// the token stays spent. When no peer arrives before the window, the
+    /// token is dropped with no peer to answer. The peer is unauthenticated
+    /// until its line is read, so the accept and that read use the short
+    /// handshake window: a silent same-uid peer cannot hold the handshake
+    /// open and burn the authentication window.
     async fn accept_with_deadline(
         &mut self,
         daemon_pid: u32,
@@ -1040,14 +1042,14 @@ impl HostTransport {
             token.expires_at.saturating_duration_since(Instant::now())
         });
         let spent = remaining.is_zero();
-        // A spent token still waits for one peer, but only for the handshake
-        // window: no host means no peer to answer and the token stays spent.
-        let accept_limit = if spent {
+        // A spent token still gets one peer so its named deny reaches the wire;
+        // an unspent one never waits past its deadline either.
+        let window = if spent {
             HOST_HANDSHAKE_TIMEOUT
         } else {
-            remaining
+            HOST_HANDSHAKE_TIMEOUT.min(remaining)
         };
-        let stream = if let Ok(accepted) = timeout(accept_limit, self.listener.accept()).await {
+        let stream = if let Ok(accepted) = timeout(window, self.listener.accept()).await {
             io_at("accepting host socket", accepted)?.0
         } else {
             self.token = None;
@@ -1055,48 +1057,75 @@ impl HostTransport {
             return Err(SupervisorError::HostDenied(HostDeny::TokenExpiredOrSpent));
         };
 
-        let (deadline, timeout_deny) = if spent {
-            (HOST_HANDSHAKE_TIMEOUT, HostDeny::TokenExpiredOrSpent)
-        } else {
-            (remaining, HostDeny::StalledReply)
-        };
         let mut reader = BufReader::new(stream);
-        let exchanged = timeout(deadline, self.exchange(&mut reader, daemon_pid, stall_name)).await;
-
-        match exchanged {
-            Ok(Ok(())) => Ok(reader),
-            Ok(Err(error)) => Err(error),
-            Err(_) => {
-                self.token = None;
-
-                refuse(&mut reader, &Value::Null, timeout_deny, DENY_WRITE_TIMEOUT).await
-            }
-        }
-    }
-
-    /// Completes the `host.start` exchange on an accepted connection.
-    async fn exchange(
-        &mut self,
-        reader: &mut BufReader<UnixStream>,
-        daemon_pid: u32,
-        stall_name: &str,
-    ) -> Result<()> {
         let cred = io_at(
             "reading host peer credentials",
             reader.get_ref().peer_cred(),
         )?;
-        let line = match read_line_bounded(reader).await {
-            Ok(line) => line,
-            Err(host_deny) => {
-                return refuse(reader, &Value::Null, host_deny, DENY_WRITE_TIMEOUT).await;
+        // The line arrives while the peer is still unauthenticated: bound its
+        // read by the handshake window, not by the token's full lifetime.
+        let line = match timeout(window, read_line_bounded(&mut reader)).await {
+            Ok(Ok(line)) => line,
+            Ok(Err(host_deny)) => {
+                return refuse(&mut reader, &Value::Null, host_deny, DENY_WRITE_TIMEOUT).await;
+            }
+            Err(_) => {
+                self.token = None;
+                let deny = if spent {
+                    HostDeny::TokenExpiredOrSpent
+                } else {
+                    HostDeny::StalledReply
+                };
+
+                return refuse(&mut reader, &Value::Null, deny, DENY_WRITE_TIMEOUT).await;
             }
         };
-        let id = request_id(&line);
 
-        if let Err(host_deny) = host_peer(cred.pid(), cred.uid(), daemon_pid, self.uid) {
+        // The line is here, so the peer can be authenticated. The rest of the
+        // exchange keeps the token's lifetime (the window when already spent).
+        let exchange_limit = if spent {
+            HOST_HANDSHAKE_TIMEOUT
+        } else {
+            remaining
+        };
+        let exchanged = timeout(
+            exchange_limit,
+            self.exchange(&mut reader, cred.pid(), cred.uid(), daemon_pid, stall_name, &line),
+        )
+        .await;
+
+        match exchanged {
+            Ok(result) => result,
+            Err(_) => {
+                self.token = None;
+                let deny = if spent {
+                    HostDeny::TokenExpiredOrSpent
+                } else {
+                    HostDeny::StalledReply
+                };
+
+                refuse(&mut reader, &Value::Null, deny, DENY_WRITE_TIMEOUT).await
+            }
+        }
+    }
+
+    /// Completes the authenticated part of `host.start` on a connection whose
+    /// peer credentials and request line have already been read.
+    async fn exchange(
+        &mut self,
+        reader: &mut BufReader<UnixStream>,
+        peer_pid: Option<i32>,
+        peer_uid: u32,
+        daemon_pid: u32,
+        stall_name: &str,
+        line: &[u8],
+    ) -> Result<()> {
+        let id = request_id(line);
+
+        if let Err(host_deny) = host_peer(peer_pid, peer_uid, daemon_pid, self.uid) {
             return refuse(reader, &id, host_deny, DENY_WRITE_TIMEOUT).await;
         }
-        let (id, params) = match decode_host_start(&line) {
+        let (id, params) = match decode_host_start(line) {
             Ok(start) => start,
             Err(host_deny) => return refuse(reader, &id, host_deny, DENY_WRITE_TIMEOUT).await,
         };
@@ -1393,8 +1422,9 @@ enum BodyCap {
 
 /// Whether a frame's inline body fits the cap after decoding.
 ///
-/// A body barn cannot measure is denied: malformed JSON and a present `body`
-/// that is not a string fail closed, while a frame with no body stays valid.
+/// A body barn cannot measure is denied: malformed JSON, a present `body` that
+/// is not a string, and malformed base64 fail closed, while a frame with no
+/// body stays valid.
 fn body_within_cap(frame: &[u8]) -> BodyCap {
     let Ok(value) = serde_json::from_slice::<Value>(frame) else {
         return BodyCap::BadFrame;
@@ -1406,6 +1436,10 @@ fn body_within_cap(frame: &[u8]) -> BodyCap {
         return BodyCap::BadFrame;
     };
     let decoded = if value.get("body_encoding").and_then(Value::as_str) == Some("base64") {
+        if !valid_base64(body) {
+            return BodyCap::BadFrame;
+        }
+
         base64_decoded_len(body)
     } else {
         body.len()
@@ -1432,6 +1466,32 @@ fn base64_decoded_len(body: &str) -> usize {
         .saturating_div(4)
         .saturating_mul(3)
         .saturating_add(tail)
+}
+
+/// Whether `body` is base64 that `base64_decoded_len` can measure.
+///
+/// Only the standard alphabet appears and `=` pads at most two places at the
+/// end, completing a group of four. Unpadded input stays valid.
+fn valid_base64(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    let symbols = bytes
+        .iter()
+        .take_while(|byte| is_base64_symbol(**byte))
+        .count();
+    let padding = bytes.len().saturating_sub(symbols);
+
+    if padding > 2 || !bytes[symbols..].iter().all(|byte| *byte == b'=') {
+        return false;
+    }
+
+    let remainder = symbols % 4;
+
+    remainder != 1 && (padding == 0 || remainder + padding == 4)
+}
+
+/// Whether a byte is a standard base64 symbol, excluding `=` padding.
+fn is_base64_symbol(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'
 }
 
 /// Writes the `stall.start` reply, or the oversize error when it cannot fit.
@@ -2047,6 +2107,45 @@ mod tests {
     }
 
     #[test]
+    fn a_base64_body_with_a_bad_alphabet_character_is_a_bad_frame() {
+        for body in ["aGk*", "a$Gk", "a-Gk"] {
+            let frame = format!(r#"{{"body_encoding":"base64","body":"{body}"}}"#);
+
+            assert_eq!(body_within_cap(frame.as_bytes()), BodyCap::BadFrame, "{body}");
+        }
+    }
+
+    #[test]
+    fn a_base64_body_with_bad_padding_is_a_bad_frame() {
+        for body in ["a=", "ab=", "aG===", "aGk==", "abcd==", "a=Gk"] {
+            let frame = format!(r#"{{"body_encoding":"base64","body":"{body}"}}"#);
+
+            assert_eq!(body_within_cap(frame.as_bytes()), BodyCap::BadFrame, "{body}");
+        }
+    }
+
+    #[test]
+    fn a_valid_base64_body_is_measured_at_the_cap_and_one_byte_over() {
+        let encode = |decoded_len: usize| {
+            let groups = decoded_len / 3;
+            let tail = match decoded_len % 3 {
+                1 => "QQ==",
+                2 => "QUI=",
+                _ => "",
+            };
+            format!("{}{}", "QUJD".repeat(groups), tail)
+        };
+        let frame = |body: &str| format!(r#"{{"body_encoding":"base64","body":"{body}"}}"#);
+
+        let exact = encode(DEFAULT_MAX_BODY_BYTES);
+        let over = encode(DEFAULT_MAX_BODY_BYTES + 1);
+        assert_eq!(base64_decoded_len(&exact), DEFAULT_MAX_BODY_BYTES);
+        assert_eq!(base64_decoded_len(&over), DEFAULT_MAX_BODY_BYTES + 1);
+        assert_eq!(body_within_cap(frame(&exact).as_bytes()), BodyCap::Fits);
+        assert_eq!(body_within_cap(frame(&over).as_bytes()), BodyCap::TooLarge);
+    }
+
+    #[test]
     fn a_body_that_cannot_be_measured_is_denied() {
         for frame in [
             br#"{"body":42}"#.as_slice(),
@@ -2351,6 +2450,41 @@ mod tests {
         // exchange and the named deny still reaches the wire.
         let accepted = timeout(
             Duration::from_secs(1),
+            transport.accept_with_deadline(daemon, "fixture"),
+        )
+        .await;
+
+        assert!(matches!(
+            accepted,
+            Ok(Err(SupervisorError::HostDenied(HostDeny::StalledReply)))
+        ));
+        assert!(transport.token.is_none());
+        assert_eq!(
+            read_deny(&mut peer).await,
+            denied(&Value::Null, deny::CLOSED_SOCKET)
+        );
+    }
+
+    /// A peer that connects and sends nothing must be denied by the handshake
+    /// window, not the token's full lifetime. The outer deadline sits between
+    /// the two, so a wait for the TTL fails this test instead of passing late.
+    #[tokio::test]
+    async fn a_silent_host_is_denied_within_the_handshake_window_and_spends_the_token() {
+        let fixture = PrepareFixture::new();
+        let deadline = Instant::now()
+            .checked_add(TOKEN_TTL)
+            .expect("the token deadline fits");
+        let socket = fixture.0.join(HOST_SOCKET_FILE);
+        let mut transport = test_host_transport(&fixture.0, Some(issued(deadline)));
+        let daemon = std::process::id();
+        let mut peer = UnixStream::connect(&socket).await.expect("host connects");
+
+        // The peer sends no line; a wait for the TTL would exceed this bound.
+        let outside = HOST_HANDSHAKE_TIMEOUT
+            .checked_add(Duration::from_secs(1))
+            .expect("the window plus slack fits");
+        let accepted = timeout(
+            outside,
             transport.accept_with_deadline(daemon, "fixture"),
         )
         .await;
