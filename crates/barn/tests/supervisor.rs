@@ -316,6 +316,90 @@ async fn a_start_reply_exposes_the_declared_jobs() {
     );
 }
 
+#[tokio::test]
+async fn a_real_stall_execs_and_authenticates_without_a_cli_change() {
+    if std::env::var_os("CI").is_none() {
+        return;
+    }
+
+    let scratch = Scratch::new().expect("scratch folder");
+    let barn = PathBuf::from(env!("CARGO_BIN_EXE_barn"));
+    let beside_helper = barn.with_file_name("barn-exec");
+    let beside_program = barn.with_file_name("barn-luau-stall");
+    let debug = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug");
+    let debug_helper = debug.join("barn-exec");
+    let debug_program = debug.join("barn-luau-stall");
+
+    // The CLI finds both binaries beside the running barn; use those same
+    // paths here, without starting a CLI process. cargo-mutants builds in an
+    // isolated target dir with no siblings, so build both binaries and look
+    // in the target dir inherited from the test when neither usual place has
+    // them.
+    let (helper, program) = if beside_helper.is_file() && beside_program.is_file() {
+        (beside_helper, beside_program)
+    } else if debug_helper.is_file() && debug_program.is_file() {
+        (debug_helper, debug_program)
+    } else {
+        let inherited_target = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
+        let target = inherited_target
+            .as_ref()
+            .map_or_else(|| debug.clone(), |dir| dir.join("debug"));
+
+        let mut build = std::process::Command::new("cargo");
+        build.args([
+            "build",
+            "--locked",
+            "-p",
+            "barn-exec",
+            "-p",
+            "barn-luau-stall",
+        ]);
+        if let Some(dir) = &inherited_target {
+            build.env("CARGO_TARGET_DIR", dir);
+        }
+        let status = build.status().expect("build barn-exec and barn-luau-stall");
+        assert!(
+            status.success(),
+            "build barn-exec and barn-luau-stall failed"
+        );
+
+        (target.join("barn-exec"), target.join("barn-luau-stall"))
+    };
+    assert!(helper.is_file(), "barn-exec must be built");
+    assert!(program.is_file(), "barn-luau-stall must be built");
+
+    let plugin = scratch.dir.join("plugin");
+    fs::create_dir(&plugin).expect("plugin folder");
+    fs::write(plugin.join("plugin.luau"), "return { name = 'fixture' }\n").expect("plugin module");
+    let spec = StallSpec {
+        name: "stall".to_owned(),
+        program: program.clone(),
+        args: vec![plugin.clone().into_os_string()],
+        grant: Grant {
+            executable: Some(program),
+            read_paths: vec![plugin.clone()],
+            write_paths: vec![plugin],
+            network_hosts: Vec::new(),
+        },
+    };
+    let supervisor = Supervisor::new(scratch.state(), helper);
+    let mut stall = supervisor
+        .start_for_host(spec, std::process::id())
+        .await
+        .expect("start the real stall under barn-exec");
+
+    // `accept` admits only the child's pid and spends the token the stall
+    // read from its environment, so this handshake proves the exec'd binary
+    // sent `stall.start` from the expected pid with the right token.
+    let accepted = timeout(Duration::from_secs(30), stall.accept())
+        .await
+        .expect("stall.start within the token deadline");
+    assert!(
+        accepted.is_ok(),
+        "the exec'd stall must authenticate: {accepted:?}"
+    );
+}
+
 const LOG_FRAME: &str = concat!(
     r#"{"jsonrpc":"2.0","method":"log","params":{"message":"replacement ready"}}"#,
     "\n"
