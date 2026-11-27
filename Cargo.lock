@@ -100,6 +100,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "barn-luau-stall"
+version = "0.1.0"
+dependencies = [
+ "barn-luau",
+ "barn-stall",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "barn-stall"
 version = "0.1.0"
 dependencies = [

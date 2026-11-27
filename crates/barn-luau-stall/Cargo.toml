@@ -1,0 +1,22 @@
+[package]
+name = "barn-luau-stall"
+description = "The Luau plugin stall: completes barn's stall.start handshake and provides the five-verdict bridge (allow, deny, rewrite, annotate, drop)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "barn-luau-stall"
+path = "src/main.rs"
+
+[dependencies]
+barn-luau = { path = "../barn-luau" }
+barn-stall = { path = "../barn-stall" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "time"] }
+
+[lints]
+workspace = true
