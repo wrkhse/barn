@@ -536,9 +536,15 @@ async fn host_start_with_the_wrong_peer_pid_is_denied() {
         stall.accept_host().await,
         Err(SupervisorError::HostDenied(HostDeny::WrongPeerPid))
     ));
-    assert_denied(
-        &read_host_line(&mut client).expect("deny"),
-        deny::WRONG_PEER_PID,
+    // Peer identity is checked before host.start's line is read, so the
+    // denial carries a null id rather than the id from that line.
+    assert_eq!(
+        read_host_line(&mut client).expect("deny"),
+        json!({
+            "jsonrpc": "2.0", "id": Value::Null,
+            "error": {"code": -32001, "message": "denied",
+                      "data": {"reason": deny::WRONG_PEER_PID}}
+        })
     );
 }
 

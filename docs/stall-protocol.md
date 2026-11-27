@@ -68,13 +68,17 @@ broker tack's frames yet.
   `0700`. tack receives the socket's absolute path and a single-use host
   token when barn starts the stall; the stall binds nothing. barn removes
   `host.sock` on drain or exit. tack supplies its daemon pid at launch,
-  connects and sends `host.start` as its first message. barn checks the
-  peer pid against that pid and the peer uid against the socket owner, then
-  spends the token. A missing or wrong peer, or a token at or past
-  `TOKEN_TTL_SECS`, is a named deny: barn answers with the deny and closes
-  the connection, issuing no new token without a restart. Failures at this
-  boundary are named denies, each in `data.reason` on a `DENIED_CODE`
-  error; `barn-stall`'s `deny` module names every reason. tack launches barn as a
+  connects and sends `host.start` as its first message, and that message must
+  arrive within `HOST_HANDSHAKE_TIMEOUT` (2 seconds), whether the token is
+  unspent or already spent. barn checks the peer pid against that pid and the
+  peer uid against the socket owner, then spends the token. A missing or wrong
+  peer, or a token at or past `TOKEN_TTL_SECS`, is a named deny: barn answers
+  with the deny and closes the connection. A peer-identity denial leaves the
+  token available for the real tack; every other handshake failure spends it,
+  and no new token is issued without a restart. A body that is not valid
+  base64 is denied as `bad frame`. Failures at this boundary are named
+  denies, each in `data.reason` on a `DENIED_CODE` error; `barn-stall`'s
+  `deny` module names every reason. tack launches barn as a
   separate program and reads the socket path and token from barn's stdout as
   one bounded JSON line, as "Launching a stall from tack" describes; there is
   no in-process carrier.
