@@ -128,7 +128,12 @@ if [ -f "$TIDY_CACHE_ROOT/tidy-$zeros/tidy.tar.gz" ]; then
 fi
 git restore --staged --worktree .github/tidy.env
 
-awk '$1 != "TIDY_LINUX_ASSET=" { print }' "$work/tidy.env.orig" > .github/tidy.env
+while IFS= read -r line; do
+  case "$line" in
+    TIDY_*ASSET=*) ;;
+    *) printf '%s\n' "$line" ;;
+  esac
+done < "$work/tidy.env.orig" > .github/tidy.env
 git add .github/tidy.env
 if git commit -qm 'test: missing pin' > "$work/missing.out" 2>&1; then
   echo 'missing pin commit unexpectedly succeeded' >&2
