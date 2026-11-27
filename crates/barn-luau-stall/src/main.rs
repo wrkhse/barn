@@ -1,4 +1,4 @@
-//! The Luau stall binary: authenticate to barn and load a plugin; the framed serve loop is the next slice.
+//! The Luau stall binary: authenticate to barn, load a plugin, serve frames.
 //!
 //! The plugin folder is the first process argument and must be absolute; a
 //! relative path would resolve against a different directory after barn
@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use barn_luau::{Capabilities, EngineError, Limits, Sandbox};
 use barn_luau_stall::bridge::real_clock;
+use barn_luau_stall::serve::{ServeError, serve};
 use barn_stall::client::{self, ClientError};
 
 const MEMORY_BYTES: usize = 16 * 1024 * 1024;
@@ -32,8 +33,8 @@ pub enum MainError {
     Limits(EngineError),
     /// The plugin could not be loaded into a sandbox.
     Sandbox(EngineError),
-    /// The stall started but cannot serve until the framed loop lands.
-    NotServingYet,
+    /// The frame exchange failed.
+    Serve(ServeError),
 }
 
 impl fmt::Display for MainError {
@@ -51,9 +52,7 @@ impl fmt::Display for MainError {
             Self::Socket(error) => write!(formatter, "preparing the socket failed: {error}"),
             Self::Limits(error) => write!(formatter, "invalid engine limits: {error}"),
             Self::Sandbox(error) => write!(formatter, "loading the plugin failed: {error}"),
-            Self::NotServingYet => {
-                formatter.write_str("the framed serve loop is not available in this slice")
-            }
+            Self::Serve(error) => write!(formatter, "serving frames failed: {error}"),
         }
     }
 }
@@ -64,7 +63,8 @@ impl std::error::Error for MainError {
             Self::Client(error) => Some(error),
             Self::Socket(error) => Some(error),
             Self::Limits(error) | Self::Sandbox(error) => Some(error),
-            Self::MissingFolder | Self::RelativeFolder(_) | Self::NotServingYet => None,
+            Self::Serve(error) => Some(error),
+            Self::MissingFolder | Self::RelativeFolder(_) => None,
         }
     }
 }
@@ -93,20 +93,13 @@ async fn main() -> Result<(), MainError> {
     let (stream, _) = client::from_env(declared_jobs).map_err(MainError::Client)?;
     let socket = stream.into_inner();
     socket.set_nonblocking(true).map_err(MainError::Socket)?;
-    let _stream = tokio::net::UnixStream::from_std(socket).map_err(MainError::Socket)?;
+    let stream = tokio::net::UnixStream::from_std(socket).map_err(MainError::Socket)?;
 
     let limits = Limits::new(MEMORY_BYTES, CALL_DEADLINE_MS).map_err(MainError::Limits)?;
-    let _sandbox = Sandbox::new(&folder, limits, Capabilities::default(), real_clock())
+    let sandbox = Sandbox::new(&folder, limits, Capabilities::default(), real_clock())
         .map_err(MainError::Sandbox)?;
 
-    not_serving_yet()
-}
-
-/// The stall started but cannot serve yet. Slice 2b replaces this with the
-/// framed serve loop; until then a started stall must not report success by
-/// exiting cleanly.
-const fn not_serving_yet() -> Result<(), MainError> {
-    Err(MainError::NotServingYet)
+    serve(stream, sandbox).await.map_err(MainError::Serve)
 }
 
 #[cfg(test)]
@@ -156,12 +149,15 @@ mod tests {
     }
 
     #[test]
-    fn not_serving_yet_has_its_exact_reason() {
+    fn display_wraps_the_serve_failure() {
         assert_eq!(
-            MainError::NotServingYet.to_string(),
-            "the framed serve loop is not available in this slice"
+            MainError::Serve(ServeError::Oversize).to_string(),
+            "serving frames failed: a request line exceeded MAX_LINE_BYTES"
         );
-        assert!(std::error::Error::source(&MainError::NotServingYet).is_none());
+        assert_eq!(
+            MainError::Serve(ServeError::Closed).to_string(),
+            "serving frames failed: the peer closed before the exchange finished"
+        );
     }
 
     #[test]
@@ -195,6 +191,32 @@ mod tests {
             .expect("a sandbox failure carries its source");
 
         assert_eq!(sandbox.to_string(), "bad plugin");
+    }
+
+    #[test]
+    fn source_reports_the_serve_error() {
+        let serve_error = MainError::Serve(ServeError::Oversize);
+        let source =
+            std::error::Error::source(&serve_error).expect("a serve failure carries its source");
+
+        assert_eq!(source.to_string(), "a request line exceeded MAX_LINE_BYTES");
+
+        let malformed = serde_json::from_str::<serde_json::Value>("{")
+            .expect_err("an incomplete object is a malformed frame");
+        let json_reason = malformed.to_string();
+        let malformed_error = MainError::Serve(ServeError::Malformed(malformed));
+        let serve = std::error::Error::source(&malformed_error)
+            .expect("a malformed frame carries its source");
+
+        assert_eq!(
+            serve.to_string(),
+            format!("a request line is malformed: {json_reason}")
+        );
+
+        let json =
+            std::error::Error::source(serve).expect("a malformed frame carries the JSON error");
+
+        assert_eq!(json.to_string(), json_reason);
     }
 
     #[test]
@@ -237,22 +259,11 @@ mod tests {
         assert_eq!(folder, absolute);
     }
 
-    #[test]
-    fn the_launcher_withholds_success_until_the_serve_loop() {
-        let error = not_serving_yet().expect_err("a started stall must not report success");
-
-        assert!(matches!(error, MainError::NotServingYet));
-        assert_eq!(
-            error.to_string(),
-            "the framed serve loop is not available in this slice"
-        );
-    }
-
-    /// Calls the real `main` only to kill the whole-main-returns-`Ok` mutant
-    /// CI shard 1 missed; the exact `not_serving_yet` result is covered
-    /// separately by `the_launcher_withholds_success_until_the_serve_loop`.
-    /// Like the process tests in `crates/barn/tests/exit.rs`, it runs in CI
-    /// only and returns at once without `CI` set.
+    // This test kills the mutant that replaces the whole body of `main` with
+    // `Ok(())`: from a test process there is no valid plugin folder or socket,
+    // so success can only come from that replacement. CI only, like exit.rs --
+    // `main` may touch the socket named by `BARN_SOCKET`, which must stay off
+    // the owner's Mac.
     #[test]
     fn main_never_reports_success_in_ci() {
         if std::env::var_os("CI").is_none() {

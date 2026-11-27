@@ -8,9 +8,6 @@ use barn_luau::{Clock, EngineError, Sandbox};
 use barn_stall::{Content, FRAMED_VERSION, Reply, Request};
 use serde_json::{Value, json};
 
-/// A framed call finishes inside barn's drain budget; the sandbox shortens it.
-const CALL_DEADLINE_MS: u64 = barn_stall::protocol::DRAIN_DEADLINE_MS;
-
 /// The machine name a frame with the wrong contract version gets.
 const VERSION_ERROR: &str = "version_mismatch";
 
@@ -59,7 +56,10 @@ pub fn handle_request(sandbox: &Sandbox, request: Request) -> Reply {
                 context: json!({ "tool": call.tool }),
             };
 
-            match sandbox.hook(&invocation, CALL_DEADLINE_MS) {
+            // `Sandbox` applies its own `call_deadline_ms` bound: main's
+            // `Limits` cap production at 500 ms, while tests inject a longer
+            // budget through their own `Limits`.
+            match sandbox.hook(&invocation, u64::MAX) {
                 Ok(outcome) => Reply::Hook {
                     id,
                     outcome: wire_outcome(outcome),
@@ -72,7 +72,10 @@ pub fn handle_request(sandbox: &Sandbox, request: Request) -> Reply {
                 return reply;
             }
 
-            match sandbox.run(&call.name, &call.input, CALL_DEADLINE_MS) {
+            // `Sandbox` applies its own `call_deadline_ms` bound: main's
+            // `Limits` cap production at 500 ms, while tests inject a longer
+            // budget through their own `Limits`.
+            match sandbox.run(&call.name, &call.input, u64::MAX) {
                 Ok(value) => Reply::Tool {
                     id,
                     content: Content {

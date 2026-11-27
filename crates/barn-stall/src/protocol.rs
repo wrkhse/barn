@@ -101,6 +101,14 @@ pub mod deny {
     pub const BAD_FRAME: &str = "bad frame";
     /// The socket closed before the peer completed the exchange.
     pub const CLOSED_SOCKET: &str = "closed socket";
+    /// The stall is draining and cannot take new work.
+    pub const STALL_DRAINING: &str = "stall draining";
+    /// The stall is not running, or is not yet healthy.
+    pub const STALL_UNAVAILABLE: &str = "stall unavailable";
+    /// The stall has no room for another in-flight call.
+    pub const STALL_BUSY: &str = "stall busy";
+    /// A reply is longer than [`MAX_LINE_BYTES`].
+    pub const OVERSIZE_REPLY: &str = "oversize reply";
 }
 
 /// The `stall.start` parameters a stall sends when it connects.

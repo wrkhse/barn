@@ -165,8 +165,9 @@ A host whose peer pid differs from the pid barn was given is denied:
 ```
 
 The other named reasons are `wrong peer uid`, `token expired or spent`,
-`token mismatch`, `protocol mismatch`, `oversize frame`, `bad frame` and
-`closed socket`. Each travels in `data.reason` with `DENIED_CODE`;
+`token mismatch`, `protocol mismatch`, `oversize frame`, `bad frame`,
+`closed socket`, `stall draining`, `stall unavailable`, `stall busy` and
+`oversize reply`. Each travels in `data.reason` with `DENIED_CODE`;
 `barn-stall`'s `deny` module names every reason.
 
 A malformed or unmeasurable frame is denied as a bad frame:
@@ -213,6 +214,11 @@ work and replies `null`:
 In-flight calls get `DRAIN_DEADLINE_MS` (500 ms) to finish. A call still running
 at the deadline is answered with a named deny in `data.reason` on a
 `DENIED_CODE` error, and barn proceeds with the drain.
+
+The stall replies `null` only after every in-flight call has finished or been
+denied with `stall draining`. The deny writes share one 500 ms deadline, not one
+each. _For a later slice to confirm: the cap on calls in flight. This version
+does not fix the exact bound on concurrent calls._
 
 A stall asks the broker:
 
