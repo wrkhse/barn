@@ -96,8 +96,12 @@ count; this example advances a counter so it stays deterministic.
 
 Hooks take `(payload, ctx)`. The fields of a host context object appear
 directly on `ctx`; another value appears as `ctx.host`. Verdict helpers
-and registered capabilities take precedence over host fields. A hook can
-use `ctx.rewrite(payload)` to replace the entire payload.
+and registered capabilities take precedence over host fields. A hook
+returns `nil` to allow the call, or one verdict built with a helper:
+`ctx.deny(reason)` refuses it, `ctx.rewrite(payload)` replaces the whole
+payload, `ctx.annotate(fields)` attaches JSON object fields (explicit
+nulls survive), and `ctx.drop()` removes the call. A result with more than
+one verdict is refused.
 
 The manifest contains the plugin's `name`, `needs`, and a `tools` array.
 Tool entries carry their name and other non-function fields.
@@ -115,7 +119,8 @@ Tool entries carry their name and other non-function fields.
   exhaustion returns a named `LimitCause`.
 - By default, the per-call context contains verdict helpers but no host
   capabilities. Register callbacks with `Capabilities::insert` to expose
-  them as `ctx.<name>(argument)`. Each callback exchanges JSON-compatible
+  them as `ctx.<name>(argument)`. The verdict-helper names are reserved, so
+  a callback cannot shadow one. Each callback exchanges JSON-compatible
   values, and a returned error carries the capability name and reason.
   Capabilities run in the host: the VM cannot interrupt a blocking Rust
   callback or cap its memory. The host must bound that work itself.

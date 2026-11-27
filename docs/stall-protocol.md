@@ -78,7 +78,7 @@ encoding is a new version, never a value added inside this one.
 | ----------------------------- | ------------- | ------------------------------------------------------------------------------------------------------- |
 | `stall.start`                 | stall to barn | Authenticate the stall and return its state folder                                                      |
 | `host.start`                  | host to barn  | Authenticate the host on `host.sock` and return the stall's name                                        |
-| `stall.health`, `stall.drain` | barn to stall | Report health; finish in-flight work and exit within a deadline                                         |
+| `stall.health`, `stall.drain` | barn to stall | Report health; drain finishes in-flight work in 500 ms or denies                                        |
 | `request`, `cancel`           | barn to stall | A client request from a listener; a cancel or a closed connection                                       |
 | `stream.send`, `stream.end`   | stall to barn | Write to a response stream, such as SSE                                                                 |
 | `webhook`                     | barn to stall | A verified webhook delivery                                                                             |
@@ -156,6 +156,18 @@ A successful JSON-RPC reply with the matching id within 2 seconds answers the
 check. barn buffers non-health frames on the connection during the check.
 A check without a matching success is missed. barn restarts the stall after
 three consecutive misses.
+
+barn sends `stall.drain` with no parameters. The stall finishes its in-flight
+work and replies `null`:
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"stall.drain"}
+{"jsonrpc":"2.0","id":3,"result":null}
+```
+
+In-flight calls get `DRAIN_DEADLINE_MS` (500 ms) to finish. A call still running
+at the deadline is answered with a named deny in `data.reason` on a
+`DENIED_CODE` error, and barn proceeds with the drain.
 
 A stall asks the broker:
 
@@ -249,13 +261,13 @@ access to a tool or a session.
 | `DEFAULT_MAX_BODY_BYTES` | `4194304` | 4 MiB, the default body cap a grant sets |
 | `DENIED_CODE`            | `-32001`  | the error code for `denied`              |
 | `TOKEN_TTL_SECS`         | `30`      | seconds before a start token expires     |
+| `DRAIN_DEADLINE_MS`      | `500`     | ms for in-flight calls to finish         |
 
 ## For a later slice to confirm
 
 The plan fixes these methods' names and directions. These details remain open:
 
 - `stall.health`: the short status its result carries.
-- `stall.drain`: its parameters and the deadline a stall must finish in.
 - `request`: the method, params and connection id barn passes, and how a response
   stream is opened.
 - `cancel`: what it names, and what a closed connection does to everything on it.

@@ -20,9 +20,9 @@ pub struct Capabilities {
 impl Capabilities {
     /// Register or replace a callback invoked as `ctx.name(argument)`.
     ///
-    /// The names `allow`, `deny`, and `rewrite` are reserved. Callbacks run
-    /// synchronously; they must bound their own work and must not re-enter the
-    /// same sandbox.
+    /// The names `allow`, `deny`, `rewrite`, `annotate`, and `drop` are
+    /// reserved. Callbacks run synchronously; they must bound their own work
+    /// and must not re-enter the same sandbox.
     pub fn insert(
         &mut self,
         name: impl Into<String>,
@@ -32,7 +32,7 @@ impl Capabilities {
     }
 
     pub(super) fn validate(&self) -> Result<(), EngineError> {
-        for name in ["allow", "deny", "rewrite"] {
+        for name in ["allow", "deny", "rewrite", "annotate", "drop"] {
             if self.callbacks.contains_key(name) {
                 return Err(EngineError::InvalidResult(format!(
                     "reserved capability name: {name}"

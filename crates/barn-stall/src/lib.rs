@@ -13,9 +13,11 @@
 //!
 //! [protocol]: https://github.com/wrkhse/barn/blob/main/docs/stall-protocol.md
 
+pub mod client;
 pub mod frames;
 pub mod protocol;
 
+pub use client::{ClientError, connect, from_env};
 pub use frames::{Content, FRAMED_VERSION, Meta, Outcome, Reply, Request, ToolCall};
 pub use protocol::{
     BodyEncoding, DEFAULT_MAX_BODY_BYTES, DENIED_CODE, Headers, HostStartParams, HostStartResult,

@@ -301,6 +301,169 @@ fn host_context_fields_cannot_override_helpers_or_capabilities() {
 }
 
 #[test]
+fn decode_accepts_nil_as_allow() {
+    assert_eq!(decode_outcome(LuaValue::Nil), Ok(Outcome::Allow));
+}
+
+#[test]
+fn decode_accepts_a_deny_verdict() {
+    let lua = Lua::new();
+    let result = lua.create_table().expect("result table");
+    result.raw_set("deny", "blocked").expect("set deny");
+
+    assert_eq!(
+        decode_outcome(LuaValue::Table(result)),
+        Ok(Outcome::Deny {
+            reason: "blocked".into()
+        })
+    );
+}
+
+#[test]
+fn decode_accepts_a_rewrite_verdict() {
+    let lua = Lua::new();
+    let result = lua.create_table().expect("result table");
+    let payload = lua.create_table().expect("payload");
+    payload.raw_set("command", "echo hi").expect("set command");
+    result.raw_set("rewrite", payload).expect("set rewrite");
+
+    assert_eq!(
+        decode_outcome(LuaValue::Table(result)),
+        Ok(Outcome::Rewrite {
+            payload: json!({ "command": "echo hi" })
+        })
+    );
+}
+
+#[test]
+fn decode_accepts_an_annotate_verdict() {
+    let lua = Lua::new();
+    let result = lua.create_table().expect("result table");
+    let fields = lua.create_table().expect("fields");
+    fields.raw_set("severity", "high").expect("set severity");
+    fields.raw_set("retries", 2).expect("set retries");
+    result.raw_set("annotate", fields).expect("set annotate");
+
+    let mut expected = serde_json::Map::new();
+    expected.insert("severity".into(), json!("high"));
+    expected.insert("retries".into(), json!(2));
+
+    assert_eq!(
+        decode_outcome(LuaValue::Table(result)),
+        Ok(Outcome::Annotate { fields: expected })
+    );
+}
+
+#[test]
+fn decode_accepts_a_drop_verdict() {
+    let lua = Lua::new();
+    let result = lua.create_table().expect("result table");
+    result.raw_set("drop", true).expect("set drop");
+
+    assert_eq!(decode_outcome(LuaValue::Table(result)), Ok(Outcome::Drop));
+}
+
+#[test]
+fn decode_refuses_more_than_one_verdict() {
+    let lua = Lua::new();
+    let result = lua.create_table().expect("result table");
+    result.raw_set("deny", "no").expect("set deny");
+    result.raw_set("drop", true).expect("set drop");
+
+    assert_eq!(
+        decode_outcome(LuaValue::Table(result)),
+        Err(EngineError::InvalidResult(
+            "hook result has multiple verdicts: deny, drop".into()
+        ))
+    );
+}
+
+#[test]
+fn decode_refuses_a_non_object_annotate() {
+    let lua = Lua::new();
+    let result = lua.create_table().expect("result table");
+    result
+        .raw_set("annotate", "not an object")
+        .expect("set annotate");
+
+    assert_eq!(
+        decode_outcome(LuaValue::Table(result)),
+        Err(EngineError::InvalidResult(
+            "annotate must be an object".into()
+        ))
+    );
+}
+
+#[test]
+fn decode_refuses_a_non_true_drop() {
+    let lua = Lua::new();
+    for value in [LuaValue::Boolean(false), LuaValue::Integer(1)] {
+        let result = lua.create_table().expect("result table");
+        result.raw_set("drop", value).expect("set drop");
+
+        assert_eq!(
+            decode_outcome(LuaValue::Table(result)),
+            Err(EngineError::InvalidResult("drop must be true".into()))
+        );
+    }
+}
+
+#[test]
+fn ctx_helpers_expose_annotate_and_drop_shapes() {
+    let scratch = Scratch::new();
+    scratch.write(
+        "plugin.luau",
+        r#"
+        return {
+            name = "verdicts",
+            mark = function(payload, ctx)
+                return ctx.annotate({ severity = "high", note = ctx.note })
+            end,
+            stop = function(payload, ctx)
+                return ctx.drop()
+            end,
+            bad = function(payload, ctx)
+                return ctx.annotate("not a table")
+            end,
+        }
+        "#,
+    );
+    let sandbox = Sandbox::new(
+        scratch.path(),
+        default_limits(),
+        Capabilities::default(),
+        test_clock(),
+    )
+    .expect("fixture loads");
+
+    let call = |hook: &str| Invocation {
+        hook: hook.into(),
+        payload: Value::Null,
+        context: json!({ "note": null }),
+    };
+
+    assert_eq!(
+        sandbox.hook(&call("mark"), DEFAULT_DEADLINE_MS),
+        Ok(Outcome::Annotate {
+            fields: json!({ "severity": "high", "note": null })
+                .as_object()
+                .cloned()
+                .expect("object fields")
+        })
+    );
+    assert_eq!(
+        sandbox.hook(&call("stop"), DEFAULT_DEADLINE_MS),
+        Ok(Outcome::Drop)
+    );
+    assert_eq!(
+        sandbox.hook(&call("bad"), DEFAULT_DEADLINE_MS),
+        Err(EngineError::InvalidResult(
+            "annotate fields must be a table".into()
+        ))
+    );
+}
+
+#[test]
 fn a_runaway_loop_is_limited_by_the_deadline() {
     let (_scratch, sandbox) = fixture(default_limits());
     let error = sandbox
