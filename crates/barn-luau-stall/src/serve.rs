@@ -5,7 +5,9 @@
 //! blocking pool so a health check is answered while a plugin is busy. Every
 //! reply is one line of JSON ending in a newline, and every failure has a
 //! name in [`ServeError`]. Calls are bounded: a request past the cap gets a
-//! named busy deny instead of a worker.
+//! named busy deny instead of a worker. Control calls made by a plugin arrive
+//! on a separate channel, get one framed request written to the peer, and are
+//! answered by the next matching control or error line.
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Formatter};
@@ -21,10 +23,12 @@ use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
 };
 use tokio::net::UnixStream;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::{self, JoinSet};
-use tokio::time::{Duration, Instant, timeout, timeout_at};
+use tokio::time::{Duration, Instant, sleep_until, timeout, timeout_at};
 
 use crate::bridge::handle_request;
+use crate::control::{self, ControlCall};
 
 /// Emit a timestamped diagnostic line when `BARN_TEST_TRACE` is set.
 pub fn trace(message: impl FnOnce() -> String) {
@@ -52,6 +56,15 @@ pub const MAX_IN_FLIGHT: usize = 8;
 /// past the time barn gives in-flight calls to finish.
 const REPLY_TIMEOUT: Duration = Duration::from_millis(DRAIN_DEADLINE_MS);
 
+/// How long a control call waits for its framed reply.
+const CONTROL_TIMEOUT: Duration = REPLY_TIMEOUT;
+
+/// The message on a control frame too large to write to the peer.
+const CONTROL_FRAME_ERROR: &str = "control call frame exceeds the size cap";
+
+/// The message on a control call whose reply never arrived.
+const CONTROL_TIMEOUT_ERROR: &str = "control call timed out";
+
 /// The message on a call still running when the drain deadline passes.
 const DRAIN_DENY_MESSAGE: &str = "in-flight call did not finish before the drain deadline";
 
@@ -63,6 +76,13 @@ const BUSY_DENY_MESSAGE: &str = "too many in-flight calls";
 
 /// The message on a reply too long to frame.
 const OVERSIZE_REPLY_MESSAGE: &str = "the reply exceeds MAX_LINE_BYTES";
+
+/// A control call waiting for its reply: id, reply channel and deadline.
+type PendingControl = (
+    u64,
+    oneshot::Sender<Result<serde_json::Value, String>>,
+    Instant,
+);
 
 /// Why a connection could not finish the exchange.
 #[derive(Debug)]
@@ -122,7 +142,9 @@ enum Event {
 /// At most [`MAX_IN_FLIGHT`] calls run at once; a request that arrives at the
 /// cap is answered with stall busy and never reaches the sandbox. After a
 /// busy deny the loop awaits a call completion before reading another line.
-/// For a later slice to confirm: the exact cap value.
+/// Control calls arrive on a separate channel: one is written to the peer at
+/// a time and its reply is matched by id before the line reaches normal
+/// decoding. For a later slice to confirm: the exact cap value.
 ///
 /// # Errors
 ///
@@ -132,24 +154,45 @@ enum Event {
 /// [`ServeError::Closed`] when the peer goes away or a write fails, and
 /// [`ServeError::StalledReply`] when a reply cannot be written in time. A
 /// drain ends the loop with ok after its in-flight calls finish or are denied.
-pub async fn serve(stream: UnixStream, sandbox: Sandbox) -> Result<(), ServeError> {
+pub async fn serve(
+    stream: UnixStream,
+    sandbox: Sandbox,
+    mut control_rx: mpsc::UnboundedReceiver<ControlCall>,
+) -> Result<(), ServeError> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let sandbox = Arc::new(sandbox);
     let mut calls = JoinSet::new();
     let mut pending = BTreeMap::new();
+    let mut pending_control: Option<PendingControl> = None;
     let mut line = Vec::new();
     let mut need_slot = false;
 
     loop {
-        let event = next_event(
-            &mut reader,
-            &mut writer,
-            &mut line,
-            &mut calls,
-            &mut need_slot,
-        )
-        .await?;
+        let control_deadline = pending_control.as_ref().map(|&(_, _, deadline)| deadline);
+
+        let event = tokio::select! {
+            event = next_event(
+                &mut reader,
+                &mut writer,
+                &mut line,
+                &mut calls,
+                &mut need_slot,
+                pending_control.is_some(),
+            ) => event?,
+
+            Some(call) = control_rx.recv(), if control_deadline.is_none() => {
+                queue_control(&mut writer, &mut pending_control, call).await?;
+
+                continue;
+            }
+
+            () = control_wait(control_deadline), if control_deadline.is_some() => {
+                expire_control(&mut pending_control);
+
+                continue;
+            }
+        };
         trace(|| match &event {
             Event::Line => "event: line".to_owned(),
             Event::Call(_) => "event: call".to_owned(),
@@ -157,27 +200,19 @@ pub async fn serve(stream: UnixStream, sandbox: Sandbox) -> Result<(), ServeErro
 
         match event {
             Event::Line => {
-                let frame = decode_frame(&mut writer, &mut line).await?;
-                trace(|| match &frame {
-                    Frame::Health(_) => "frame: health".to_owned(),
-                    Frame::Drain(_) => "frame: drain".to_owned(),
-                    Frame::Request(_) => "frame: request".to_owned(),
-                });
-
-                let drained = matches!(frame, Frame::Drain(_));
-                let result = handle_frame(
+                let drained = handle_line_event(
                     &mut writer,
+                    &mut line,
                     &mut calls,
                     &mut pending,
                     &mut need_slot,
-                    frame,
+                    &mut pending_control,
                     &sandbox,
                 )
-                .await;
+                .await?;
                 if drained {
-                    return result;
+                    return Ok(());
                 }
-                result?;
             }
             Event::Call(joined) => {
                 trace(|| "finish_call start".to_owned());
@@ -190,6 +225,122 @@ pub async fn serve(stream: UnixStream, sandbox: Sandbox) -> Result<(), ServeErro
             }
         }
     }
+}
+
+/// Handle one decoded line: route a matching control reply, skip a control
+/// envelope that answers no pending call, then decode and dispatch the frame.
+///
+/// Returns whether the frame was a drain, which ends the connection.
+async fn handle_line_event(
+    writer: &mut (impl AsyncWrite + Unpin),
+    line: &mut Vec<u8>,
+    calls: &mut JoinSet<Reply>,
+    pending: &mut BTreeMap<task::Id, u64>,
+    need_slot: &mut bool,
+    pending_control: &mut Option<PendingControl>,
+    sandbox: &Arc<Sandbox>,
+) -> Result<bool, ServeError> {
+    if take_control_reply(line, pending_control) {
+        return Ok(false);
+    }
+
+    if is_foreign_control_envelope(line) {
+        trace(|| "skip foreign control envelope".to_owned());
+        line.clear();
+
+        return Ok(false);
+    }
+
+    let frame = decode_frame(writer, line).await?;
+    trace(|| match &frame {
+        Frame::Health(_) => "frame: health".to_owned(),
+        Frame::Drain(_) => "frame: drain".to_owned(),
+        Frame::Request(_) => "frame: request".to_owned(),
+    });
+
+    let drained = matches!(frame, Frame::Drain(_));
+    handle_frame(writer, calls, pending, need_slot, frame, sandbox).await?;
+
+    Ok(drained)
+}
+
+/// Whether a line is a control envelope that answers no pending call.
+///
+/// A late reply after a timeout, or a duplicate reply, carries `kind` set to
+/// "control" or "error" and a numeric `version`, whatever its id. Barn's own
+/// requests carry a `type` tag instead, so they keep the normal decode path.
+fn is_foreign_control_envelope(line: &[u8]) -> bool {
+    let Ok(envelope) = serde_json::from_slice::<Value>(line) else {
+        return false;
+    };
+
+    let control_kind = matches!(
+        envelope.get("kind").and_then(Value::as_str),
+        Some("control" | "error")
+    );
+
+    control_kind && envelope.get("version").is_some_and(Value::is_number)
+}
+
+/// Write one queued control request and remember its reply channel.
+///
+/// An oversize frame is refused to the caller without being written. The
+/// encode step already caps frames, so this is a second, explicit bound.
+async fn queue_control(
+    writer: &mut (impl AsyncWrite + Unpin),
+    pending_control: &mut Option<PendingControl>,
+    call: ControlCall,
+) -> Result<(), ServeError> {
+    if call.frame.len() > tack_protocol::MAX_FRAME_BYTES {
+        let _ = call.reply.send(Err(CONTROL_FRAME_ERROR.to_owned()));
+
+        return Ok(());
+    }
+
+    write_line(writer, &call.frame).await?;
+    *pending_control = Some((call.id, call.reply, deadline_after(CONTROL_TIMEOUT)));
+
+    Ok(())
+}
+
+/// Wait for the pending control deadline, or forever while none is pending.
+async fn control_wait(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Answer a timed-out control call with the named timeout error.
+fn expire_control(pending_control: &mut Option<PendingControl>) {
+    if let Some((id, reply, _)) = pending_control.take() {
+        trace(|| format!("control call timed out id={id}"));
+        let _ = reply.send(Err(CONTROL_TIMEOUT_ERROR.to_owned()));
+    }
+}
+
+/// Route a control reply to its waiting caller and clear its line.
+///
+/// Returns whether the line answered the pending control call; an unrelated
+/// line stays in the buffer for the normal decode path.
+fn take_control_reply(line: &mut Vec<u8>, pending_control: &mut Option<PendingControl>) -> bool {
+    let Some((id, _, _)) = pending_control.as_ref() else {
+        return false;
+    };
+    let id = *id;
+
+    if !control::is_control_reply(line, id) {
+        return false;
+    }
+
+    let result = control::decode_control_reply(line, id);
+    line.clear();
+
+    if let Some((_, reply, _)) = pending_control.take() {
+        let _ = reply.send(result);
+    }
+
+    true
 }
 
 /// Handle one decoded frame under the same cap and write bounds as before.
@@ -245,68 +396,86 @@ async fn handle_frame(
     Ok(())
 }
 
+/// An event for a finished call, traced with the branch that observed it.
+fn call_event(branch: &str, joined: Result<(task::Id, Reply), task::JoinError>) -> Event {
+    trace(|| {
+        let (kind, id) = match &joined {
+            Ok((task, _)) => ("answered", *task),
+            Err(error) => ("join_error", error.id()),
+        };
+        format!(
+            "next_event call complete ({branch}) {}",
+            joined_tag(kind, id)
+        )
+    });
+    Event::Call(joined)
+}
+
+/// Read one line into an event, naming a read error on the wire first.
+async fn read_event(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    line: &mut Vec<u8>,
+) -> Result<Event, ServeError> {
+    if let Err(error) = read_or_report(reader, writer, line).await {
+        trace(|| format!("next_event read error {error:?}"));
+
+        return Err(error);
+    }
+
+    Ok(Event::Line)
+}
+
 /// Choose the next event, giving a busy stall a call slot before another read.
+///
+/// While a control call is pending the read stays live even in the need-slot
+/// branch, so a late or duplicate control reply can be read and skipped.
 async fn next_event(
     reader: &mut (impl AsyncBufRead + Unpin),
     writer: &mut (impl AsyncWrite + Unpin),
     line: &mut Vec<u8>,
     calls: &mut JoinSet<Reply>,
     need_slot: &mut bool,
+    control_pending: bool,
 ) -> Result<Event, ServeError> {
-    if *need_slot
-        && !calls.is_empty()
-        && let Some(joined) = calls.join_next_with_id().await
-    {
-        *need_slot = false;
-        trace(|| {
-            let (kind, id) = match &joined {
-                Ok((task, _)) => ("answered", *task),
-                Err(error) => ("join_error", error.id()),
+    if *need_slot && !calls.is_empty() {
+        if control_pending {
+            let event = tokio::select! {
+                read = read_or_report(reader, writer, line) => match read {
+                    Ok(()) => Event::Line,
+                    Err(error) => {
+                        trace(|| format!("next_event read error (need_slot) {error:?}"));
+                        return Err(error);
+                    }
+                },
+                Some(joined) = calls.join_next_with_id() => call_event("need_slot", joined),
             };
-            format!(
-                "next_event call complete (need_slot) {}",
-                joined_tag(kind, id)
-            )
-        });
+            *need_slot = false;
 
-        return Ok(Event::Call(joined));
+            return Ok(event);
+        }
+        if let Some(joined) = calls.join_next_with_id().await {
+            *need_slot = false;
+
+            return Ok(call_event("need_slot", joined));
+        }
     }
 
     *need_slot = false;
 
     if calls.is_empty() {
-        if let Err(error) = read_or_report(reader, writer, line).await {
-            trace(|| format!("next_event read error (idle) {error:?}"));
-
-            return Err(error);
-        }
-
-        return Ok(Event::Line);
+        return read_event(reader, writer, line).await;
     }
 
     tokio::select! {
-        read = read_or_report(reader, writer, line) => {
-            match read {
-                Ok(()) => Ok(Event::Line),
-                Err(error) => {
-                    trace(|| format!("next_event read error (select) {error:?}"));
-                    Err(error)
-                }
+        read = read_or_report(reader, writer, line) => match read {
+            Ok(()) => Ok(Event::Line),
+            Err(error) => {
+                trace(|| format!("next_event read error (select) {error:?}"));
+                Err(error)
             }
-        }
-        Some(joined) = calls.join_next_with_id() => {
-            trace(|| {
-                let (kind, id) = match &joined {
-                    Ok((task, _)) => ("answered", *task),
-                    Err(error) => ("join_error", error.id()),
-                };
-                format!(
-                    "next_event call complete (select) {}",
-                    joined_tag(kind, id)
-                )
-            });
-            Ok(Event::Call(joined))
-        }
+        },
+        Some(joined) = calls.join_next_with_id() => Ok(call_event("select", joined)),
     }
 }
 
@@ -646,7 +815,12 @@ async fn drain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use barn_luau::{Capabilities, Limits};
     use barn_stall::Content;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::bridge::real_clock;
 
     /// A tool reply carrying len bytes of text. Plain ASCII needs no JSON
     /// escaping, so the serialized length grows exactly with len.
@@ -810,6 +984,7 @@ mod tests {
                 &mut line,
                 &mut calls,
                 &mut need_slot,
+                false,
             ),
         )
         .await;
@@ -828,6 +1003,7 @@ mod tests {
                 &mut line,
                 &mut calls,
                 &mut need_slot,
+                false,
             ),
         )
         .await
@@ -897,5 +1073,244 @@ mod tests {
             joined_tag("join_error", id),
             format!("task={id:?} join_error")
         );
+    }
+
+    #[tokio::test]
+    async fn queue_control_writes_the_exact_frame_and_holds_the_reply() {
+        let (reply, receiver) = oneshot::channel();
+        let frame = b"{\"kind\":\"control\"}\n".to_vec();
+        let call = ControlCall {
+            id: 9,
+            frame: frame.clone(),
+            reply,
+        };
+        let mut pending_control = None;
+        let mut sink = Vec::new();
+
+        queue_control(&mut sink, &mut pending_control, call)
+            .await
+            .expect("the control frame is written");
+
+        assert_eq!(sink, frame);
+
+        let (id, sender, deadline) = pending_control.expect("a pending control call");
+        assert_eq!(id, 9);
+        assert!(deadline > Instant::now());
+
+        sender
+            .send(Ok(json!({ "ok": true })))
+            .expect("the caller still waits");
+        assert_eq!(
+            receiver.await.expect("the reply arrives"),
+            Ok(json!({ "ok": true }))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_exactly_at_the_cap_is_written() {
+        let (reply, receiver) = oneshot::channel();
+        let frame = vec![b'x'; tack_protocol::MAX_FRAME_BYTES];
+        let call = ControlCall {
+            id: 10,
+            frame: frame.clone(),
+            reply,
+        };
+        let mut pending_control = None;
+        let mut sink = Vec::new();
+
+        queue_control(&mut sink, &mut pending_control, call)
+            .await
+            .expect("the control frame is written");
+
+        assert_eq!(sink, frame);
+
+        let (id, sender, deadline) = pending_control.expect("a pending control call");
+        assert_eq!(id, 10);
+        assert!(deadline > Instant::now());
+
+        sender
+            .send(Ok(json!({ "ok": true })))
+            .expect("the caller still waits");
+        assert_eq!(
+            receiver.await.expect("the reply arrives"),
+            Ok(json!({ "ok": true }))
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_control_refuses_an_oversize_frame_without_writing_it() {
+        let (reply, receiver) = oneshot::channel();
+        let call = ControlCall {
+            id: 1,
+            frame: vec![b'x'; tack_protocol::MAX_FRAME_BYTES.saturating_add(1)],
+            reply,
+        };
+        let mut pending_control = None;
+        let mut sink = Vec::new();
+
+        queue_control(&mut sink, &mut pending_control, call)
+            .await
+            .expect("an oversize frame is refused");
+
+        assert_eq!(sink, Vec::<u8>::new());
+        assert!(pending_control.is_none());
+        assert_eq!(
+            receiver.await.expect("the refusal arrives"),
+            Err(CONTROL_FRAME_ERROR.to_owned())
+        );
+    }
+
+    /// A complete control reply line for the call id, as the peer writes it.
+    fn control_reply_line(id: u64, result: Value) -> Vec<u8> {
+        let reply = tack_protocol::wire::Reply::Control {
+            id,
+            version: tack_protocol::wire::PROTOCOL_VERSION,
+            result,
+        };
+        let mut line = serde_json::to_vec(&reply).expect("the reply serializes");
+        line.push(b'\n');
+
+        line
+    }
+
+    #[test]
+    fn take_control_reply_routes_the_result_and_clears_the_line() {
+        let (reply, receiver) = oneshot::channel();
+        let mut pending_control = Some((7, reply, deadline_after(CONTROL_TIMEOUT)));
+        let mut line = control_reply_line(7, json!({ "ok": true }));
+
+        assert!(take_control_reply(&mut line, &mut pending_control));
+        assert_eq!(line, Vec::<u8>::new());
+        assert!(pending_control.is_none());
+        assert_eq!(
+            receiver.blocking_recv().expect("the result arrives"),
+            Ok(json!({ "ok": true }))
+        );
+    }
+
+    #[test]
+    fn take_control_reply_routes_a_named_error() {
+        let (reply, receiver) = oneshot::channel();
+        let mut pending_control = Some((8, reply, deadline_after(CONTROL_TIMEOUT)));
+        let error = tack_protocol::wire::Reply::Error {
+            id: 8,
+            version: tack_protocol::wire::PROTOCOL_VERSION,
+            error: tack_protocol::wire::ReplyError::DaemonError,
+            message: "navigate refused".to_owned(),
+        };
+        let mut line = serde_json::to_vec(&error).expect("the error serializes");
+        line.push(b'\n');
+
+        assert!(take_control_reply(&mut line, &mut pending_control));
+        assert_eq!(line, Vec::<u8>::new());
+        assert!(pending_control.is_none());
+        assert_eq!(
+            receiver.blocking_recv().expect("the refusal arrives"),
+            Err("daemon_error: navigate refused".to_owned())
+        );
+    }
+
+    #[test]
+    fn take_control_reply_leaves_an_unrelated_line_for_the_decode_path() {
+        let (reply, _receiver) = oneshot::channel();
+        let mut pending_control = Some((7, reply, deadline_after(CONTROL_TIMEOUT)));
+        let mut line = b"{}\n".to_vec();
+
+        assert!(!take_control_reply(&mut line, &mut pending_control));
+        assert_eq!(line, b"{}\n");
+        assert!(pending_control.is_some());
+    }
+
+    #[test]
+    fn is_foreign_control_envelope_ignores_a_normal_barn_line() {
+        let line = b"{\"jsonrpc\":\"2.0\",\"method\":\"stall.health\",\"id\":5}\n";
+
+        assert!(!is_foreign_control_envelope(line));
+    }
+
+    #[test]
+    fn is_foreign_control_envelope_ignores_a_framed_hook_line() {
+        let line =
+            b"{\"type\":\"hook\",\"id\":5,\"version\":1,\"hook\":\"PreToolUse\",\"call\":{}}\n";
+
+        assert!(!is_foreign_control_envelope(line));
+    }
+
+    #[test]
+    fn is_foreign_control_envelope_matches_a_control_reply() {
+        let line = b"{\"kind\":\"control\",\"id\":7,\"version\":1,\"result\":{}}\n";
+
+        assert!(is_foreign_control_envelope(line));
+    }
+
+    #[test]
+    fn is_foreign_control_envelope_matches_an_error_reply() {
+        let line = b"{\"kind\":\"error\",\"id\":8,\"version\":1}\n";
+
+        assert!(is_foreign_control_envelope(line));
+    }
+
+    /// A plugin folder removed when the guard drops, so tests leave no files.
+    struct TempPluginFolder(PathBuf);
+
+    impl Drop for TempPluginFolder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_line_event_answers_a_health_line_without_draining() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "barn-luau-serve-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("create the plugin folder");
+        let folder = TempPluginFolder(root);
+
+        std::fs::write(
+            folder.0.join("plugin.luau"),
+            "return { name = 'serve-health', tools = {} }",
+        )
+        .expect("write the plugin fixture");
+
+        let limits = Limits::new(16 * 1024 * 1024, 100).expect("valid limits");
+        let sandbox = Arc::new(
+            Sandbox::new(
+                folder.0.as_path(),
+                limits,
+                Capabilities::default(),
+                real_clock(),
+            )
+            .expect("fixture loads"),
+        );
+
+        let mut line = b"{\"jsonrpc\":\"2.0\",\"method\":\"stall.health\",\"id\":5}\n".to_vec();
+        let mut sink = Vec::new();
+        let mut calls = JoinSet::new();
+        let mut pending = BTreeMap::new();
+        let mut need_slot = false;
+        let mut pending_control = None;
+
+        let drained = handle_line_event(
+            &mut sink,
+            &mut line,
+            &mut calls,
+            &mut pending,
+            &mut need_slot,
+            &mut pending_control,
+            &sandbox,
+        )
+        .await
+        .expect("the health line is handled");
+
+        assert!(!drained);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&sink).expect("a JSON health reply"),
+            serde_json::json!({"jsonrpc": "2.0", "id": 5, "result": null})
+        );
+        assert!(sink.ends_with(b"\n"));
     }
 }

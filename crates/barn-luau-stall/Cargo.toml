@@ -16,7 +16,14 @@ path = "src/main.rs"
 barn-luau = { path = "../barn-luau" }
 barn-stall = { path = "../barn-stall" }
 serde_json.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "time"] }
+tack_protocol = { git = "https://github.com/wrkhse/tack", rev = "b23115dfffe5d8ae76b918ee3b6df5b3f197a1eb" }
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt",
+  "time",
+] }
 
 [lints]
 workspace = true

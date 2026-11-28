@@ -7,12 +7,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use barn_luau::{Capabilities, Limits, Sandbox};
 use barn_luau_stall::bridge::real_clock;
+use barn_luau_stall::capabilities_for;
+use barn_luau_stall::control::ControlBridge;
 use barn_luau_stall::serve::{MAX_IN_FLIGHT, ServeError, serve};
 use barn_stall::protocol::deny::{
     BAD_FRAME, OVERSIZE_FRAME, OVERSIZE_REPLY, STALL_BUSY, STALL_DRAINING,
 };
-use barn_stall::{DENIED_CODE, MAX_LINE_BYTES, Reply, protocol::DRAIN_DEADLINE_MS};
+use barn_stall::{DENIED_CODE, MAX_LINE_BYTES, Outcome, Reply, protocol::DRAIN_DEADLINE_MS};
 use serde_json::{Value, json};
+use tack_protocol::wire::{PROTOCOL_VERSION, Reply as TackReply, ReplyError as TackReplyError};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::task::JoinHandle;
@@ -95,6 +98,41 @@ return {
 }
 "#;
 
+/// A plugin that declares one control need and uses the capability by a
+/// computed context key.
+const CONTROL_NEED_PLUGIN: &str = r#"
+return {
+    name = "control-need",
+    needs = { "control.call.navigate" },
+    PreToolUse = function(payload, ctx)
+        return ctx.rewrite(ctx['con' .. 'trol'].call('navigate', { who = 'x' }))
+    end,
+    tools = {},
+}
+"#;
+
+/// The same call from a plugin that declared no control need.
+const CONTROL_NO_NEED_PLUGIN: &str = r#"
+return {
+    name = "control-no-need",
+    PreToolUse = function(payload, ctx)
+        return ctx.rewrite(ctx['con' .. 'trol'].call('navigate', { who = 'x' }))
+    end,
+    tools = {},
+}
+"#;
+
+fn control_hook(id: u64) -> String {
+    json!({
+        "type": "hook",
+        "id": id,
+        "version": 1,
+        "hook": "PreToolUse",
+        "call": { "tool": "bash", "name": "run", "input": {} },
+    })
+    .to_string()
+}
+
 struct PluginFolder(PathBuf);
 
 impl PluginFolder {
@@ -137,12 +175,23 @@ fn peer_with(plugin: &str, call_ms: u64) -> Result<Peer, BoxError> {
     let folder = PluginFolder::new()?;
     folder.write("plugin.luau", plugin)?;
     let limits = Limits::new(MEMORY_BYTES, call_ms)?;
-    let sandbox = Sandbox::new(folder.path(), limits, Capabilities::default(), real_clock())?;
+    let (bridge, control_rx) = ControlBridge::new();
+
+    // The real stall reads the manifest once, then builds capabilities from
+    // its declared needs. Do the same here so conformance tests exercise the
+    // registration path rather than a fixture-only copy of it.
+    let probe = Sandbox::new(folder.path(), limits, Capabilities::default(), real_clock())?;
+    let manifest = probe.manifest()?;
+    let needs = manifest
+        .get("needs")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "manifest has no needs array"))?;
+    let capabilities = capabilities_for(needs, bridge)?;
+    let sandbox = Sandbox::new(folder.path(), limits, capabilities, real_clock())?;
     let (client, stall) = UnixStream::pair()?;
 
     Ok(Peer {
         wire: BufReader::new(client),
-        task: tokio::spawn(serve(stall, sandbox)),
+        task: tokio::spawn(serve(stall, sandbox, control_rx)),
         _folder: folder,
     })
 }
@@ -179,6 +228,36 @@ async fn finish(
 
 fn wires() -> Result<Vec<Value>, serde_json::Error> {
     FRAMES.lines().map(serde_json::from_str).collect()
+}
+
+/// Send the next hook, answer its second control call with `input`, and check
+/// the stall rewrites with exactly that value.
+async fn assert_next_hook_verdict(peer: &mut Peer, id: u64, input: Value) -> Result<(), BoxError> {
+    peer.send(&control_hook(id)).await?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&peer.read().await?)?,
+        json!({
+            "kind": "control",
+            "id": 1,
+            "version": PROTOCOL_VERSION,
+            "call": "navigate",
+            "input": { "who": "x" },
+        })
+    );
+    let control = TackReply::Control {
+        id: 1,
+        version: PROTOCOL_VERSION,
+        result: input.clone(),
+    };
+    peer.send(&serde_json::to_string(&control)?).await?;
+    assert_eq!(
+        peer.reply().await?,
+        Reply::Hook {
+            id,
+            outcome: Outcome::Rewrite { input },
+        }
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -493,6 +572,249 @@ async fn an_oversized_reply_is_denied_and_serving_continues() {
         peer.json().await.expect("a health reply"),
         json!({"jsonrpc": "2.0", "id": 61, "result": null})
     );
+
+    drop(peer.wire);
+    let outcome = finish(peer.task).await.expect("serve stops");
+    assert!(matches!(outcome, Err(ServeError::Closed)));
+}
+
+#[tokio::test]
+async fn a_declared_control_need_returns_the_exact_tack_result() {
+    let mut peer = peer_with(CONTROL_NEED_PLUGIN, CALL_MS).expect("a peer");
+    peer.send(&control_hook(70)).await.expect("send the hook");
+
+    let request: Value = serde_json::from_str(&peer.read().await.expect("a control request line"))
+        .expect("a JSON frame");
+    assert_eq!(
+        request,
+        json!({
+            "kind": "control",
+            "id": 0,
+            "version": PROTOCOL_VERSION,
+            "call": "navigate",
+            "input": { "who": "x" },
+        })
+    );
+
+    let reply = TackReply::Control {
+        id: 0,
+        version: PROTOCOL_VERSION,
+        result: json!({ "url": "https://example.test/x" }),
+    };
+    peer.send(&serde_json::to_string(&reply).expect("a control reply"))
+        .await
+        .expect("send the control reply");
+
+    assert_eq!(
+        peer.reply().await.expect("the verdict"),
+        Reply::Hook {
+            id: 70,
+            outcome: Outcome::Rewrite {
+                input: json!({ "url": "https://example.test/x" }),
+            },
+        }
+    );
+
+    drop(peer.wire);
+    let outcome = finish(peer.task).await.expect("serve stops");
+    assert!(matches!(outcome, Err(ServeError::Closed)));
+}
+
+#[tokio::test]
+async fn an_undeclared_control_need_is_named_without_a_frame() {
+    let mut peer = peer_with(CONTROL_NO_NEED_PLUGIN, CALL_MS).expect("a peer");
+    peer.send(&control_hook(71)).await.expect("send the hook");
+
+    assert_eq!(
+        peer.reply().await.expect("the verdict"),
+        Reply::Error {
+            id: 71,
+            error: "capability".into(),
+            message: "capability control.call: no declared control need for navigate".into(),
+        }
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), peer.read())
+            .await
+            .is_err(),
+        "an undeclared need must not write a control frame"
+    );
+
+    drop(peer.wire);
+    let outcome = finish(peer.task).await.expect("serve stops");
+    assert!(matches!(outcome, Err(ServeError::Closed)));
+}
+
+#[tokio::test]
+async fn a_named_tack_control_error_becomes_the_hook_error() {
+    let mut peer = peer_with(CONTROL_NEED_PLUGIN, CALL_MS).expect("a peer");
+    peer.send(&control_hook(72)).await.expect("send the hook");
+
+    let request: Value = serde_json::from_str(&peer.read().await.expect("a control request line"))
+        .expect("a JSON frame");
+    assert_eq!(
+        request,
+        json!({
+            "kind": "control",
+            "id": 0,
+            "version": PROTOCOL_VERSION,
+            "call": "navigate",
+            "input": { "who": "x" },
+        })
+    );
+
+    let reply = TackReply::Error {
+        id: 0,
+        version: PROTOCOL_VERSION,
+        error: TackReplyError::DaemonError,
+        message: "navigate refused".to_owned(),
+    };
+    peer.send(&serde_json::to_string(&reply).expect("a control error"))
+        .await
+        .expect("send the control error");
+
+    assert_eq!(
+        peer.reply().await.expect("the verdict"),
+        Reply::Error {
+            id: 72,
+            error: "capability".into(),
+            message: "capability control.call: daemon_error: navigate refused".into(),
+        }
+    );
+
+    drop(peer.wire);
+    let outcome = finish(peer.task).await.expect("serve stops");
+    assert!(matches!(outcome, Err(ServeError::Closed)));
+}
+
+#[tokio::test]
+async fn a_control_reply_after_timeout_is_skipped_and_the_next_hook_is_served() {
+    let mut peer = peer_with(CONTROL_NEED_PLUGIN, CALL_MS).expect("a peer");
+    peer.send(&control_hook(73)).await.expect("send the hook");
+
+    // The peer reads the request but does not answer, so the control call
+    // reaches its deadline (CONTROL_TIMEOUT, below this hook's own budget).
+    assert_eq!(
+        serde_json::from_str::<Value>(&peer.read().await.expect("a control request line"))
+            .expect("a JSON frame"),
+        json!({
+            "kind": "control",
+            "id": 0,
+            "version": PROTOCOL_VERSION,
+            "call": "navigate",
+            "input": { "who": "x" },
+        })
+    );
+
+    assert_eq!(
+        tokio::time::timeout(WAIT, peer.reply())
+            .await
+            .expect("the control call times out with a verdict")
+            .expect("a verdict"),
+        Reply::Error {
+            id: 73,
+            error: "capability".into(),
+            message: "capability control.call: control call timed out".into(),
+        }
+    );
+
+    // The peer's answer arrives after the pending call was already cleared.
+    let late = TackReply::Control {
+        id: 0,
+        version: PROTOCOL_VERSION,
+        result: json!({ "url": "https://example.test/late" }),
+    };
+    peer.send(&serde_json::to_string(&late).expect("a late control reply"))
+        .await
+        .expect("send the late control reply");
+
+    // A real hook after that stale line still gets its exact verdict.
+    peer.send(&control_hook(74))
+        .await
+        .expect("send the next hook");
+    assert_eq!(
+        serde_json::from_str::<Value>(&peer.read().await.expect("a control request line"))
+            .expect("a JSON frame"),
+        json!({
+            "kind": "control",
+            "id": 1,
+            "version": PROTOCOL_VERSION,
+            "call": "navigate",
+            "input": { "who": "x" },
+        })
+    );
+    let next = TackReply::Control {
+        id: 1,
+        version: PROTOCOL_VERSION,
+        result: json!({ "url": "https://example.test/next" }),
+    };
+    peer.send(&serde_json::to_string(&next).expect("a control reply"))
+        .await
+        .expect("send the control reply");
+
+    assert_eq!(
+        peer.reply().await.expect("the next verdict"),
+        Reply::Hook {
+            id: 74,
+            outcome: Outcome::Rewrite {
+                input: json!({ "url": "https://example.test/next" }),
+            },
+        }
+    );
+
+    drop(peer.wire);
+    let outcome = finish(peer.task).await.expect("serve stops");
+    assert!(matches!(outcome, Err(ServeError::Closed)));
+}
+
+#[tokio::test]
+async fn a_late_control_envelope_with_another_id_is_skipped_and_the_next_hook_is_served() {
+    let mut peer = peer_with(CONTROL_NEED_PLUGIN, CALL_MS).expect("a peer");
+    peer.send(&control_hook(75)).await.expect("send the hook");
+
+    assert_eq!(
+        serde_json::from_str::<Value>(&peer.read().await.expect("a control request line"))
+            .expect("a JSON frame"),
+        json!({
+            "kind": "control",
+            "id": 0,
+            "version": PROTOCOL_VERSION,
+            "call": "navigate",
+            "input": { "who": "x" },
+        })
+    );
+    let first = TackReply::Control {
+        id: 0,
+        version: PROTOCOL_VERSION,
+        result: json!({ "url": "https://example.test/first" }),
+    };
+    peer.send(&serde_json::to_string(&first).expect("a control reply"))
+        .await
+        .expect("send the control reply");
+    assert_eq!(
+        peer.reply().await.expect("the verdict"),
+        Reply::Hook {
+            id: 75,
+            outcome: Outcome::Rewrite {
+                input: json!({ "url": "https://example.test/first" }),
+            },
+        }
+    );
+
+    // A second control envelope whose id no pending call is waiting for.
+    let stray = TackReply::Control {
+        id: 42,
+        version: PROTOCOL_VERSION,
+        result: json!({ "url": "https://example.test/stray" }),
+    };
+    peer.send(&serde_json::to_string(&stray).expect("a stray control line"))
+        .await
+        .expect("send the stray control line");
+
+    let rewrite = json!({ "url": "https://example.test/second" });
+    assert_next_hook_verdict(&mut peer, 76, rewrite)
+        .await
+        .expect("the next hook verdict");
 
     drop(peer.wire);
     let outcome = finish(peer.task).await.expect("serve stops");

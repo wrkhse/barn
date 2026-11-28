@@ -46,6 +46,8 @@ const MAX_EXIT_DRAIN_BYTES: usize = 64 * 1024;
 const EXIT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const HOST_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+/// The only control-frame version barn brokers today.
+const CONTROL_VERSION: u64 = 1;
 const HOST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const DENY_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const TOKEN_BYTES: usize = 32;
@@ -773,6 +775,24 @@ impl RunningStall {
         rx: &mut StallReceiver,
     ) -> Result<()> {
         broker_host_frame(host, stall, rx, HOST_REPLY_TIMEOUT).await
+    }
+
+    /// Brokers one stall-originated control frame while the host is idle.
+    ///
+    /// The request and the host's reply travel unchanged: only their generic
+    /// envelope is read. Both connections stay open for later frames.
+    ///
+    /// # Errors
+    /// Returns a named denial for a lost peer, a stalled or malformed reply,
+    /// else the failing I/O stage.
+    pub async fn serve_stall_control(
+        &self,
+        host: &mut BufReader<UnixStream>,
+        stall: &mut StallWriter,
+        request: &[u8],
+        id: u64,
+    ) -> Result<()> {
+        broker_stall_control(host, stall, request, id, HOST_REPLY_TIMEOUT).await
     }
 
     /// Accepts a connection from the child and responds to its start request.
@@ -1531,6 +1551,120 @@ async fn deny_body_cap(
     }
 }
 
+/// The id of a stall-originated control request, or `None` for any other
+/// line. Only the envelope is read; `call` and `input` are never interpreted.
+#[must_use]
+pub fn stall_control_request(line: &[u8]) -> Option<u64> {
+    let request: Value = serde_json::from_slice(line).ok()?;
+
+    if request.get("kind").and_then(Value::as_str) != Some("control")
+        || request.get("version").and_then(Value::as_u64) != Some(CONTROL_VERSION)
+        || request.get("call").and_then(Value::as_str).is_none()
+        || request.get("input").is_none()
+    {
+        return None;
+    }
+
+    request.get("id").and_then(Value::as_u64)
+}
+
+/// Whether a host line replies to the control request `id`.
+///
+/// A control reply carries a `result`; an error reply carries string `error`
+/// and `message`. Both echo the id and version. Barn's own framed replies,
+/// which use `type`, do not match.
+#[must_use]
+pub fn stall_control_reply(line: &[u8], id: u64) -> bool {
+    let Ok(reply) = serde_json::from_slice::<Value>(line) else {
+        return false;
+    };
+
+    if reply.get("id").and_then(Value::as_u64) != Some(id)
+        || reply.get("version").and_then(Value::as_u64) != Some(CONTROL_VERSION)
+    {
+        return false;
+    }
+
+    match reply.get("kind").and_then(Value::as_str) {
+        Some("control") => reply.get("result").is_some(),
+        Some("error") => {
+            reply.get("error").and_then(Value::as_str).is_some()
+                && reply.get("message").and_then(Value::as_str).is_some()
+        }
+        _ => false,
+    }
+}
+
+/// Forwards one stall-originated control frame to the host and returns the
+/// host's reply to the stall, with every step bounded by one shared `limit`.
+///
+/// The request and reply bytes travel unchanged: only their envelope is read.
+/// A reply that does not echo the request is denied as `bad frame` on the host.
+///
+/// # Errors
+/// Returns a named denial for a lost peer, a stalled or malformed reply, else
+/// the failing I/O stage.
+pub async fn broker_stall_control(
+    host: &mut BufReader<UnixStream>,
+    stall: &mut StallWriter,
+    request: &[u8],
+    id: u64,
+    limit: Duration,
+) -> Result<()> {
+    let deadline = TokioInstant::now()
+        .checked_add(limit)
+        .unwrap_or_else(TokioInstant::now);
+    let echoed = Value::from(id);
+
+    let sent = timeout_at(deadline, host.write_all(request)).await;
+
+    if !matches!(sent, Ok(Ok(()))) {
+        return refuse(host, &echoed, HostDeny::StalledReply, DENY_WRITE_TIMEOUT).await;
+    }
+
+    let reply = match timeout_at(deadline, read_line_bounded(host)).await {
+        Ok(Ok(reply)) => reply,
+        Ok(Err(_)) => return refuse(host, &echoed, HostDeny::BadFrame, DENY_WRITE_TIMEOUT).await,
+        Err(_) => return refuse(host, &echoed, HostDeny::StalledReply, DENY_WRITE_TIMEOUT).await,
+    };
+    deny_body_cap(host, &reply, &echoed).await?;
+
+    if !stall_control_reply(&reply, id) {
+        return refuse(host, &echoed, HostDeny::BadFrame, DENY_WRITE_TIMEOUT).await;
+    }
+
+    let sent = timeout_at(deadline, stall.write_all(&reply)).await;
+
+    if !matches!(sent, Ok(Ok(()))) {
+        return refuse(host, &echoed, HostDeny::StalledReply, DENY_WRITE_TIMEOUT).await;
+    }
+
+    Ok(())
+}
+
+fn trace_host_reply_wait(
+    id: &Value,
+    reply: &std::result::Result<Option<StallEvent>, tokio::time::error::Elapsed>,
+) {
+    match reply {
+        Ok(Some(StallEvent::Line(_))) => {
+            trace_stall_event(|| format!("host reply wait done: id={id} outcome=Line"));
+        }
+        Ok(Some(event)) => trace_stall_event(|| {
+            format!(
+                "host reply wait done: id={id} outcome={}",
+                stall_event_kind(event)
+            )
+        }),
+        Ok(None) => {
+            trace_stall_event(|| format!("host reply wait done: id={id} outcome=None"));
+        }
+        Err(_) => {
+            trace_stall_event(|| format!("host reply wait done: id={id} outcome=timeout"));
+        }
+    }
+}
+
 /// Forwards one host frame to the stall and copies its reply back, with every
 /// forwarding step bounded by `limit` and every denial by `DENY_WRITE_TIMEOUT`.
 async fn broker_host_frame(
@@ -1568,37 +1702,37 @@ async fn broker_host_frame(
     }
 
     trace_stall_event(|| format!("host reply wait start: id={id}"));
-    let reply = timeout(limit, rx.recv()).await;
-    match &reply {
-        Ok(Some(StallEvent::Line(_))) => {
-            trace_stall_event(|| format!("host reply wait done: id={id} outcome=Line"));
+    // One deadline bounds the whole wait: a stall that floods control frames
+    // cannot renew the time it has to answer the host's request.
+    let deadline = TokioInstant::now()
+        .checked_add(limit)
+        .unwrap_or_else(TokioInstant::now);
+    let line = loop {
+        let reply = timeout_at(deadline, rx.recv()).await;
+        trace_host_reply_wait(&id, &reply);
+        let line = match reply {
+            Ok(Some(StallEvent::Line(line))) => line,
+            // An over-cap reply keeps its named reason; the other terminal
+            // events, and a vanished reader, are a lost peer.
+            Ok(Some(StallEvent::Oversize)) => {
+                return refuse(host, &id, HostDeny::OversizeFrame, DENY_WRITE_TIMEOUT).await;
+            }
+            Ok(_) => {
+                return refuse(host, &id, HostDeny::PeerLoss, DENY_WRITE_TIMEOUT).await;
+            }
+            Err(_) => {
+                return refuse(host, &id, HostDeny::StalledReply, DENY_WRITE_TIMEOUT).await;
+            }
+        };
+        if let Some(control_id) = stall_control_request(&line) {
+            let remaining = deadline.saturating_duration_since(TokioInstant::now());
+
+            broker_stall_control(host, stall, &line, control_id, remaining).await?;
+
+            continue;
         }
-        Ok(Some(event)) => trace_stall_event(|| {
-            format!(
-                "host reply wait done: id={id} outcome={}",
-                stall_event_kind(event)
-            )
-        }),
-        Ok(None) => {
-            trace_stall_event(|| format!("host reply wait done: id={id} outcome=None"));
-        }
-        Err(_) => {
-            trace_stall_event(|| format!("host reply wait done: id={id} outcome=timeout"));
-        }
-    }
-    let line = match reply {
-        Ok(Some(StallEvent::Line(line))) => line,
-        // An over-cap reply keeps its named reason; the other terminal
-        // events, and a vanished reader, are a lost peer.
-        Ok(Some(StallEvent::Oversize)) => {
-            return refuse(host, &id, HostDeny::OversizeFrame, DENY_WRITE_TIMEOUT).await;
-        }
-        Ok(_) => {
-            return refuse(host, &id, HostDeny::PeerLoss, DENY_WRITE_TIMEOUT).await;
-        }
-        Err(_) => {
-            return refuse(host, &id, HostDeny::StalledReply, DENY_WRITE_TIMEOUT).await;
-        }
+
+        break line;
     };
     if !answers_request(&line, &id) {
         return refuse(host, &id, HostDeny::BadFrame, DENY_WRITE_TIMEOUT).await;
@@ -3933,6 +4067,54 @@ mod tests {
         .await
         .expect("host reply within the deadline")
         .expect("read host reply");
+        assert_eq!(received, reply.to_vec());
+    }
+
+    #[tokio::test]
+    async fn serve_stall_control_forwards_one_control_frame_and_returns_the_exact_reply() {
+        // This spawns an idle child, so it runs in CI only.
+        if std::env::var_os("CI").is_none() {
+            return;
+        }
+
+        let stall = idle_stall_for_brokering();
+        let (host_barn, mut host_peer) = UnixStream::pair().expect("host pair");
+        let (stall_barn, mut stall_peer) = UnixStream::pair().expect("stall pair");
+        let (stall_read, mut stall_writer) = stall_barn.into_split();
+        let _rx = spawn_stall_reader(stall_read);
+        let mut host = BufReader::new(host_barn);
+        let request =
+            b"{\"kind\":\"control\",\"id\":9,\"version\":1,\"call\":\"do.thing\",\"input\":{}}\n";
+        let reply = b"{\"kind\":\"control\",\"id\":9,\"version\":1,\"result\":{\"ok\":true}}\n";
+        let mut forwarded = Vec::new();
+
+        let exchange = async {
+            BufReader::new(&mut host_peer)
+                .read_until(b'\n', &mut forwarded)
+                .await
+                .expect("forwarded request");
+            host_peer.write_all(reply).await.expect("control reply");
+        };
+        let (served, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                stall.serve_stall_control(&mut host, &mut stall_writer, request, 9),
+                exchange
+            )
+        })
+        .await
+        .expect("broker and peers finish within the deadline");
+
+        assert!(matches!(served, Ok(())));
+        assert_eq!(forwarded, request.to_vec());
+
+        let mut received = Vec::new();
+        timeout(
+            Duration::from_secs(1),
+            BufReader::new(&mut stall_peer).read_until(b'\n', &mut received),
+        )
+        .await
+        .expect("stall reply within the deadline")
+        .expect("read stall reply");
         assert_eq!(received, reply.to_vec());
     }
 

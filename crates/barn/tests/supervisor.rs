@@ -15,11 +15,13 @@ use barn::supervisor::{HealthCheck, HealthDecision, HealthTracker};
 use barn::supervisor::{HostDeny, HostEndpoint, RunningStall};
 use barn::supervisor::{RestartDecision, RestartOutcome, RestartPolicy};
 use barn::supervisor::{StallSpec, Supervisor, SupervisorError, spawn_stall_reader};
+use barn::supervisor::{broker_stall_control, stall_control_reply, stall_control_request};
 use barn_stall::Job;
 use barn_stall::protocol::{deny, method};
 use serde_json::{Value, json};
 use std::ffi::OsStr;
 use tokio::io::BufReader as AsyncBufReader;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream as AsyncUnixStream;
 use tokio::time::timeout;
 
@@ -839,4 +841,164 @@ fn broker_stall_fixture() {
         .expect("read the framed request");
     assert_eq!(request, format!("{HOST_REQUEST}\n"));
     writeln!(client.get_mut(), "{HOST_REPLY}").expect("send the framed reply");
+}
+
+#[test]
+fn a_stall_control_request_accepts_only_a_version_one_control_envelope() {
+    let accepted = br#"{"kind":"control","id":21,"version":1,"call":"do.thing","input":{}}"#;
+
+    assert_eq!(stall_control_request(accepted), Some(21));
+
+    let rejected: [&[u8]; 4] = [
+        br#"{"kind":"other","id":21,"version":1,"call":"do.thing","input":{}}"#,
+        br#"{"kind":"control","id":21,"version":2,"call":"do.thing","input":{}}"#,
+        br#"{"kind":"control","id":"21","version":1,"call":"do.thing","input":{}}"#,
+        b"not JSON",
+    ];
+
+    for line in rejected {
+        assert_eq!(stall_control_request(line), None, "{line:?}");
+    }
+}
+
+#[test]
+fn a_stall_control_request_with_a_missing_guard_is_ignored() {
+    let without_call = br#"{"kind":"control","id":21,"version":1,"input":{}}"#;
+    let without_input = br#"{"kind":"control","id":21,"version":1,"call":"do.thing"}"#;
+    let string_id = br#"{"kind":"control","id":"21","version":1,"call":"do.thing","input":{}}"#;
+    let null_id = br#"{"kind":"control","id":null,"version":1,"call":"do.thing","input":{}}"#;
+    let absent_id = br#"{"kind":"control","version":1,"call":"do.thing","input":{}}"#;
+
+    assert_eq!(stall_control_request(without_call), None);
+    assert_eq!(stall_control_request(without_input), None);
+    assert_eq!(stall_control_request(string_id), None);
+    assert_eq!(stall_control_request(null_id), None);
+    assert_eq!(stall_control_request(absent_id), None);
+}
+
+#[test]
+fn a_stall_control_reply_must_echo_the_id_and_version() {
+    let result = br#"{"kind":"control","id":21,"version":1,"result":{"ok":true}}"#;
+    let error = br#"{"kind":"error","id":21,"version":1,"error":"denied","message":"no"}"#;
+
+    assert!(stall_control_reply(result, 21));
+    assert!(stall_control_reply(error, 21));
+
+    let rejected: [&[u8]; 3] = [
+        br#"{"kind":"control","id":22,"version":1,"result":null}"#,
+        br#"{"kind":"control","id":21,"version":2,"result":null}"#,
+        br#"{"type":"hook","id":21,"version":1,"result":null}"#,
+    ];
+
+    for line in rejected {
+        assert!(!stall_control_reply(line, 21), "{line:?}");
+    }
+}
+
+#[test]
+fn a_stall_control_error_reply_needs_both_error_and_message() {
+    let only_error = br#"{"kind":"error","id":21,"version":1,"error":"denied"}"#;
+    let only_message = br#"{"kind":"error","id":21,"version":1,"message":"no"}"#;
+
+    assert!(!stall_control_reply(only_error, 21));
+    assert!(!stall_control_reply(only_message, 21));
+}
+
+#[test]
+fn a_stall_control_reply_with_a_different_id_is_rejected() {
+    let duplicate = br#"{"kind":"control","id":22,"version":1,"result":{"ok":true}}"#;
+
+    assert!(!stall_control_reply(duplicate, 21));
+}
+
+#[tokio::test]
+async fn a_stall_control_frame_is_forwarded_and_its_exact_reply_returned() {
+    let request = br#"{"kind":"control","id":21,"version":1,"call":"do.thing","input":{}}
+"#;
+    let reply = br#"{"kind":"control","id":21,"version":1,"result":{"ok":true}}
+"#;
+    let (host_barn, host_peer) = AsyncUnixStream::pair().expect("host pair");
+    let (stall_barn, stall_peer) = AsyncUnixStream::pair().expect("stall pair");
+    let mut host = AsyncBufReader::new(host_barn);
+    let (_stall_read, mut stall_writer) = stall_barn.into_split();
+
+    let host_side = async {
+        let mut peer = host_peer;
+        let mut forwarded = vec![0; request.len()];
+        peer.read_exact(&mut forwarded)
+            .await
+            .expect("forwarded request");
+        assert_eq!(forwarded.as_slice(), &request[..]);
+        peer.write_all(reply).await.expect("host reply");
+    };
+    let stall_side = async {
+        let mut peer = stall_peer;
+        let mut returned = vec![0; reply.len()];
+        peer.read_exact(&mut returned)
+            .await
+            .expect("returned reply");
+        assert_eq!(returned.as_slice(), &reply[..]);
+    };
+
+    let (brokered, (), ()) = tokio::join!(
+        broker_stall_control(
+            &mut host,
+            &mut stall_writer,
+            request,
+            21,
+            Duration::from_secs(2)
+        ),
+        host_side,
+        stall_side
+    );
+
+    brokered.expect("control frame brokered");
+}
+
+#[tokio::test]
+async fn a_non_matching_control_reply_is_denied_as_a_bad_frame() {
+    let request = br#"{"kind":"control","id":21,"version":1,"call":"do.thing","input":{}}
+"#;
+    let wrong = br#"{"kind":"control","id":22,"version":1,"result":null}
+"#;
+    let (host_barn, host_peer) = AsyncUnixStream::pair().expect("host pair");
+    let (stall_barn, _stall_peer) = AsyncUnixStream::pair().expect("stall pair");
+    let mut host = AsyncBufReader::new(host_barn);
+    let (_stall_read, mut stall_writer) = stall_barn.into_split();
+
+    let host_side = async {
+        let mut peer = host_peer;
+        let mut forwarded = vec![0; request.len()];
+        peer.read_exact(&mut forwarded)
+            .await
+            .expect("forwarded request");
+        assert_eq!(forwarded.as_slice(), &request[..]);
+        peer.write_all(wrong).await.expect("non-matching reply");
+
+        let mut reader = AsyncBufReader::new(peer);
+        let mut line = Vec::new();
+        timeout(Duration::from_secs(2), reader.read_until(b'\n', &mut line))
+            .await
+            .expect("deny within the deadline")
+            .expect("read deny");
+        line
+    };
+
+    let (brokered, denial) = tokio::join!(
+        broker_stall_control(
+            &mut host,
+            &mut stall_writer,
+            request,
+            21,
+            Duration::from_secs(2)
+        ),
+        host_side
+    );
+
+    assert!(matches!(
+        brokered,
+        Err(SupervisorError::HostDenied(HostDeny::BadFrame))
+    ));
+    let denial: Value = serde_json::from_slice(&denial).expect("deny JSON");
+    assert_denied(&denial, deny::BAD_FRAME);
 }

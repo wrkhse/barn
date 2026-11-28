@@ -108,6 +108,7 @@ dependencies = [
  "barn-luau",
  "barn-stall",
  "serde_json",
+ "tack_protocol",
  "tokio",
 ]
 
@@ -1416,6 +1417,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "tack_protocol"
+version = "0.1.0-rc.6"
+source = "git+https://github.com/wrkhse/tack?rev=b23115dfffe5d8ae76b918ee3b6df5b3f197a1eb#b23115dfffe5d8ae76b918ee3b6df5b3f197a1eb"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
