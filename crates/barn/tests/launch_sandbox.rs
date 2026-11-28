@@ -130,6 +130,8 @@ impl Launch {
                 .arg(&self.plugin)
                 .args(["--daemon-pid", &std::process::id().to_string()])
                 .env("BARN_STATE_DIR", &self.state)
+                .env("RUST_BACKTRACE", "1")
+                .env("BARN_TEST_TRACE", "1")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn(),
@@ -410,6 +412,45 @@ fn read_line(reader: &mut impl BufRead) -> String {
     line
 }
 
+/// Abort every live stall so a failed health read's SIGABRT lands in barn's
+/// captured stderr with a backtrace, then fail with a named reason.
+fn abort_stalls_and_panic(pids: &[u32], reason: &str) {
+    for pid in pids {
+        eprintln!("HOST TRACE health read failure: {reason}; aborting stall {pid}");
+        let _ = Command::new("kill")
+            .args(["-ABRT", &pid.to_string()])
+            .status();
+    }
+    must_res(
+        Err::<(), _>(io::Error::other(format!(
+            "stalls {pids:?} aborted: {reason}"
+        ))),
+        "stall abort",
+    );
+}
+
+/// On a failed or closed health reply read, abort the stall and fail the test.
+/// The pids are resolved at failure time, so the normal path keeps its order.
+fn read_line_with_stall_abort(
+    reader: &mut impl BufRead,
+    stall_pids: impl FnOnce() -> Vec<u32>,
+) -> String {
+    let mut line = String::new();
+
+    let failure = match reader.read_line(&mut line) {
+        Ok(0) => Some("the health socket closed before a reply".to_owned()),
+        Ok(_) => None,
+        Err(error) => Some(format!("health read failed: {error}")),
+    };
+
+    if let Some(reason) = failure {
+        let pids = stall_pids();
+        abort_stalls_and_panic(&pids, &reason);
+    }
+
+    line
+}
+
 fn parse(line: &str) -> Value {
     must_res(serde_json::from_str(line), "one JSON line")
 }
@@ -430,13 +471,10 @@ fn connect(socket: &str) -> BufReader<UnixStream> {
     BufReader::new(stream)
 }
 
-#[test]
-fn a_launched_stall_serves_one_host_connection_then_exits_cleanly() {
-    if std::env::var_os("CI").is_none() {
-        return;
-    }
-
-    let mut launch = Launch::new().expect("the scratch tree");
+/// Spawn barn, open its host socket, and complete the host.start handshake.
+/// Both startup tests share this prefix; keeping it here leaves their
+/// differing health and trace checks readable and under the line limit.
+fn start_and_start_host(launch: &mut Launch) -> BufReader<UnixStream> {
     let line = launch.spawn();
     let (socket, token) = launch.endpoint(&line);
     let mut host = connect(&socket);
@@ -451,7 +489,7 @@ fn a_launched_stall_serves_one_host_connection_then_exits_cleanly() {
             pid: std::process::id(),
         },
     });
-    writeln!(host.get_mut(), "{start}").expect("send host.start");
+    must_res(writeln!(host.get_mut(), "{start}"), "send host.start");
 
     assert_eq!(
         parse(&read_line(&mut host)),
@@ -462,16 +500,40 @@ fn a_launched_stall_serves_one_host_connection_then_exits_cleanly() {
         })
     );
 
+    host
+}
+
+#[test]
+fn a_launched_stall_serves_one_host_connection_then_exits_cleanly() {
+    if std::env::var_os("CI").is_none() {
+        return;
+    }
+
+    let mut launch = Launch::new().expect("the scratch tree");
+    let t0 = Instant::now();
+    let mut host = start_and_start_host(&mut launch);
+    eprintln!("HOST TRACE connect {:?}", t0.elapsed());
+    eprintln!("HOST TRACE reader-ready-check {:?}", t0.elapsed());
+
     let health = json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": method::STALL_HEALTH,
     });
+    eprintln!("HOST TRACE health-send {:?}", t0.elapsed());
     writeln!(host.get_mut(), "{health}").expect("send stall.health");
+    eprintln!("HOST TRACE health-written {:?}", t0.elapsed());
 
+    eprintln!("HOST TRACE health-reply-wait {:?}", t0.elapsed());
+    let health_reply = parse(&read_line_with_stall_abort(&mut host, || {
+        launch.stall_pids()
+    }));
+    eprintln!("HOST TRACE health-reply-got {:?}", t0.elapsed());
     assert_eq!(
-        parse(&read_line(&mut host)),
-        json!({"jsonrpc": "2.0", "id": 1, "result": null})
+        health_reply,
+        json!({"jsonrpc": "2.0", "id": 1, "result": null}),
+        "{}",
+        launch.failure("stall.health reply")
     );
 
     // One connection owns the launch: the real stall is live while the host
@@ -485,6 +547,85 @@ fn a_launched_stall_serves_one_host_connection_then_exits_cleanly() {
         launch.failure("one stall serves the host before it closes")
     );
     let stall_pid = running.first().copied().expect("one stall pid");
+    eprintln!("HOST TRACE stall-pid {:?} {stall_pid}", t0.elapsed());
+
+    drop(host);
+
+    let status = launch.wait_exit();
+    eprintln!("HOST TRACE exit {:?}", t0.elapsed());
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "{}",
+        launch.failure("barn exits zero after its host closes")
+    );
+    assert!(
+        launch.wait_stall_gone(stall_pid),
+        "{}",
+        launch.failure(&format!("stall {stall_pid} is gone"))
+    );
+
+    launch.cleanup();
+    assert!(
+        launch.stall_pids().is_empty(),
+        "{}",
+        launch.failure("no stall process is left behind")
+    );
+}
+
+#[test]
+fn trace_records_a_health_round_trip() {
+    if std::env::var_os("CI").is_none() {
+        return;
+    }
+
+    let mut launch = Launch::new().expect("the scratch tree");
+    let mut host = start_and_start_host(&mut launch);
+
+    let running = launch.stall_pids();
+    assert_eq!(
+        running.len(),
+        1,
+        "{}",
+        launch.failure("one stall serves the host before it closes")
+    );
+    let stall_pid = running.first().copied().expect("one stall pid");
+
+    let health = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method::STALL_HEALTH,
+    });
+    writeln!(host.get_mut(), "{health}").expect("send stall.health");
+    assert_eq!(
+        parse(&read_line_with_stall_abort(&mut host, || launch.stall_pids())),
+        json!({"jsonrpc": "2.0", "id": 1, "result": null}),
+        "{}",
+        launch.failure("stall.health reply")
+    );
+
+    let stderr = launch.stderr();
+    let messages: Vec<&str> = stderr
+        .lines()
+        .filter_map(|line| line.split_once("] ").map(|(_, message)| message))
+        .collect();
+    assert!(
+        !messages.is_empty(),
+        "{}",
+        launch.failure("barn emitted no stall-event trace lines")
+    );
+    for expected in [
+        "host reply wait start: id=1",
+        "host reply wait done: id=1 outcome=Line",
+        "recv start: waiting for event",
+        "channel created cap=2",
+        "send start: kind=Line",
+    ] {
+        assert!(
+            messages.contains(&expected),
+            "{expected} missing from {messages:?}; stderr: {stderr}"
+        );
+    }
 
     drop(host);
 
