@@ -232,13 +232,10 @@ fn wires() -> Result<Vec<Value>, serde_json::Error> {
 
 /// Send the next hook, answer its second control call with `input`, and check
 /// the stall rewrites with exactly that value.
-async fn assert_next_hook_verdict(peer: &mut Peer, id: u64, input: Value) {
-    peer.send(&control_hook(id))
-        .await
-        .expect("send the next hook");
+async fn assert_next_hook_verdict(peer: &mut Peer, id: u64, input: Value) -> Result<(), BoxError> {
+    peer.send(&control_hook(id)).await?;
     assert_eq!(
-        serde_json::from_str::<Value>(&peer.read().await.expect("a control request line"))
-            .expect("a JSON frame"),
+        serde_json::from_str::<Value>(&peer.read().await?)?,
         json!({
             "kind": "control",
             "id": 1,
@@ -252,16 +249,15 @@ async fn assert_next_hook_verdict(peer: &mut Peer, id: u64, input: Value) {
         version: PROTOCOL_VERSION,
         result: input.clone(),
     };
-    peer.send(&serde_json::to_string(&control).expect("a control reply"))
-        .await
-        .expect("send the control reply");
+    peer.send(&serde_json::to_string(&control)?).await?;
     assert_eq!(
-        peer.reply().await.expect("the next verdict"),
+        peer.reply().await?,
         Reply::Hook {
             id,
             outcome: Outcome::Rewrite { input },
         }
     );
+    Ok(())
 }
 
 #[tokio::test]
@@ -816,7 +812,9 @@ async fn a_late_control_envelope_with_another_id_is_skipped_and_the_next_hook_is
         .expect("send the stray control line");
 
     let rewrite = json!({ "url": "https://example.test/second" });
-    assert_next_hook_verdict(&mut peer, 76, rewrite).await;
+    assert_next_hook_verdict(&mut peer, 76, rewrite)
+        .await
+        .expect("the next hook verdict");
 
     drop(peer.wire);
     let outcome = finish(peer.task).await.expect("serve stops");
