@@ -29,6 +29,7 @@ const THROW_REASON: &str = "hook handler threw";
 const TIMEOUT_REASON: &str = "hook handler budget exceeded";
 const DEADLINE_REASON: &str = "sandbox deadline exceeded";
 const MEMORY_REASON: &str = "sandbox memory limit";
+#[cfg(test)]
 const POISON_REASON: &str = "sandbox poisoned";
 const TOO_DEEP_REASON: &str = "value too deep";
 const TOO_LARGE_REASON: &str = "value too large";

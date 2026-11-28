@@ -205,12 +205,11 @@ pub(super) fn decode_hook_table(
         }
         LuaValue::Table(table) => {
             let run = table.raw_get::<LuaValue>("run")?;
-            match &run {
-                LuaValue::Nil => decode_array(&table, default_budget_ms),
-                _ => {
-                    let handler = decode_handler(&table, &run, default_budget_ms)?;
-                    HookTable::new(vec![handler])
-                }
+            if matches!(&run, LuaValue::Nil) {
+                decode_array(&table, default_budget_ms)
+            } else {
+                let handler = decode_handler(&table, &run, default_budget_ms)?;
+                HookTable::new(vec![handler])
             }
         }
         other => Err(invalid("hook", "a function or table", &other)),
