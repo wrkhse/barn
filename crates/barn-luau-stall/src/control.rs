@@ -41,9 +41,9 @@ pub struct ControlBridge {
 }
 
 /// The shape of a framed reply this bridge accepts.
-enum ReplyShape<'a> {
-    Control(&'a Value),
-    Error(&'a str, &'a str),
+enum ReplyShape {
+    Control(Value),
+    Error(String, String),
 }
 
 impl ControlBridge {
@@ -103,7 +103,7 @@ impl ControlBridge {
 }
 
 /// Read a reply shape only when it answers `id` at this protocol version.
-fn reply_shape(frame: &[u8], id: u64) -> Option<ReplyShape<'_>> {
+fn reply_shape(frame: &[u8], id: u64) -> Option<ReplyShape> {
     let value: Value = serde_json::from_slice(frame).ok()?;
 
     if value.get("id").and_then(Value::as_u64) != Some(id) {
@@ -114,10 +114,10 @@ fn reply_shape(frame: &[u8], id: u64) -> Option<ReplyShape<'_>> {
     }
 
     match value.get("kind").and_then(Value::as_str)? {
-        "control" => Some(ReplyShape::Control(value.get("result")?)),
+        "control" => Some(ReplyShape::Control(value.get("result")?.clone())),
         "error" => Some(ReplyShape::Error(
-            value.get("error").and_then(Value::as_str)?,
-            value.get("message").and_then(Value::as_str)?,
+            value.get("error").and_then(Value::as_str)?.to_owned(),
+            value.get("message").and_then(Value::as_str)?.to_owned(),
         )),
         _ => None,
     }
@@ -137,7 +137,7 @@ pub fn is_control_reply(frame: &[u8], id: u64) -> bool {
 /// call, or the peer's error and message joined with a colon for a named error.
 pub fn decode_control_reply(frame: &[u8], id: u64) -> Result<Value, String> {
     match reply_shape(frame, id) {
-        Some(ReplyShape::Control(result)) => Ok(result.clone()),
+        Some(ReplyShape::Control(result)) => Ok(result),
         Some(ReplyShape::Error(error, message)) => Err(format!("{error}: {message}")),
         None => Err(REJECTED_REPLY.to_owned()),
     }
