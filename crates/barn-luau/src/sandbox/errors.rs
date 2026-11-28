@@ -156,7 +156,6 @@ mod tests {
             }
         );
         assert_eq!(rendered, format!("too many hook handlers: {MAX_HANDLERS}"));
-        assert!(!rendered.is_empty());
     }
 
     #[test]
