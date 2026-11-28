@@ -21,6 +21,11 @@ mod capabilities;
 mod clock;
 mod deadline;
 mod errors;
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "wired into Sandbox::hook in barn#73")
+)]
+mod hook_table;
 mod loading;
 mod outcome;
 #[cfg(test)]

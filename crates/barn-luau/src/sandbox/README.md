@@ -32,4 +32,5 @@ flowchart LR
   helpers, and capabilities.
 - `capabilities.rs`: host callbacks attached to the per-call context, with
   bounded value conversion and named errors.
+- `hook_table.rs`: the bounded hook-table engine and its contract tests.
 - `tests.rs`: the sandbox test suite, compiled only under `cfg(test)`.

@@ -4,6 +4,8 @@ use crate::require::RequireCause;
 
 pub(super) const MAX_DEPTH: usize = 16;
 pub(super) const MAX_ENTRIES: usize = 1024;
+#[cfg_attr(not(test), expect(dead_code, reason = "used by the hook table engine"))]
+pub const MAX_HANDLERS: usize = 64;
 
 /// Mirrors the stall protocol's `MAX_LINE_BYTES` (8 MiB): a reply larger than
 /// a frame can never be sent, so conversion stops before it grows that large.
@@ -16,6 +18,7 @@ pub enum LimitCause {
     Deadline,
     Memory,
     TooManyEntries { limit: usize },
+    TooManyHandlers { limit: usize },
     TooLarge { limit: usize },
     TooDeep { limit: usize },
 }
@@ -27,6 +30,9 @@ impl fmt::Display for LimitCause {
             Self::Memory => f.write_str("memory limit exceeded"),
             Self::TooManyEntries { limit } => {
                 write!(f, "too many table entries: {limit}")
+            }
+            Self::TooManyHandlers { limit } => {
+                write!(f, "too many hook handlers: {limit}")
             }
             Self::TooLarge { limit } => write!(f, "output exceeds {limit} bytes"),
             Self::TooDeep { limit } => write!(f, "nesting deeper than {limit}"),
@@ -119,6 +125,12 @@ mod tests {
             (
                 LimitCause::TooManyEntries { limit: MAX_ENTRIES },
                 format!("too many table entries: {MAX_ENTRIES}"),
+            ),
+            (
+                LimitCause::TooManyHandlers {
+                    limit: MAX_HANDLERS,
+                },
+                format!("too many hook handlers: {MAX_HANDLERS}"),
             ),
             (
                 LimitCause::TooDeep { limit: MAX_DEPTH },
