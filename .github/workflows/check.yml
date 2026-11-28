@@ -43,6 +43,7 @@ jobs:
       - run: cargo fmt --all -- --check
 
   clippy:
+    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -66,6 +67,7 @@ jobs:
       - run: cargo clippy -p barn --lib --no-default-features --locked -- -D warnings
 
   test:
+    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -109,6 +111,7 @@ jobs:
 
   # The same tests under Seatbelt, where stalls run on the owner's Macs.
   test-macos:
+    needs: [fmt]
     runs-on: macos-15
     timeout-minutes: 20
     steps:
@@ -200,6 +203,7 @@ jobs:
   # /usr/lib64. The policy test grants that library folder read and execute but
   # not write, and asserts a stall's write into it is refused.
   linux-nonddebian:
+    needs: [fmt]
     runs-on: ubuntu-latest
     container: fedora:latest
     timeout-minutes: 20
@@ -259,6 +263,7 @@ jobs:
   # Cargo.toml's rust-version, exactly. Today the pinned toolchain is the same
   # version, so this job states the floor a pin change would have to keep.
   msrv:
+    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -273,6 +278,7 @@ jobs:
       - run: cargo +1.100.0 check --workspace --all-targets --locked
 
   deny:
+    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -299,6 +305,7 @@ jobs:
   # an equivalent one is excluded in .cargo/mutants.toml, with why. The diff is
   # split across four shards; a push to main mutates the whole tree instead.
   mutants-shard:
+    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
@@ -389,7 +396,7 @@ jobs:
   # The required check: every shard succeeded and every outcome is clean. An
   # absent shard or a missed or timed-out mutant fails the gate.
   mutants:
-    needs: [mutants-shard]
+    needs: [fmt, mutants-shard]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -430,6 +437,7 @@ jobs:
   # The markdown a change adds: prettier and markdownlint, both pinned in
   # package-lock.json, installed with npm ci so CI runs what a person runs.
   docs:
+    needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -441,3 +449,234 @@ jobs:
           node-version: "24"
       - run: npm ci
       - run: npm run check
+
+  # Scripts AND prompt come from the base SHA via the pin; the YAML is editable
+  # by a same-repo PR. The manager's merge guard diff-checks every PR touching
+  # review workflows, .github/scripts, the prompt or required checks (owner
+  # decision, 11-28).
+  review:
+    needs: [fmt, clippy, test, msrv, deny, docs, mutants]
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PRIMARY_MODEL: opencode/deepseek-v4.1-flash-free
+      REVIEW_FALLBACK_MODEL: opencode-go/hy4-flash-free
+      REVIEW_TIMEOUT_SEC: 420
+      # Nobody answers prompts in CI, so nothing may ask. The reviewer only
+      # reads files in the checkout: no shell, no edits, no web.
+      OPENCODE_CONFIG_CONTENT: >-
+        {"small_model":"opencode-go/hy4-flash-free",
+        "agents":{"build":{"steps":150}},
+        "permission":{"read":"allow","bash":"deny","edit":"deny",
+        "external_directory":"deny","webfetch":"deny","websearch":"deny",
+        "question":"deny","doom_loop":"deny","grep":"deny","glob":"deny"}}
+    permissions:
+      id-token: write
+      contents: read
+      # Commenting and reacting on a pull request needs pull-requests: write.
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # A PR must not supply the scripts that judge it. The full fetch keeps
+      # the base tree local, so pinning needs no write credential on the remote.
+      - name: Pin review scripts to the base commit
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git cat-file -e "${BASE_SHA}^{commit}"
+          git checkout "${BASE_SHA}" -- .github/scripts
+          # Unchanged files come from the base SHA; only base-absent new files
+          # come from HEAD, each guard-checked by git cat-file.
+          for f in \
+            .github/scripts/review-prompt.txt \
+            .github/scripts/enforce-review-verdict.sh \
+            .github/scripts/enforce-review-verdict.jq \
+            .github/scripts/test-enforce-verdict.sh
+          do
+            git cat-file -e "$BASE_SHA:$f" 2>/dev/null || git checkout HEAD -- "$f"
+          done
+          git status --short -- .github/scripts
+      - name: Fetch PR metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: gh pr view "$PR" -R "$REPO" --json title,body,files > "$RUNNER_TEMP/pr.json"
+      # A title-only edit has no new commits. Carry forward only a posted
+      # MERGE AS IS for this exact head, base and body; a miss reviews fresh.
+      - name: Carry forward review on title edit
+        id: carry_forward
+        if: >-
+          github.event.action == 'edited' &&
+          github.event.changes.title &&
+          !github.event.changes.body &&
+          !github.event.changes.base
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_JSON: ${{ runner.temp }}/pr.json
+        shell: bash
+        run: bash .github/scripts/carry-forward.sh
+      - name: Sign in to OpenCode
+        if: steps.carry_forward.outputs.carried != 'true'
+        env:
+          AUDIENCE: https://opencode.ai/console
+          CLIENT_ID: ${{ secrets.OPENCODE_CLIENT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          oidc=$(curl -sSf --oauth2-bearer "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" | jq -re .value)
+          token=$(curl -sSf https://opencode.ai/console/auth/oauth/token \
+            -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+            -d subject_token_type=urn:ietf:params:oauth:token-type:jwt \
+            -d client_id="$CLIENT_ID" \
+            -d subject_token="$oidc" | jq -re .access_token)
+          echo "::add-mask::$token"
+          echo "OPENCODE_API_KEY=$token" >> "$GITHUB_ENV"
+      - name: Install opencode v1.19.6
+        if: steps.carry_forward.outputs.carried != 'true'
+        env:
+          SHA256: 47734e08968b30cc22a0bffb6d9feeed76ad4aa743213a12122040392d09a057
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=https://github.com/anomalyco/opencode/releases/download
+          dir="$RUNNER_TEMP/opencode"
+          mkdir -p "$dir"
+          curl -fsSL --retry 3 --max-time 300 -o "$dir/opencode.tgz" \
+            "$base/v1.19.6/opencode-linux-x64.tar.gz"
+          echo "$SHA256  $dir/opencode.tgz" | sha256sum -c -
+          tar -xzf "$dir/opencode.tgz" -C "$dir" opencode
+          rm "$dir/opencode.tgz"
+          echo "$dir" >> "$GITHUB_PATH"
+      # The reviewer gets no shell. The script writes the review material,
+      # capping each file at 2 MB and including at most 100 commits.
+      # Every cut is noted in NOTES.txt.
+      - name: Gather review material
+        if: steps.carry_forward.outputs.carried != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          PR_JSON: ${{ runner.temp }}/pr.json
+          CHANGED_FILES: ${{ runner.temp }}/changed-files.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          body_hash=$(PR_JSON="$PR_JSON" bash .github/scripts/pr-body-hash.sh)
+          echo "PR_BODY_HASH=$body_hash" >> "$GITHUB_ENV"
+          gh api "repos/$REPO/pulls/$PR" --jq .changed_files > "$CHANGED_FILES"
+          # Keep it out of git status, so the run never sees it as a change.
+          echo "/review-input/" >> .git/info/exclude
+          CHANGED_FILES="$CHANGED_FILES" bash .github/scripts/gather-review-input.sh
+      # Both attempts are bounded; the model has no GitHub access. The JSONL
+      # event stream is the reviewer's whole output; post-review.sh reads it.
+      - name: Write review prompt from base
+        if: steps.carry_forward.outputs.carried != 'true'
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -e "s#{{PR}}#$PR#g" -e "s#{{REPO}}#$REPO#g" \
+            .github/scripts/review-prompt.txt > "$RUNNER_TEMP/review-prompt.txt"
+      - name: Review (primary)
+        id: review_primary
+        if: steps.carry_forward.outputs.carried != 'true'
+        timeout-minutes: 8
+        env:
+          MODEL: ${{ env.PRIMARY_MODEL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          events="$RUNNER_TEMP/review-events.jsonl"
+          status=0
+          timeout --kill-after=10s "${REVIEW_TIMEOUT_SEC}s" \
+            opencode run --model "$MODEL" --variant low --format json \
+            < "$RUNNER_TEMP/review-prompt.txt" > "$events" || status=$?
+          if [ "$status" -eq 0 ] && [ -s "$events" ] && \
+             jq -es 'any(.[]; .type == "error") | not' "$events" > /dev/null && \
+             jq -es 'any(.[]; .type == "text" and ((.part.text // "") | contains("<!-- opencode-review -->")))' "$events" > /dev/null; then
+            echo "failed=false" >> "$GITHUB_OUTPUT"
+            echo "REVIEW_MODEL=$MODEL" >> "$GITHUB_ENV"
+          else
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Primary review with $MODEL failed (status $status); retrying once with $REVIEW_FALLBACK_MODEL."
+          fi
+      - name: Review (fallback)
+        id: review_fallback
+        if: >-
+          ${{ always() && steps.carry_forward.outputs.carried != 'true' &&
+          (steps.review_primary.outcome != 'success' ||
+           steps.review_primary.outputs.failed == 'true') }}
+        timeout-minutes: 8
+        env:
+          MODEL: ${{ env.REVIEW_FALLBACK_MODEL }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          events="$RUNNER_TEMP/review-events.jsonl"
+          status=0
+          timeout --kill-after=10s "${REVIEW_TIMEOUT_SEC}s" \
+            opencode run --model "$MODEL" --variant low --format json \
+            < "$RUNNER_TEMP/review-prompt.txt" > "$events" || status=$?
+          if [ "$status" -eq 0 ] && [ -s "$events" ] && \
+             jq -es 'any(.[]; .type == "error") | not' "$events" > /dev/null && \
+             jq -es 'any(.[]; .type == "text" and ((.part.text // "") | contains("<!-- opencode-review -->")))' "$events" > /dev/null; then
+            echo "failed=false" >> "$GITHUB_OUTPUT"
+            echo "REVIEW_MODEL=$MODEL" >> "$GITHUB_ENV"
+          else
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+            echo "::error::Primary and fallback reviews both failed (fallback status $status for $MODEL)."
+            exit 1
+          fi
+      # Posts the marker comment and inline review, then removes or
+      # minimizes earlier ones.
+      - name: Post review
+        if: >-
+          ${{ always() && steps.carry_forward.outputs.carried != 'true' &&
+          ((steps.review_primary.outcome == 'success' &&
+            steps.review_primary.outputs.failed == 'false') ||
+           (steps.review_fallback.outcome == 'success' &&
+            steps.review_fallback.outputs.failed == 'false')) }}
+        env:
+          MODEL: ${{ env.REVIEW_MODEL }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          DIFF: review-input/diff.patch
+          EVENTS: ${{ runner.temp }}/review-events.jsonl
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BODY_HASH: ${{ env.PR_BODY_HASH }}
+        shell: bash
+        run: bash .github/scripts/post-review.sh
+      # The gate is the verdict the bot actually posted, read back from the
+      # API, never the model's own words. Only MERGE AS IS and the advisory
+      # verdict for a docs-only PR let the review job pass.
+      - name: Enforce posted review verdict
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: bash .github/scripts/enforce-review-verdict.sh
