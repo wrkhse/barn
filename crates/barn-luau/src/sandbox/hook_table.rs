@@ -311,7 +311,7 @@ mod tests {
     fn fake_fixture() -> (Arc<FakeClock>, Arc<Mutex<Vec<String>>>, Scratch, Sandbox) {
         let fake = Arc::new(FakeClock::new());
         let (caps, order) = capabilities(Arc::clone(&fake));
-        let clock: Arc<dyn Clock> = Arc::clone(&fake);
+        let clock: Arc<dyn Clock> = fake.clone();
         let (scratch, sandbox) = fixture(clock, caps);
         (fake, order, scratch, sandbox)
     }
@@ -549,7 +549,7 @@ mod tests {
             step.rewind();
             Ok(Value::Null)
         });
-        let dyn_clock: Arc<dyn Clock> = Arc::clone(&clock);
+        let dyn_clock: Arc<dyn Clock> = clock.clone();
         let (_scratch, sandbox) = fixture(dyn_clock, caps);
         let table = HookTable::new(vec![handler(&sandbox, "backwards", 0, 100, OnError::Deny)])
             .expect("table");
