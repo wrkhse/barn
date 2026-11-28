@@ -788,6 +788,59 @@ mod tests {
     }
 
     #[test]
+    fn a_userspace_deadline_returns_available_bytes_without_retrying() {
+        let (client, mut peer) = UnixStream::pair().expect("a socket pair");
+        peer.write_all(b"ready")
+            .expect("the peer writes the first chunk");
+        let mut reader = BufReader::new(client);
+        reader
+            .fill_buf()
+            .expect("the first chunk is buffered before the read");
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("a bounded socket read");
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let started = Instant::now();
+        let mut nonblocking = true;
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(400));
+                peer.write_all(b" now\n")
+                    .expect("the peer completes the line after the deadline");
+            });
+
+            let line = read_line(&mut reader, deadline, &mut nonblocking)
+                .expect("buffered bytes still yield the whole line");
+
+            assert_eq!(line, b"ready now\n".to_vec());
+            assert!(started.elapsed() < Duration::from_secs(2));
+        });
+    }
+
+    #[test]
+    fn a_blocking_read_maps_would_block_to_timeout_without_retrying() {
+        let (client, _peer) = UnixStream::pair().expect("a socket pair");
+        client
+            .set_nonblocking(true)
+            .expect("a nonblocking socket that yields WouldBlock at once");
+        let mut reader = BufReader::new(client);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let started = Instant::now();
+        let mut nonblocking = false;
+
+        let error = read_line(&mut reader, deadline, &mut nonblocking)
+            .expect_err("WouldBlock maps to Timeout without the retry loop");
+
+        match error {
+            ClientError::Timeout => {}
+            other => panic!("got {other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
     fn an_oversize_reply_is_an_error() {
         let reply = vec![b'x'; MAX_LINE_BYTES];
 
