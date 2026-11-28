@@ -41,7 +41,7 @@ impl Deadline {
 
         *started = self.clock.micros();
         self.budget_us.store(
-            u64::try_from(us.min(u128::from(u64::MAX - 1))).unwrap_or(u64::MAX - 1),
+            u64::try_from(us.min(u128::from(u64::MAX - 1))).unwrap_or(u64::MAX - 1), // fallback unreachable: input is clamped to u64::MAX - 1
             Ordering::Relaxed,
         );
     }

@@ -148,6 +148,18 @@ mod tests {
     }
 
     #[test]
+    fn a_limit_cause_display_is_not_empty() {
+        let rendered = format!(
+            "{}",
+            LimitCause::TooManyHandlers {
+                limit: MAX_HANDLERS
+            }
+        );
+        assert_eq!(rendered, format!("too many hook handlers: {MAX_HANDLERS}"));
+        assert!(!rendered.is_empty());
+    }
+
+    #[test]
     fn load_causes_display_their_messages() {
         assert_eq!(
             LoadCause::Require(RequireCause::Missing("./x".into())).to_string(),

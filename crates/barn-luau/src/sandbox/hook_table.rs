@@ -699,4 +699,38 @@ mod tests {
     fn event_before_has_the_exact_hook_name() {
         assert_eq!(EVENT_BEFORE, "eventBefore");
     }
+
+    #[test]
+    fn stop_reason_returns_each_named_reason() {
+        for (cause, expected) in [
+            (LimitCause::Deadline, DEADLINE_REASON),
+            (LimitCause::Memory, MEMORY_REASON),
+            (
+                LimitCause::TooManyEntries { limit: 1 },
+                TOO_MANY_ENTRIES_REASON,
+            ),
+            (
+                LimitCause::TooManyHandlers {
+                    limit: MAX_HANDLERS,
+                },
+                TOO_MANY_HANDLERS_REASON,
+            ),
+            (LimitCause::TooLarge { limit: 1 }, TOO_LARGE_REASON),
+            (LimitCause::TooDeep { limit: 1 }, TOO_DEEP_REASON),
+        ] {
+            assert_eq!(stop_reason(&cause), expected, "{cause:?}");
+        }
+    }
+
+    #[test]
+    fn debug_shapes_name_fields_and_hide_the_function() {
+        let (_fake, _order, _scratch, sandbox) = fake_fixture();
+        let subject = handler(&sandbox, "cont", 3, 7, OnError::Deny);
+
+        assert_eq!(
+            format!("{subject:?}"),
+            "HookHandler { priority: 3, budget_ms: 7, on_error: Deny, run: HookRun { .. } }"
+        );
+        assert_eq!(format!("{:?}", subject.run), "HookRun { .. }");
+    }
 }

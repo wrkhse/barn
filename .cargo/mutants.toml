@@ -4,3 +4,8 @@
 test_workspace = true
 test_tool = "nextest"
 features = ["barn/test-fixtures"]
+
+# unreachable fallback: try_from input is clamped to u64::MAX - 1 (supervisor-approved 11-28)
+exclude_re = [
+  "^crates/barn-luau/src/sandbox/deadline\\.rs:44:80: replace - with / in Deadline::begin_us$",
+]
