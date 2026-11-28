@@ -712,6 +712,23 @@ mod tests {
     }
 
     #[test]
+    fn clearing_a_read_deadline_restores_an_unbounded_socket() {
+        let (client, _peer) = UnixStream::pair().expect("a socket pair");
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("arm a read deadline");
+        let reader = BufReader::new(&client);
+
+        set_read_deadline(&reader, None, "clear read").expect("the deadline clears");
+
+        assert_eq!(
+            client.read_timeout().expect("a readable socket timeout"),
+            None,
+            "clearing the deadline leaves later reads unbounded"
+        );
+    }
+
+    #[test]
     fn an_interrupted_fill_is_retried_and_other_errors_keep_their_names() {
         let data: &[u8] = b"line\n";
         assert!(matches!(fill_outcome(Ok(data)), Ok(Some(bytes)) if bytes == data));
@@ -741,6 +758,9 @@ mod tests {
     #[test]
     fn a_read_arm_einval_switches_to_a_userspace_deadline() {
         let (client, _peer) = UnixStream::pair().expect("a socket pair");
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("a short deadline keeps the assertion fast");
         let reader = BufReader::new(client);
         let source = io::Error::new(io::ErrorKind::InvalidInput, "injected EINVAL");
 
@@ -764,6 +784,19 @@ mod tests {
             }
             other => panic!("got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_successful_read_arm_keeps_the_socket_deadline() {
+        let (client, _peer) = UnixStream::pair().expect("a socket pair");
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("arm a read deadline");
+        let reader = BufReader::new(&client);
+
+        let fallback = read_arm_result(&reader, Ok(())).expect("the arm succeeds");
+
+        assert!(!fallback, "a socket deadline needs no nonblocking fallback");
     }
 
     #[test]
