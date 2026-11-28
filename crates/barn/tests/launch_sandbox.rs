@@ -414,14 +414,14 @@ fn read_line(reader: &mut impl BufRead) -> String {
 
 /// Abort every live stall so a failed health read's SIGABRT lands in barn's
 /// captured stderr with a backtrace, then fail with a named reason.
-fn abort_stalls_and_panic(pids: Vec<u32>, reason: &str) -> ! {
-    for pid in &pids {
+fn abort_stalls_and_panic(pids: &[u32], reason: &str) -> ! {
+    for pid in pids {
         eprintln!("HOST TRACE health read failure: {reason}; aborting stall {pid}");
         let _ = Command::new("kill")
             .args(["-ABRT", &pid.to_string()])
             .status();
     }
-    panic!("stalls {pids:?} aborted: {reason}");
+    std::panic::panic_any(format!("stalls {pids:?} aborted: {reason}"));
 }
 
 /// On a failed or closed health reply read, abort the stall and fail the test.
@@ -439,7 +439,8 @@ fn read_line_with_stall_abort(
     };
 
     if let Some(reason) = failure {
-        abort_stalls_and_panic(stall_pids(), &reason);
+        let pids = stall_pids();
+        abort_stalls_and_panic(&pids, &reason);
     }
 
     line
@@ -465,18 +466,13 @@ fn connect(socket: &str) -> BufReader<UnixStream> {
     BufReader::new(stream)
 }
 
-#[test]
-fn a_launched_stall_serves_one_host_connection_then_exits_cleanly() {
-    if std::env::var_os("CI").is_none() {
-        return;
-    }
-
-    let mut launch = Launch::new().expect("the scratch tree");
+/// Spawn barn, open its host socket, and complete the host.start handshake.
+/// Both startup tests share this prefix; keeping it here leaves their
+/// differing health and trace checks readable and under the line limit.
+fn start_and_start_host(launch: &mut Launch) -> BufReader<UnixStream> {
     let line = launch.spawn();
     let (socket, token) = launch.endpoint(&line);
     let mut host = connect(&socket);
-    let t0 = Instant::now();
-    eprintln!("HOST TRACE connect {:?}", t0.elapsed());
 
     let start = json!({
         "jsonrpc": "2.0",
@@ -499,6 +495,19 @@ fn a_launched_stall_serves_one_host_connection_then_exits_cleanly() {
         })
     );
 
+    host
+}
+
+#[test]
+fn a_launched_stall_serves_one_host_connection_then_exits_cleanly() {
+    if std::env::var_os("CI").is_none() {
+        return;
+    }
+
+    let mut launch = Launch::new().expect("the scratch tree");
+    let t0 = Instant::now();
+    let mut host = start_and_start_host(&mut launch);
+    eprintln!("HOST TRACE connect {:?}", t0.elapsed());
     eprintln!("HOST TRACE reader-ready-check {:?}", t0.elapsed());
 
     let health = json!({
@@ -566,29 +575,7 @@ fn trace_records_a_health_round_trip() {
     }
 
     let mut launch = Launch::new().expect("the scratch tree");
-    let line = launch.spawn();
-    let (socket, token) = launch.endpoint(&line);
-    let mut host = connect(&socket);
-
-    let start = json!({
-        "jsonrpc": "2.0",
-        "id": 21,
-        "method": method::HOST_START,
-        "params": HostStartParams {
-            protocol: PROTOCOL_VERSION,
-            token,
-            pid: std::process::id(),
-        },
-    });
-    writeln!(host.get_mut(), "{start}").expect("send host.start");
-    assert_eq!(
-        parse(&read_line(&mut host)),
-        json!({
-            "jsonrpc": "2.0",
-            "id": 21,
-            "result": {"stall": launch.stall_name()},
-        })
-    );
+    let mut host = start_and_start_host(&mut launch);
 
     let running = launch.stall_pids();
     assert_eq!(
