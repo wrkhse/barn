@@ -21,7 +21,7 @@ use tokio::time::timeout;
 use crate::Grant;
 use crate::supervisor::{
     HostDeny, HostEndpoint, RunningStall, StallEvent, StallReceiver, StallSpec, StallWriter,
-    Supervisor, SupervisorError, spawn_stall_reader,
+    Supervisor, SupervisorError, spawn_stall_reader, stall_control_request,
 };
 
 /// How long a stall may take to connect back after the endpoint is written.
@@ -485,6 +485,17 @@ async fn broker_host(
                 Err(_) => return Err(StartFailure::after(StartError::HostLoss)),
             },
             event = rx.recv() => {
+                if let Some(StallEvent::Line(line)) = &event
+                    && let Some(id) = stall_control_request(line)
+                {
+                    running
+                        .serve_stall_control(host, stall, line, id)
+                        .await
+                        .map_err(after_supervisor)?;
+
+                    continue;
+                }
+
                 return Err(StartFailure::after(idle_event_failure(event.as_ref())));
             }
             _ = running.stall_exit() => {

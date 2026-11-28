@@ -288,6 +288,123 @@ fn a_non_object_host_context_is_only_exposed_as_ctx_host() {
 }
 
 #[test]
+fn a_grouped_capability_is_reachable_by_a_computed_key() {
+    let scratch = Scratch::new();
+    scratch.write(
+        "plugin.luau",
+        r#"
+        return {
+            name = "grouped",
+            tools = {},
+            inspect = function(payload, ctx)
+                return ctx.rewrite(ctx['con' .. 'trol'].call('navigate', { who = 'x' }))
+            end,
+        }
+        "#,
+    );
+    let mut capabilities = Capabilities::default();
+    capabilities.insert_group("control", "call", |args| Ok(json!({ "ok": args })));
+    let sandbox = Sandbox::new(scratch.path(), default_limits(), capabilities, test_clock())
+        .expect("fixture loads");
+
+    assert_eq!(
+        sandbox.hook(&invocation("inspect", "shell"), DEFAULT_DEADLINE_MS),
+        Ok(Outcome::Rewrite {
+            payload: json!({ "ok": ["navigate", { "who": "x" }] })
+        })
+    );
+}
+
+#[test]
+fn a_group_keeps_each_method_separate() {
+    let scratch = Scratch::new();
+    scratch.write(
+        "plugin.luau",
+        r#"
+        return {
+            name = "grouped-methods",
+            tools = {},
+            inspect = function(payload, ctx)
+                return ctx.rewrite({
+                    first = ctx.ops.first('x', 2),
+                    second = ctx.ops.second(true),
+                })
+            end,
+        }
+        "#,
+    );
+    let mut capabilities = Capabilities::default();
+    capabilities.insert_group("ops", "first", |args| Ok(json!({ "first": args })));
+    capabilities.insert_group("ops", "second", |args| Ok(json!({ "second": args })));
+    let sandbox = Sandbox::new(scratch.path(), default_limits(), capabilities, test_clock())
+        .expect("fixture loads");
+
+    assert_eq!(
+        sandbox.hook(&invocation("inspect", "shell"), DEFAULT_DEADLINE_MS),
+        Ok(Outcome::Rewrite {
+            payload: json!({
+                "first": { "first": ["x", 2] },
+                "second": { "second": [true] },
+            })
+        })
+    );
+}
+
+#[test]
+fn a_grouped_capability_error_names_group_and_method() {
+    let scratch = Scratch::new();
+    scratch.write(
+        "plugin.luau",
+        r#"
+        return {
+            name = "grouped-error",
+            tools = {},
+            inspect = function(payload, ctx)
+                return ctx.control.call('navigate')
+            end,
+        }
+        "#,
+    );
+    let mut capabilities = Capabilities::default();
+    capabilities.insert_group("control", "call", |_| Err("denied".into()));
+    let sandbox = Sandbox::new(scratch.path(), default_limits(), capabilities, test_clock())
+        .expect("fixture loads");
+
+    assert_eq!(
+        sandbox.hook(&invocation("inspect", "shell"), DEFAULT_DEADLINE_MS),
+        Err(EngineError::Capability {
+            name: "control.call".into(),
+            reason: "denied".into(),
+        })
+    );
+}
+
+#[test]
+fn reserved_and_conflicting_group_names_are_refused() {
+    let scratch = Scratch::new();
+    scratch.write("plugin.luau", r#"return { name = "test" }"#);
+
+    let mut reserved = Capabilities::default();
+    reserved.insert_group("allow", "call", |_| Ok(Value::Null));
+    let error = Sandbox::new(scratch.path(), default_limits(), reserved, test_clock())
+        .expect_err("reserved group is refused");
+    assert_eq!(
+        error,
+        EngineError::InvalidResult("reserved or conflicting group name: allow".into())
+    );
+
+    let mut conflicting = Capabilities::default();
+    conflicting.insert("control", Ok);
+    conflicting.insert_group("control", "call", |_| Ok(Value::Null));
+    let error = Sandbox::new(scratch.path(), default_limits(), conflicting, test_clock())
+        .expect_err("conflicting group is refused");
+    assert_eq!(
+        error,
+        EngineError::InvalidResult("reserved or conflicting group name: control".into())
+    );
+}
+
+#[test]
 fn host_context_fields_cannot_override_helpers_or_capabilities() {
     let scratch = Scratch::new();
     scratch.write(

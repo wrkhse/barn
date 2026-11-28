@@ -56,3 +56,5 @@ skip = [
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+# barn#76: owner-approved, commit-pinned tack_protocol for the Luau stall adapter.
+allow-git = ["https://github.com/wrkhse/tack"]
