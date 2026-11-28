@@ -137,11 +137,11 @@ mod tests {
     /// values for one return value.
     fn assert_decoders(
         value: LuaValue,
-        expected_result: Result<HookResult, EngineError>,
-        expected_outcome: Result<Outcome, EngineError>,
+        expected_result: &Result<HookResult, EngineError>,
+        expected_outcome: &Result<Outcome, EngineError>,
     ) {
-        assert_eq!(decode_hook_result(value.clone()), expected_result);
-        assert_eq!(decode_outcome(value.clone()), expected_outcome);
+        assert_eq!(decode_hook_result(value.clone()), *expected_result);
+        assert_eq!(decode_outcome(value.clone()), *expected_outcome);
         assert_eq!(
             decode_outcome(value.clone()),
             decode_hook_result(value).map(Outcome::from)
@@ -150,7 +150,11 @@ mod tests {
 
     #[test]
     fn nil_decodes_to_continue() {
-        assert_decoders(LuaValue::Nil, Ok(HookResult::Continue), Ok(Outcome::Allow));
+        assert_decoders(
+            LuaValue::Nil,
+            &Ok(HookResult::Continue),
+            &Ok(Outcome::Allow),
+        );
     }
 
     #[test]
@@ -158,8 +162,8 @@ mod tests {
         let expected = EngineError::InvalidResult("hook must return a table or nil".into());
         assert_decoders(
             LuaValue::Boolean(true),
-            Err(expected.clone()),
-            Err(expected),
+            &Err(expected.clone()),
+            &Err(expected),
         );
     }
 
@@ -188,35 +192,35 @@ mod tests {
 
         assert_decoders(
             LuaValue::Table(deny),
-            Ok(HookResult::Deny {
+            &Ok(HookResult::Deny {
                 reason: "blocked".to_owned(),
             }),
-            Ok(Outcome::Deny {
+            &Ok(Outcome::Deny {
                 reason: "blocked".to_owned(),
             }),
         );
         assert_decoders(
             LuaValue::Table(rewrite),
-            Ok(HookResult::Rewrite {
+            &Ok(HookResult::Rewrite {
                 payload: json!({ "command": "echo" }),
             }),
-            Ok(Outcome::Rewrite {
+            &Ok(Outcome::Rewrite {
                 payload: json!({ "command": "echo" }),
             }),
         );
         assert_decoders(
             LuaValue::Table(annotate),
-            Ok(HookResult::Annotate {
+            &Ok(HookResult::Annotate {
                 fields: expected_fields.clone(),
             }),
-            Ok(Outcome::Annotate {
+            &Ok(Outcome::Annotate {
                 fields: expected_fields,
             }),
         );
         assert_decoders(
             LuaValue::Table(drop),
-            Ok(HookResult::Drop),
-            Ok(Outcome::Drop),
+            &Ok(HookResult::Drop),
+            &Ok(Outcome::Drop),
         );
     }
 
@@ -227,7 +231,11 @@ mod tests {
         let expected = EngineError::InvalidResult(
             "hook result has no verdict: expected deny, rewrite, annotate or drop".into(),
         );
-        assert_decoders(LuaValue::Table(empty), Err(expected.clone()), Err(expected));
+        assert_decoders(
+            LuaValue::Table(empty),
+            &Err(expected.clone()),
+            &Err(expected),
+        );
     }
 
     #[test]
@@ -241,8 +249,8 @@ mod tests {
             EngineError::InvalidResult("hook result has multiple verdicts: deny, drop".into());
         assert_decoders(
             LuaValue::Table(result),
-            Err(expected.clone()),
-            Err(expected),
+            &Err(expected.clone()),
+            &Err(expected),
         );
     }
 }

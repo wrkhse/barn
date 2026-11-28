@@ -282,10 +282,10 @@ mod tests {
     "#;
 
     /// Record `note` labels and let a handler spend fake-clock microseconds.
-    fn capabilities(fake: Arc<FakeClock>) -> (Capabilities, Arc<Mutex<Vec<String>>>) {
+    fn capabilities(fake: &Arc<FakeClock>) -> (Capabilities, Arc<Mutex<Vec<String>>>) {
         let order = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&order);
-        let step = Arc::clone(&fake);
+        let step = Arc::clone(fake);
         let mut caps = Capabilities::default();
         caps.insert("note", move |value: Value| -> Result<Value, String> {
             let label = value.as_str().unwrap_or_default().to_owned();
@@ -310,7 +310,7 @@ mod tests {
     /// A static clock fixture so a test controls every elapsed microsecond.
     fn fake_fixture() -> (Arc<FakeClock>, Arc<Mutex<Vec<String>>>, Scratch, Sandbox) {
         let fake = Arc::new(FakeClock::new());
-        let (caps, order) = capabilities(Arc::clone(&fake));
+        let (caps, order) = capabilities(&fake);
         let clock: Arc<dyn Clock> = fake.clone();
         let (scratch, sandbox) = fixture(clock, caps);
         (fake, order, scratch, sandbox)
@@ -319,7 +319,7 @@ mod tests {
     /// Each `micros` read advances the clock, so a loop reaches a checkpoint.
     fn tick_fixture() -> (Scratch, Sandbox) {
         let clock: Arc<dyn Clock> = Arc::new(TickingClock::new());
-        fixture(clock, capabilities(Arc::new(FakeClock::new())).0)
+        fixture(clock, capabilities(&Arc::new(FakeClock::new())).0)
     }
 
     fn handler(
@@ -549,7 +549,7 @@ mod tests {
             step.rewind();
             Ok(Value::Null)
         });
-        let dyn_clock: Arc<dyn Clock> = clock.clone();
+        let dyn_clock: Arc<dyn Clock> = clock;
         let (_scratch, sandbox) = fixture(dyn_clock, caps);
         let table = HookTable::new(vec![handler(&sandbox, "backwards", 0, 100, OnError::Deny)])
             .expect("table");
