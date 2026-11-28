@@ -163,7 +163,7 @@ fn handshake(
     let mut reader = BufReader::new(stream);
     let line = read_bounded(&mut reader, deadline)?;
     let result = decode_reply(&line, &json!(START_ID))?;
-    set_read_deadline(reader.get_mut(), None, "clear read")?;
+    set_read_deadline(reader.get_ref(), None, "clear read")?;
 
     Ok((reader, result))
 }
@@ -194,7 +194,7 @@ fn read_error(error: io::Error) -> ClientError {
 /// write half. That is not a real failure: buffered data (or EOF) is still
 /// valid, so the caller continues. Other failures are reported with `step`.
 fn set_read_deadline(
-    stream: &mut UnixStream,
+    stream: &UnixStream,
     timeout: Option<Duration>,
     step: &'static str,
 ) -> Result<(), ClientError> {
@@ -244,7 +244,7 @@ fn read_bounded(
         }
         // A zero timeval means "no timeout" on Unix, so keep it positive.
         let remaining = remaining.max(Duration::from_millis(1));
-        set_read_deadline(reader.get_mut(), Some(remaining), "read")?;
+        set_read_deadline(reader.get_ref(), Some(remaining), "read")?;
 
         if reader.fill_buf().map_err(read_error)?.is_empty() {
             return Err(ClientError::Eof);
@@ -551,7 +551,7 @@ mod tests {
             state: "/state".to_owned(),
             jobs: BTreeMap::new(),
         };
-        let (client, server) = UnixStream::pair().expect("a socket pair");
+        let (client, mut server) = UnixStream::pair().expect("a socket pair");
 
         // The peer buffers a reply and shuts down its write half before the
         // client starts. On macOS the client's set_read_timeout calls then
