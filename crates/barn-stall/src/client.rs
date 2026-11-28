@@ -717,12 +717,15 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_millis(100)))
             .expect("arm a read deadline");
-        let reader = BufReader::new(&client);
+        let reader = BufReader::new(client);
 
         set_read_deadline(&reader, None, "clear read").expect("the deadline clears");
 
         assert_eq!(
-            client.read_timeout().expect("a readable socket timeout"),
+            reader
+                .get_ref()
+                .read_timeout()
+                .expect("a readable socket timeout"),
             None,
             "clearing the deadline leaves later reads unbounded"
         );
@@ -792,7 +795,7 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_millis(100)))
             .expect("arm a read deadline");
-        let reader = BufReader::new(&client);
+        let reader = BufReader::new(client);
 
         let fallback = read_arm_result(&reader, Ok(())).expect("the arm succeeds");
 
