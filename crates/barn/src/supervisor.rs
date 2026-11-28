@@ -64,12 +64,15 @@ const SHELL_LINK: &str = "/private/var/select/sh";
 const SHELL_GRANTS: &[&str] = &[SHELL_LINK, "/bin/bash", "/bin/zsh", "/bin/dash"];
 #[cfg(not(target_os = "macos"))]
 const SHELL_GRANTS: &[&str] = &[];
-const OVERSIZE_REPLY: &[u8] = concat!(
-    r#"{"jsonrpc":"2.0","id":null,"protocol":1,"error":{"code":-32600,"#,
-    r#""message":"stall start message exceeds the protocol line limit"}}"#,
-    "\n"
-)
-.as_bytes();
+/// The newline-terminated over-size error reply, at the current protocol version.
+fn oversize_reply() -> Vec<u8> {
+    format!(concat!(
+        r#"{{"jsonrpc":"2.0","id":null,"protocol":{PROTOCOL_VERSION},"error":{{"code":-32600,"#,
+        r#""message":"stall start message exceeds the protocol line limit"}}}}"#,
+        "\n"
+    ))
+    .into_bytes()
+}
 
 /// A stall and the in-memory grant that bounds it.
 pub struct StallSpec {
@@ -1804,7 +1807,7 @@ fn declared_jobs(frame: &[u8]) -> BTreeMap<String, Job> {
 async fn refuse_oversize(writer: &mut (impl AsyncWrite + Unpin)) -> Result<()> {
     io_at(
         "answering oversized stall start",
-        writer.write_all(OVERSIZE_REPLY).await,
+        writer.write_all(&oversize_reply()).await,
     )
 }
 
@@ -4399,7 +4402,7 @@ mod tests {
             .find(|line| line.starts_with(r#"{"jsonrpc":"2.0","id":null,"protocol":1,"error""#))
             .expect("the page fixes the oversize error line");
         let page: Value = serde_json::from_str(line).expect("the page's error JSON");
-        let reply: Value = serde_json::from_slice(OVERSIZE_REPLY).expect("barn's error JSON");
+        let reply: Value = serde_json::from_slice(&oversize_reply()).expect("barn's error JSON");
 
         assert_eq!(reply, page);
     }

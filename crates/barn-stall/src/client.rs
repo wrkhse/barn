@@ -188,6 +188,16 @@ fn read_error(error: io::Error) -> ClientError {
     }
 }
 
+/// Classifies one `fill_buf` result: `Interrupted` asks `read_bounded` to
+/// retry after rechecking its deadline; every other error keeps its named form.
+fn fill_outcome(result: io::Result<&[u8]>) -> Result<Option<&[u8]>, ClientError> {
+    match result {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(None),
+        Err(error) => Err(read_error(error)),
+    }
+}
+
 /// Sets or clears a read deadline on the stream under `reader`.
 ///
 /// macOS returns `EINVAL` from `setsockopt` once the peer has shut down its
@@ -262,7 +272,10 @@ fn read_bounded(
         let remaining = remaining.max(Duration::from_millis(1));
         set_read_deadline(reader, Some(remaining), "read")?;
 
-        if reader.fill_buf().map_err(read_error)?.is_empty() {
+        let Some(bytes) = fill_outcome(reader.fill_buf())? else {
+            continue;
+        };
+        if bytes.is_empty() {
             return Err(ClientError::Eof);
         }
     }
@@ -623,6 +636,33 @@ mod tests {
             read_deadline_result(&reader, Err(source), "read").is_ok(),
             "buffered bytes bound the next read without a deadline"
         );
+    }
+
+    #[test]
+    fn an_interrupted_fill_is_retried_and_other_errors_keep_their_names() {
+        let data: &[u8] = b"line\n";
+        assert!(matches!(fill_outcome(Ok(data)), Ok(Some(bytes)) if bytes == data));
+
+        let interrupted = io::Error::from(io::ErrorKind::Interrupted);
+        assert!(
+            matches!(fill_outcome(Err(interrupted)), Ok(None)),
+            "an interrupted fill asks read_bounded to retry after its deadline check"
+        );
+
+        let timed_out = io::Error::from(io::ErrorKind::WouldBlock);
+        assert!(matches!(
+            fill_outcome(Err(timed_out)),
+            Err(ClientError::Timeout)
+        ));
+
+        let denied = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        match fill_outcome(Err(denied)) {
+            Err(ClientError::Read(error)) => {
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                assert_eq!(error.to_string(), "denied");
+            }
+            outcome => panic!("got {outcome:?}"),
+        }
     }
 
     #[test]
