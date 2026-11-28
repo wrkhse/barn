@@ -163,7 +163,7 @@ fn handshake(
     let mut reader = BufReader::new(stream);
     let line = read_bounded(&mut reader, deadline)?;
     let result = decode_reply(&line, &json!(START_ID))?;
-    set_read_deadline(reader.get_ref(), None, "clear read")?;
+    set_read_deadline(&reader, None, "clear read")?;
 
     Ok((reader, result))
 }
@@ -188,19 +188,35 @@ fn read_error(error: io::Error) -> ClientError {
     }
 }
 
-/// Sets or clears a read deadline on `stream`.
+/// Sets or clears a read deadline on the stream under `reader`.
 ///
 /// macOS returns `EINVAL` from `setsockopt` once the peer has shut down its
-/// write half. That is not a real failure: buffered data (or EOF) is still
-/// valid, so the caller continues. Other failures are reported with `step`.
+/// write half. While clearing a deadline after a complete reply, or while the
+/// reader already holds bytes, that is benign: the next read is bounded by
+/// data or EOF, not by time. Arming a deadline with nothing buffered must not
+/// swallow `EINVAL`, or `fill_buf` could wait without a bound.
 fn set_read_deadline(
-    stream: &UnixStream,
+    reader: &BufReader<UnixStream>,
     timeout: Option<Duration>,
     step: &'static str,
 ) -> Result<(), ClientError> {
-    match stream.set_read_timeout(timeout) {
+    read_deadline_result(reader, reader.get_ref().set_read_timeout(timeout), step)
+}
+
+/// Decides whether a failed `setsockopt` is the benign closed-peer `EINVAL`.
+fn read_deadline_result(
+    reader: &BufReader<UnixStream>,
+    result: io::Result<()>,
+    step: &'static str,
+) -> Result<(), ClientError> {
+    match result {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(source)
+            if source.kind() == io::ErrorKind::InvalidInput
+                && (step == "clear read" || !reader.buffer().is_empty()) =>
+        {
+            Ok(())
+        }
         Err(source) => Err(ClientError::SetTimeout { step, source }),
     }
 }
@@ -244,7 +260,7 @@ fn read_bounded(
         }
         // A zero timeval means "no timeout" on Unix, so keep it positive.
         let remaining = remaining.max(Duration::from_millis(1));
-        set_read_deadline(reader.get_ref(), Some(remaining), "read")?;
+        set_read_deadline(reader, Some(remaining), "read")?;
 
         if reader.fill_buf().map_err(read_error)?.is_empty() {
             return Err(ClientError::Eof);
@@ -565,6 +581,48 @@ mod tests {
             .expect("the buffered reply completes the handshake");
 
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn an_unbuffered_read_deadline_fails_closed_on_invalid_input() {
+        let (client, _peer) = UnixStream::pair().expect("a socket pair");
+        let reader = BufReader::new(client);
+        let message = "injected EINVAL";
+
+        let source = io::Error::new(io::ErrorKind::InvalidInput, message);
+        let error = read_deadline_result(&reader, Err(source), "read")
+            .expect_err("an EINVAL with no buffered data fails closed");
+
+        match error {
+            ClientError::SetTimeout { step, source } => {
+                assert_eq!(step, "read");
+                assert_eq!(source.kind(), io::ErrorKind::InvalidInput);
+                assert_eq!(source.to_string(), message);
+            }
+            other => panic!("got {other:?}"),
+        }
+
+        let source = io::Error::new(io::ErrorKind::InvalidInput, message);
+        assert!(
+            read_deadline_result(&reader, Err(source), "clear read").is_ok(),
+            "clearing after a reply still tolerates a closed peer"
+        );
+    }
+
+    #[test]
+    fn a_buffered_read_deadline_tolerates_invalid_input() {
+        let (client, mut peer) = UnixStream::pair().expect("a socket pair");
+        peer.write_all(b"buffered\n")
+            .expect("the peer writes bytes");
+        let mut reader = BufReader::new(client);
+        reader.fill_buf().expect("the reader buffers the bytes");
+
+        let source = io::Error::new(io::ErrorKind::InvalidInput, "injected EINVAL");
+
+        assert!(
+            read_deadline_result(&reader, Err(source), "read").is_ok(),
+            "buffered bytes bound the next read without a deadline"
+        );
     }
 
     #[test]
