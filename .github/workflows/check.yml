@@ -9,7 +9,7 @@ on:
   pull_request:
   # macOS runners are scarce; a daily run keeps the flake proof on main too.
   schedule:
-    - cron: '0 3 * * *'
+    - cron: "0 3 * * *"
   workflow_dispatch:
     inputs:
       full_tree:
@@ -60,7 +60,7 @@ jobs:
         with:
           key: ${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked --features barn/test-fixtures -- -D warnings
       # tack links barn as a library with default features off; keep that path
       # free of the CLI and its clap dependency.
       - run: cargo clippy -p barn --lib --no-default-features --locked -- -D warnings
@@ -83,7 +83,7 @@ jobs:
       - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: cargo-nextest@0.9.152
-      - run: cargo nextest run --workspace --locked
+      - run: cargo nextest run --workspace --locked --features barn/test-fixtures
       # Both process tests hold sockets and run dirs; ten concurrent runs prove
       # they do not collide in CI.
       - name: Run launch tests concurrently 10x
@@ -91,10 +91,10 @@ jobs:
           ran=0
           for run in {1..10}; do
             echo "launch tests concurrently, run $run of 10"
-            cargo nextest run -p barn --locked \
+            cargo nextest run -p barn --locked --features test-fixtures \
               -E 'test(=a_launched_stall_serves_one_host_connection_then_exits_cleanly)' &
             launch=$!
-            cargo nextest run -p barn --locked \
+            cargo nextest run -p barn --locked --features test-fixtures \
               -E 'test(=a_sigterm_drains_the_stall_and_removes_the_run_dir)' &
             sigterm=$!
             wait "$launch"
@@ -124,7 +124,7 @@ jobs:
       - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
         with:
           tool: cargo-nextest@0.9.152
-      - run: cargo nextest run --workspace --locked
+      - run: cargo nextest run --workspace --locked --features barn/test-fixtures
       # macOS runners are scarce: repeat the flaky sandbox-child proof only on
       # a change to the code it covers, or on the daily main run.
       - name: Is the sandbox child flake in scope?
@@ -250,8 +250,8 @@ jobs:
       # and checks that a write into that folder is refused.
       - name: The non-Debian loader grant, in the real sandbox
         run: |
-          cargo nextest run --locked -p barn --lib
-          cargo nextest run --locked -p barn --test non_debian
+          cargo nextest run --locked -p barn --lib --features test-fixtures
+          cargo nextest run --locked -p barn --test non_debian --features test-fixtures
 
   # Cargo.toml's rust-version, exactly. Today the pinned toolchain is the same
   # version, so this job states the floor a pin change would have to keep.
@@ -435,6 +435,6 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '24'
+          node-version: "24"
       - run: npm ci
       - run: npm run check

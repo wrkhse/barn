@@ -11,6 +11,7 @@ repository.workspace = true
 [features]
 default = ["cli"]
 cli = ["dep:clap"]
+test-fixtures = []
 
 [dependencies]
 barn-stall = { path = "../barn-stall" }
@@ -24,6 +25,11 @@ tokio.workspace = true
 name = "barn"
 path = "src/main.rs"
 required-features = ["cli"]
+
+[[bin]]
+name = "stall_drain_fixture"
+path = "examples/stall_drain_fixture.rs"
+required-features = ["test-fixtures"]
 
 [lints]
 workspace = true
