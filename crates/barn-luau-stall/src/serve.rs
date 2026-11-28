@@ -77,6 +77,13 @@ const BUSY_DENY_MESSAGE: &str = "too many in-flight calls";
 /// The message on a reply too long to frame.
 const OVERSIZE_REPLY_MESSAGE: &str = "the reply exceeds MAX_LINE_BYTES";
 
+/// A control call waiting for its reply: id, reply channel and deadline.
+type PendingControl = (
+    u64,
+    oneshot::Sender<Result<serde_json::Value, String>>,
+    Instant,
+);
+
 /// Why a connection could not finish the exchange.
 #[derive(Debug)]
 pub enum ServeError {
@@ -157,7 +164,7 @@ pub async fn serve(
     let sandbox = Arc::new(sandbox);
     let mut calls = JoinSet::new();
     let mut pending = BTreeMap::new();
-    let mut pending_control: Option<(u64, oneshot::Sender<Result<Value, String>>, Instant)> = None;
+    let mut pending_control: Option<PendingControl> = None;
     let mut line = Vec::new();
     let mut need_slot = false;
 
@@ -179,11 +186,8 @@ pub async fn serve(
                 continue;
             }
 
-            _ = control_wait(control_deadline), if control_deadline.is_some() => {
-                if let Some((id, reply, _)) = pending_control.take() {
-                    trace(|| format!("control call timed out id={id}"));
-                    let _ = reply.send(Err(CONTROL_TIMEOUT_ERROR.to_owned()));
-                }
+            () = control_wait(control_deadline), if control_deadline.is_some() => {
+                expire_control(&mut pending_control);
 
                 continue;
             }
@@ -240,7 +244,7 @@ pub async fn serve(
 /// encode step already caps frames, so this is a second, explicit bound.
 async fn queue_control(
     writer: &mut (impl AsyncWrite + Unpin),
-    pending_control: &mut Option<(u64, oneshot::Sender<Result<Value, String>>, Instant)>,
+    pending_control: &mut Option<PendingControl>,
     call: ControlCall,
 ) -> Result<(), ServeError> {
     if call.frame.len() > tack_protocol::MAX_FRAME_BYTES {
@@ -263,14 +267,19 @@ async fn control_wait(deadline: Option<Instant>) {
     }
 }
 
+/// Answer a timed-out control call with the named timeout error.
+fn expire_control(pending_control: &mut Option<PendingControl>) {
+    if let Some((id, reply, _)) = pending_control.take() {
+        trace(|| format!("control call timed out id={id}"));
+        let _ = reply.send(Err(CONTROL_TIMEOUT_ERROR.to_owned()));
+    }
+}
+
 /// Route a control reply to its waiting caller and clear its line.
 ///
 /// Returns whether the line answered the pending control call; an unrelated
 /// line stays in the buffer for the normal decode path.
-fn take_control_reply(
-    line: &mut Vec<u8>,
-    pending_control: &mut Option<(u64, oneshot::Sender<Result<Value, String>>, Instant)>,
-) -> bool {
+fn take_control_reply(line: &mut Vec<u8>, pending_control: &mut Option<PendingControl>) -> bool {
     let Some((id, _, _)) = pending_control.as_ref() else {
         return false;
     };

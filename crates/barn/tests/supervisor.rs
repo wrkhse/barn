@@ -889,7 +889,7 @@ async fn a_stall_control_frame_is_forwarded_and_its_exact_reply_returned() {
     let (host_barn, host_peer) = AsyncUnixStream::pair().expect("host pair");
     let (stall_barn, stall_peer) = AsyncUnixStream::pair().expect("stall pair");
     let mut host = AsyncBufReader::new(host_barn);
-    let (mut stall_writer, _stall_read) = stall_barn.into_split();
+    let (_stall_read, mut stall_writer) = stall_barn.into_split();
 
     let host_side = async {
         let mut peer = host_peer;
@@ -933,7 +933,7 @@ async fn a_non_matching_control_reply_is_denied_as_a_bad_frame() {
     let (host_barn, host_peer) = AsyncUnixStream::pair().expect("host pair");
     let (stall_barn, _stall_peer) = AsyncUnixStream::pair().expect("stall pair");
     let mut host = AsyncBufReader::new(host_barn);
-    let (mut stall_writer, _stall_read) = stall_barn.into_split();
+    let (_stall_read, mut stall_writer) = stall_barn.into_split();
 
     let host_side = async {
         let mut peer = host_peer;

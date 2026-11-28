@@ -8,7 +8,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 use tack_protocol::wire::{PROTOCOL_VERSION, Request, encode_line};
 use tokio::sync::{mpsc, oneshot};
 
@@ -146,6 +146,7 @@ pub fn decode_control_reply(frame: &[u8], id: u64) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn control_line(id: u64) -> Vec<u8> {
         let mut line = serde_json::to_vec(&json!({
