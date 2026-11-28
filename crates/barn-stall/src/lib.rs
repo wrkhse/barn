@@ -18,6 +18,7 @@
 //!
 //! [protocol]: https://github.com/wrkhse/barn/blob/main/docs/stall-protocol.md
 
+// Review-gate post-merge proof: a small non-docs change.
 pub mod client;
 pub mod frames;
 pub mod protocol;
