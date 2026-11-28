@@ -4070,6 +4070,54 @@ mod tests {
         assert_eq!(received, reply.to_vec());
     }
 
+    #[tokio::test]
+    async fn serve_stall_control_forwards_one_control_frame_and_returns_the_exact_reply() {
+        // This spawns an idle child, so it runs in CI only.
+        if std::env::var_os("CI").is_none() {
+            return;
+        }
+
+        let stall = idle_stall_for_brokering();
+        let (host_barn, mut host_peer) = UnixStream::pair().expect("host pair");
+        let (stall_barn, mut stall_peer) = UnixStream::pair().expect("stall pair");
+        let (stall_read, mut stall_writer) = stall_barn.into_split();
+        let _rx = spawn_stall_reader(stall_read);
+        let mut host = BufReader::new(host_barn);
+        let request =
+            b"{\"kind\":\"control\",\"id\":9,\"version\":1,\"call\":\"do.thing\",\"input\":{}}\n";
+        let reply = b"{\"kind\":\"control\",\"id\":9,\"version\":1,\"result\":{\"ok\":true}}\n";
+        let mut forwarded = Vec::new();
+
+        let exchange = async {
+            BufReader::new(&mut host_peer)
+                .read_until(b'\n', &mut forwarded)
+                .await
+                .expect("forwarded request");
+            host_peer.write_all(reply).await.expect("control reply");
+        };
+        let (served, ()) = timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                stall.serve_stall_control(&mut host, &mut stall_writer, request, 9),
+                exchange
+            )
+        })
+        .await
+        .expect("broker and peers finish within the deadline");
+
+        assert!(matches!(served, Ok(())));
+        assert_eq!(forwarded, request.to_vec());
+
+        let mut received = Vec::new();
+        timeout(
+            Duration::from_secs(1),
+            BufReader::new(&mut stall_peer).read_until(b'\n', &mut received),
+        )
+        .await
+        .expect("stall reply within the deadline")
+        .expect("read stall reply");
+        assert_eq!(received, reply.to_vec());
+    }
+
     /// A transport bound to `root/proto.sock`, with a token at `expiry`.
     fn test_transport(root: &Path, expiry: Option<Instant>) -> Transport {
         let socket = root.join(SOCKET_FILE);

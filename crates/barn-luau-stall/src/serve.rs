@@ -815,7 +815,12 @@ async fn drain(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use barn_luau::{Capabilities, Limits};
     use barn_stall::Content;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::bridge::real_clock;
 
     /// A tool reply carrying len bytes of text. Plain ASCII needs no JSON
     /// escaping, so the serialized length grows exactly with len.
@@ -1214,5 +1219,94 @@ mod tests {
         assert!(!take_control_reply(&mut line, &mut pending_control));
         assert_eq!(line, b"{}\n");
         assert!(pending_control.is_some());
+    }
+
+    #[test]
+    fn is_foreign_control_envelope_ignores_a_normal_barn_line() {
+        let line = b"{\"jsonrpc\":\"2.0\",\"method\":\"stall.health\",\"id\":5}\n";
+
+        assert!(!is_foreign_control_envelope(line));
+    }
+
+    #[test]
+    fn is_foreign_control_envelope_ignores_a_framed_hook_line() {
+        let line =
+            b"{\"type\":\"hook\",\"id\":5,\"version\":1,\"hook\":\"PreToolUse\",\"call\":{}}\n";
+
+        assert!(!is_foreign_control_envelope(line));
+    }
+
+    #[test]
+    fn is_foreign_control_envelope_matches_a_control_reply() {
+        let line = b"{\"kind\":\"control\",\"id\":7,\"version\":1,\"result\":{}}\n";
+
+        assert!(is_foreign_control_envelope(line));
+    }
+
+    #[test]
+    fn is_foreign_control_envelope_matches_an_error_reply() {
+        let line = b"{\"kind\":\"error\",\"id\":8,\"version\":1}\n";
+
+        assert!(is_foreign_control_envelope(line));
+    }
+
+    /// A plugin folder removed when the guard drops, so tests leave no files.
+    struct TempPluginFolder(PathBuf);
+
+    impl Drop for TempPluginFolder {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_line_event_answers_a_health_line_without_draining() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "barn-luau-serve-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("create the plugin folder");
+        let folder = TempPluginFolder(root);
+
+        std::fs::write(
+            folder.0.join("plugin.luau"),
+            "return { name = 'serve-health', tools = {} }",
+        )
+        .expect("write the plugin fixture");
+
+        let limits = Limits::new(16 * 1024 * 1024, 100).expect("valid limits");
+        let sandbox = Arc::new(
+            Sandbox::new(
+                folder.0.as_path(),
+                limits,
+                Capabilities::default(),
+                real_clock(),
+            )
+            .expect("fixture loads"),
+        );
+
+        let mut line = b"{\"jsonrpc\":\"2.0\",\"method\":\"stall.health\",\"id\":5}\n".to_vec();
+        let mut sink = Vec::new();
+        let mut calls = JoinSet::new();
+        let mut pending = BTreeMap::new();
+        let mut need_slot = false;
+        let mut pending_control = None;
+
+        let drained = handle_line_event(
+            &mut sink,
+            &mut line,
+            &mut calls,
+            &mut pending,
+            &mut need_slot,
+            &mut pending_control,
+            &sandbox,
+        )
+        .await
+        .expect("the health line is handled");
+
+        assert!(!drained);
+        assert_eq!(sink, b"{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":null}\n");
     }
 }

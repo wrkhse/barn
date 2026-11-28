@@ -896,6 +896,15 @@ fn a_stall_control_reply_must_echo_the_id_and_version() {
 }
 
 #[test]
+fn a_stall_control_error_reply_needs_both_error_and_message() {
+    let only_error = br#"{"kind":"error","id":21,"version":1,"error":"denied"}"#;
+    let only_message = br#"{"kind":"error","id":21,"version":1,"message":"no"}"#;
+
+    assert!(!stall_control_reply(only_error, 21));
+    assert!(!stall_control_reply(only_message, 21));
+}
+
+#[test]
 fn a_stall_control_reply_with_a_different_id_is_rejected() {
     let duplicate = br#"{"kind":"control","id":22,"version":1,"result":{"ok":true}}"#;
 
