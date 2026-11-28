@@ -161,7 +161,8 @@ printf 'ok: carry_forward does not read BODY_HASH before gather\n'
 # The review job must check out the scripts before it tries to carry forward,
 # with an explicit depth on that first checkout. One workflow keeps it shallow;
 # the other fetches fully so it can pin scripts to the base commit. A file counts
-# only when the ordering holds and its depth is one of those two explicit values.
+# only when the ordering holds, its depth is one of those two explicit values,
+# and the base-script pin sits between the checkout and carry_forward.
 checkout_ok=false
 for candidate in "${workflows[@]}"; do
   [ -f "$candidate" ] || continue
@@ -180,11 +181,15 @@ for candidate in "${workflows[@]}"; do
     0|1) ;;
     *) continue ;;
   esac
+  pin_line=$(awk -v s="$checkout_line" -v e="$carry_line" 'NR>s && NR<e && $0 !~ /^[[:space:]]*#/ && index($0, "git checkout") && index($0, "BASE_SHA") && index($0, "-- .github/scripts") { print NR; exit }' "$candidate")
+  if [ -z "$pin_line" ]; then
+    continue
+  fi
   checkout_ok=true
   break
 done
 if [ "$checkout_ok" != true ]; then
-  echo 'FAIL: neither workflow checks out the review scripts before carry_forward' >&2
+  echo 'FAIL: no workflow checks out and pins review scripts before carry_forward' >&2
   exit 1
 fi
-printf 'ok: review checkout precedes carry_forward\n'
+printf 'ok: review checkout and base-script pin precede carry_forward\n'
