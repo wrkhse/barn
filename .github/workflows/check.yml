@@ -41,9 +41,6 @@ jobs:
           channel=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
       - run: cargo fmt --all -- --check
-      - name: "Proof: deliberate failure"
-        shell: bash
-        run: exit 1
 
   clippy:
     needs: [fmt]
