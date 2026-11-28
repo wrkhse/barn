@@ -265,17 +265,36 @@ cat > "$tmp/agent-dirs-files.json" <<'JSON'
 JSON
 run_docs_case agent-dirs "$tmp/agent-dirs.json" "$tmp/agent-dirs-files.json" 2 false
 
-# A Markdown file pulled into Rust with include_str! is code. The note must
-# survive into NOTES.txt so the reviewer is told why the verdict is blocking.
+# A crate-root doc include resolves ../README.md from a nested .rs file.
 cat > "$tmp/include-str.json" <<'JSON'
-{"title":"Included doc","body":"","files":[{"path":"docs/guide.md"}]}
+{"title":"Included doc","body":"","files":[{"path":"crates/x/README.md"}]}
 JSON
 cat > "$tmp/include-str-files.json" <<'JSON'
-[{"filename":"docs/guide.md","previous_filename":null,"status":"modified"}]
+[{"filename":"crates/x/README.md","previous_filename":null,"status":"modified"}]
 JSON
-mkdir -p "$tmp/src"
-printf '%s\n' 'const GUIDE: &str = include_str!("../docs/guide.md");' > "$tmp/src/guide.rs"
+mkdir -p "$tmp/crates/x/src"
+printf '%s\n' '#![doc = include_str!("../README.md")];' > "$tmp/crates/x/src/lib.rs"
 run_docs_case include-str "$tmp/include-str.json" "$tmp/include-str-files.json" 1 false
-grep -Fq 'Markdown docs/guide.md is included by include_str! in Rust; reviewing as code.' \
+grep -Fq 'Markdown crates/x/README.md is included by include_str! in Rust; reviewing as code.' \
   "$tmp/docs-include-str/NOTES.txt"
 printf 'ok: docs-only include-str note\n'
+
+# Without rg the include check cannot run, so classification must fail closed.
+cat > "$tmp/no-rg.json" <<'JSON'
+{"title":"No rg","body":"","files":[{"path":"README.md"}]}
+JSON
+cat > "$tmp/no-rg-files.json" <<'JSON'
+[{"filename":"README.md","previous_filename":null,"status":"modified"}]
+JSON
+out="$tmp/docs-no-rg"
+printf '%s\n' 1 > "$tmp/changed-files.txt"
+PR_FIXTURE="$tmp/no-rg.json" "$tmp/gh-pr-files" pr view 1 -R o/r \
+  --json title,body,files > "$tmp/pr.json"
+BASE="$base" HEAD="$head" PR_JSON="$tmp/pr.json" REPO=o/r PR=1 \
+  CHANGED_FILES="$tmp/changed-files.txt" \
+  API_FILES_FIXTURE="$tmp/no-rg-files.json" GH="$tmp/gh" RG="$tmp/no-such-rg" \
+  OUT="$out" MAX_BYTES=1000 MAX_COMMITS=100 "$gather"
+
+[ "$(cat -- "$out/docs-only.txt")" = "false" ]
+grep -Fq 'cannot check include_str! references; reviewing as code.' "$out/NOTES.txt"
+printf 'ok: docs-only missing rg fails closed\n'

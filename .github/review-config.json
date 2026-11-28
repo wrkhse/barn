@@ -1,0 +1,15 @@
+{
+  "governance_names": [
+    "agents.md",
+    "claude.md",
+    "contributing.md",
+    "philosophy.md",
+    "security.md"
+  ],
+  "governance_paths": [
+    "docs/repository-standards.md",
+    "docs/issues-and-pull-requests.md"
+  ],
+  "non_docs_globs": [".github/**", ".claude/**", ".agents/**", ".opencode/**"],
+  "include_roots": ["."]
+}
