@@ -8,7 +8,8 @@ set -euo pipefail
 : "${REPO:?REPO is required}" \
   "${PR:?PR is required}" \
   "${HEAD_SHA:?HEAD_SHA is required}" \
-  "${BASE_SHA:?BASE_SHA is required}"
+  "${BASE_SHA:?BASE_SHA is required}" \
+  "${PR_JSON:?PR_JSON is required}"
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 marker='<!-- opencode-review -->'
@@ -27,7 +28,7 @@ lookup_failed() {
 
 # Writer and reader must hash the body the same way; a failure reviews fresh.
 body_hash=''
-if ! body_hash=$(REPO="$REPO" PR="$PR" bash "$script_dir/pr-body-hash.sh" 2> "$err"); then
+if ! body_hash=$(PR_JSON="$PR_JSON" bash "$script_dir/pr-body-hash.sh" 2> "$err"); then
   lookup_failed
 fi
 

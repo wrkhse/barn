@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
-: "${REPO:?REPO is required}" "${PR:?PR is required}"
-gh api "repos/$REPO/pulls/$PR" --jq '.body // ""' | sha256sum | cut -d' ' -f1
+: "${PR_JSON:?PR_JSON is required}"
+jq -r '.body // ""' "$PR_JSON" | sha256sum | cut -d' ' -f1

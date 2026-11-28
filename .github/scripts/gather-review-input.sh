@@ -220,45 +220,67 @@ if [ "$docs_only" = true ]; then
         | select(type == "string" and test("\\.md$"; "i")) ] | unique | .[]' 2> /dev/null || true)
     mapfile -t roots < <(jq -r '.include_roots[]?' "$config" 2> /dev/null)
     [ "${#roots[@]}" -gt 0 ] || roots=(.)
-    includes=$("$RG" -n --no-heading --max-filesize 2000000 \
-      --glob '*.rs' --glob '!target/**' 'include_str!.*"[^"]+"' \
-      "${roots[@]}" 2> /dev/null | head -n 200 || true)
-    while IFS= read -r md; do
-      [ -n "$md" ] || continue
-      target=$(normalize_path "$md")
-      while IFS= read -r hit; do
-        [ -n "$hit" ] || continue
-        file=${hit%%:*}
-        dir=${file%/*}
-        if [ "$dir" = "$file" ]; then dir='.'; fi
-        if printf '%s\n' "$hit" | grep -Fq 'CARGO_MANIFEST_DIR'; then
-          # Crate-root includes are safe only when the manifest and the
-          # concatenated suffix can both be resolved.
-          manifest=$(find_manifest "$dir" || true)
-          inc=''
-          if [ -n "$manifest" ]; then
-            inc=$(printf '%s\n' "$hit" | sed -n 's/.*concat!(.*CARGO_MANIFEST_DIR[^,]*,[[:space:]]*"\([^"]*\)".*/\1/p')
+    # Flatten each Rust file so a path split across lines still matches, and
+    # parse every include separately. A truncated or unparseable scan fails closed.
+    scan="$OUT/include-scan.txt"
+    : > "$scan"
+    files=$("$RG" -l --glob '*.rs' --glob '!target/**' 'include_str!' "${roots[@]}" 2> /dev/null || true)
+    file_count=$(printf '%s\n' "$files" | grep -c . || true)
+    raw_count=0
+    if [ "$file_count" -gt 100 ]; then
+      docs_only=false
+      printf 'include_str! scan covered too many files (%s); reviewing as code.\n' "$file_count" >> "$notes"
+    else
+      while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        flat=$(tr '\n' ' ' < "$file")
+        n=$(printf '%s' "$flat" | "$RG" -o 'include_str!' 2> /dev/null | wc -l || true)
+        raw_count=$((raw_count + n))
+        printf '%s' "$flat" | "$RG" --label "$file" -o --no-heading \
+          'include_str!\s*\(\s*"[^"]*"|include_str!\s*\(concat!\s*\(\s*env!\s*\(\s*"CARGO_MANIFEST_DIR"\s*\)\s*,\s*"[^"]*"' \
+          >> "$scan" 2> /dev/null || true
+      done <<< "$files"
+      parsed_count=$(grep -c . "$scan" || true)
+      if [ "$raw_count" -gt "$parsed_count" ] || [ "$parsed_count" -gt 200 ]; then
+        docs_only=false
+        printf 'include_str! scan was truncated or unparseable (%s of %s includes); reviewing as code.\n' \
+          "$parsed_count" "$raw_count" >> "$notes"
+      fi
+    fi
+
+    if [ "$docs_only" = true ]; then
+      while IFS= read -r md; do
+        [ -n "$md" ] || continue
+        target=$(normalize_path "$md")
+        while IFS= read -r hit; do
+          [ -n "$hit" ] || continue
+          file=${hit%%:*}
+          expr=${hit#*:}
+          inc=$(printf '%s' "$expr" | grep -o '"[^"]*"' | tail -n 1 | tr -d '"')
+          [ -n "$inc" ] || continue
+          dir=${file%/*}
+          if [ "$dir" = "$file" ]; then dir='.'; fi
+          if printf '%s' "$expr" | grep -Fq 'CARGO_MANIFEST_DIR'; then
+            manifest=$(find_manifest "$dir" || true)
+            if [ -z "$manifest" ]; then
+              docs_only=false
+              printf 'include_str! with CARGO_MANIFEST_DIR could not be resolved; reviewing as code.\n' >> "$notes"
+              break
+            fi
+            inc=${inc#/}
+            resolved=$(normalize_path "$(dirname -- "$manifest")/$inc")
+          else
+            resolved=$(normalize_path "$dir/$inc")
           fi
-          if [ -z "$manifest" ] || [ -z "$inc" ]; then
+          if [ "$resolved" = "$target" ]; then
             docs_only=false
-            printf 'include_str! with CARGO_MANIFEST_DIR could not be resolved; reviewing as code.\n' >> "$notes"
+            printf 'Markdown %s is included by include_str! in Rust; reviewing as code.\n' "$md" >> "$notes"
             break
           fi
-          inc=${inc#/}
-          resolved=$(normalize_path "$(dirname -- "$manifest")/$inc")
-        else
-          inc=$(printf '%s\n' "$hit" | sed -n 's/.*include_str!.*"\([^"]*\)".*/\1/p')
-          [ -n "$inc" ] || continue
-          resolved=$(normalize_path "$dir/$inc")
-        fi
-        if [ "$resolved" = "$target" ]; then
-          docs_only=false
-          printf 'Markdown %s is included by include_str! in Rust; reviewing as code.\n' "$md" >> "$notes"
-          break
-        fi
-      done <<< "$includes"
-      if [ "$docs_only" = false ]; then break; fi
-    done <<< "$md_paths"
+        done < "$scan"
+        if [ "$docs_only" = false ]; then break; fi
+      done <<< "$md_paths"
+    fi
   fi
 fi
 

@@ -314,3 +314,18 @@ run_docs_case cargo-manifest "$tmp/cargo-manifest.json" "$tmp/cargo-manifest-fil
 grep -Fq 'include_str! with CARGO_MANIFEST_DIR could not be resolved; reviewing as code.' \
   "$tmp/docs-cargo-manifest/NOTES.txt"
 printf 'ok: docs-only unresolved CARGO_MANIFEST_DIR fails closed\n'
+
+# A raw-string include cannot be parsed, so the scan must fail closed.
+mkdir -p "$tmp/unparseable/src"
+printf '%s\n' 'const RAW: &str = include_str!(r"docs/raw.md");' \
+  > "$tmp/unparseable/src/lib.rs"
+cat > "$tmp/unparseable.json" <<'JSON'
+{"title":"Unparseable","body":"","files":[{"path":"README.md"}]}
+JSON
+cat > "$tmp/unparseable-files.json" <<'JSON'
+[{"filename":"README.md","previous_filename":null,"status":"modified"}]
+JSON
+run_docs_case unparseable "$tmp/unparseable.json" "$tmp/unparseable-files.json" 1 false
+grep -Fq 'include_str! scan was truncated or unparseable' \
+  "$tmp/docs-unparseable/NOTES.txt"
+printf 'ok: docs-only unparseable include scan fails closed\n'

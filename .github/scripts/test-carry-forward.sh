@@ -15,24 +15,11 @@ trap 'rm -rf -- "$tmp"' EXIT
 mkdir -p "$tmp/bin"
 cat > "$tmp/bin/gh" <<'STUB'
 #!/usr/bin/env bash
-if [[ "${1-}" != api ]]; then
+if [[ "${1-}" != api || "${2-}" != --paginate || "${3-}" != --jq ]]; then
   echo 'unexpected gh command' >&2
   exit 1
 fi
-if [[ "${2-}" = --paginate ]]; then
-  if [[ "${3-}" != --jq || "${5-}" != *"/comments" ]]; then
-    echo 'unexpected gh comments query' >&2
-    exit 1
-  fi
-  printf '%s\n' "$GH_COMMENTS"
-  exit 0
-fi
-if [[ "${2-}" = *"/pulls/"* && "${3-}" = --jq ]]; then
-  printf '%s' "$PR_BODY_JSON" | jq -r "$4"
-  exit 0
-fi
-echo 'unexpected gh command' >&2
-exit 1
+printf '%s\n' "$GH_COMMENTS"
 STUB
 chmod +x "$tmp/bin/gh"
 export PATH="$tmp/bin:$PATH"
@@ -45,10 +32,11 @@ head_sha=0123456789abcdef0123456789abcdef01234567
 base_sha=fedcba9876543210fedcba9876543210fedcba98765432
 other_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 other_base=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-pr_body='Fixture PR body.'
-pr_body_json=$(jq -nc --arg b "$pr_body" '{body:$b}')
-# The hash the writer put in the meta line, computed exactly as the helper does.
-body_hash=$(printf '%s\n' "$pr_body" | sha256sum | cut -d' ' -f1)
+pr_json="$tmp/pr.json"
+jq -nc --arg b 'Fixture PR body.' '{title:"Fixture",body:$b,files:[]}' > "$pr_json"
+hash_helper="$root/.github/scripts/pr-body-hash.sh"
+# The writer's hash comes from the same helper the reader calls.
+body_hash=$(PR_JSON="$pr_json" bash "$hash_helper")
 other_hash=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 
 summary="$tmp/summary"
@@ -71,7 +59,7 @@ check() {
   : > "$out"
   GH_COMMENTS="$comments" \
     REPO=owner/repo PR=42 \
-    HEAD_SHA="$head_sha" BASE_SHA="$base_sha" PR_BODY_JSON="$pr_body_json" \
+    HEAD_SHA="$head_sha" BASE_SHA="$base_sha" PR_JSON="$pr_json" \
     GITHUB_OUTPUT="$out" \
     bash "$script" > "$tmp/log" 2>&1
   actual=$(sed -n 's/^carried=//p' "$out" | tail -n 1)
@@ -87,15 +75,13 @@ check() {
 # older FIX FIRST comment must not win.
 comments=$(printf '%s\n%s\n' \
   "$(comment 100 41898282 "$(body_of '**Verdict: FIX FIRST**' "$head_sha" "$base_sha" "$body_hash")")" \
-  "$(comment 200 41898282 "$(body_of '**Verdict: MERGE AS IS**' "$head_sha" "$base_sha" "$body_hash")")" \
-  | jq -s .)
+  "$(comment 200 41898282 "$(body_of '**Verdict: MERGE AS IS**' "$head_sha" "$base_sha" "$body_hash")")")
 check 'newest matching MERGE AS IS comment' true "$comments"
 
 # 2. A newer comment from another head wins, so no verdict carries.
 comments=$(printf '%s\n%s\n' \
   "$(comment 100 41898282 "$(body_of '**Verdict: MERGE AS IS**' "$head_sha" "$base_sha" "$body_hash")")" \
-  "$(comment 200 41898282 "$(body_of '**Verdict: MERGE AS IS**' "$other_sha" "$base_sha" "$body_hash")")" \
-  | jq -s .)
+  "$(comment 200 41898282 "$(body_of '**Verdict: MERGE AS IS**' "$other_sha" "$base_sha" "$body_hash")")")
 check 'newer comment on another head' false "$comments"
 
 # 3. FIX FIRST never carries.
@@ -151,3 +137,22 @@ if awk -v s="$carry_line" -v e="$hash_line" \
   exit 1
 fi
 printf 'ok: carry_forward does not read BODY_HASH before gather\n'
+
+# The review job must check out the scripts before it tries to carry forward.
+review_line=$(awk '/^  review:/{print NR; exit}' "$workflow")
+checkout_line=$(awk -v s="$review_line" 'NR>s && /- uses: actions\/checkout/{print NR; exit}' "$workflow")
+carry_line=$(awk '/id: carry_forward/{print NR; exit}' "$workflow")
+if [ -z "$review_line" ] || [ -z "$checkout_line" ] || [ -z "$carry_line" ]; then
+  echo 'FAIL: could not locate review job, checkout or carry_forward' >&2
+  exit 1
+fi
+if [ "$checkout_line" -ge "$carry_line" ]; then
+  echo 'FAIL: review checkout appears after carry_forward' >&2
+  exit 1
+fi
+depth=$(awk -v s="$checkout_line" 'NR>s && NR<=s+4 && /fetch-depth:/{print $2; exit}' "$workflow")
+if [ "$depth" != 1 ]; then
+  echo 'FAIL: first review checkout is not fetch-depth 1' >&2
+  exit 1
+fi
+printf 'ok: review checkout precedes carry_forward\n'
