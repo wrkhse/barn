@@ -414,14 +414,19 @@ fn read_line(reader: &mut impl BufRead) -> String {
 
 /// Abort every live stall so a failed health read's SIGABRT lands in barn's
 /// captured stderr with a backtrace, then fail with a named reason.
-fn abort_stalls_and_panic(pids: &[u32], reason: &str) -> ! {
+fn abort_stalls_and_panic(pids: &[u32], reason: &str) {
     for pid in pids {
         eprintln!("HOST TRACE health read failure: {reason}; aborting stall {pid}");
         let _ = Command::new("kill")
             .args(["-ABRT", &pid.to_string()])
             .status();
     }
-    std::panic::panic_any(format!("stalls {pids:?} aborted: {reason}"));
+    must_res(
+        Err::<(), _>(io::Error::other(format!(
+            "stalls {pids:?} aborted: {reason}"
+        ))),
+        "stall abort",
+    );
 }
 
 /// On a failed or closed health reply read, abort the stall and fail the test.
@@ -484,7 +489,7 @@ fn start_and_start_host(launch: &mut Launch) -> BufReader<UnixStream> {
             pid: std::process::id(),
         },
     });
-    writeln!(host.get_mut(), "{start}").expect("send host.start");
+    must_res(writeln!(host.get_mut(), "{start}"), "send host.start");
 
     assert_eq!(
         parse(&read_line(&mut host)),
