@@ -162,6 +162,9 @@ pub enum StallEvent {
     Oversize,
 }
 
+/// Shared origin for the env-gated stall-event trace.
+static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 /// Env-gated diagnostic for the bounded stall-event channel. Setting
 /// `BARN_TEST_TRACE` prints timestamped events to stderr; nothing else reads
 /// the variable, so tracing cannot change supervision behavior.
@@ -169,13 +172,12 @@ fn trace_stall_event(message: impl FnOnce() -> String) {
     if std::env::var_os("BARN_TEST_TRACE").is_none() {
         return;
     }
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     let start = START.get_or_init(std::time::Instant::now);
     eprintln!("[stall-event {:?}] {}", start.elapsed(), message());
 }
 
 /// The variant name of an event, without its payload.
-fn stall_event_kind(event: &StallEvent) -> &'static str {
+const fn stall_event_kind(event: &StallEvent) -> &'static str {
     match event {
         StallEvent::Line(_) => "Line",
         StallEvent::Exited => "Exited",
@@ -196,7 +198,7 @@ impl StallReceiver {
         let event = self.rx.recv().await;
         match &event {
             Some(event) => {
-                trace_stall_event(|| format!("recv done: Some({})", stall_event_kind(event)))
+                trace_stall_event(|| format!("recv done: Some({})", stall_event_kind(event)));
             }
             None => trace_stall_event(|| "recv done: None".to_owned()),
         }
@@ -1559,24 +1561,23 @@ async fn broker_host_frame(
         return refuse(host, &id, HostDeny::PeerLoss, DENY_WRITE_TIMEOUT).await;
     }
 
-    trace_stall_event(|| format!("host reply wait start: id={}", id));
+    trace_stall_event(|| format!("host reply wait start: id={id}"));
     let reply = timeout(limit, rx.recv()).await;
     match &reply {
         Ok(Some(StallEvent::Line(_))) => {
-            trace_stall_event(|| format!("host reply wait done: id={} outcome=Line", id));
+            trace_stall_event(|| format!("host reply wait done: id={id} outcome=Line"));
         }
         Ok(Some(event)) => trace_stall_event(|| {
             format!(
-                "host reply wait done: id={} outcome={}",
-                id,
+                "host reply wait done: id={id} outcome={}",
                 stall_event_kind(event)
             )
         }),
         Ok(None) => {
-            trace_stall_event(|| format!("host reply wait done: id={} outcome=None", id));
+            trace_stall_event(|| format!("host reply wait done: id={id} outcome=None"));
         }
         Err(_) => {
-            trace_stall_event(|| format!("host reply wait done: id={} outcome=timeout", id));
+            trace_stall_event(|| format!("host reply wait done: id={id} outcome=timeout"));
         }
     }
     let line = match reply {
