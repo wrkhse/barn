@@ -488,10 +488,15 @@ async fn broker_host(
                 if let Some(StallEvent::Line(line)) = &event
                     && let Some(id) = stall_control_request(line)
                 {
-                    running
-                        .serve_stall_control(host, stall, line, id)
-                        .await
-                        .map_err(after_supervisor)?;
+                    tokio::select! {
+                        biased;
+                        _ = terminate.recv() => {
+                            return drain_on_sigterm(stall, rx, running).await;
+                        }
+                        served = running.serve_stall_control(host, stall, line, id) => {
+                            served.map_err(after_supervisor)?;
+                        }
+                    }
 
                     continue;
                 }

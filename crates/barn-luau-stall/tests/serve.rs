@@ -656,3 +656,164 @@ async fn a_named_tack_control_error_becomes_the_hook_error() {
     let outcome = finish(peer.task).await.expect("serve stops");
     assert!(matches!(outcome, Err(ServeError::Closed)));
 }
+
+#[tokio::test]
+async fn a_control_reply_after_timeout_is_skipped_and_the_next_hook_is_served() {
+    let mut peer = peer_with(CONTROL_NEED_PLUGIN, CALL_MS).expect("a peer");
+    peer.send(&control_hook(73)).await.expect("send the hook");
+
+    // The peer reads the request but does not answer, so the control call
+    // reaches its deadline (CONTROL_TIMEOUT, below this hook's own budget).
+    assert_eq!(
+        serde_json::from_str::<Value>(&peer.read().await.expect("a control request line"))
+            .expect("a JSON frame"),
+        json!({
+            "kind": "control",
+            "id": 0,
+            "version": PROTOCOL_VERSION,
+            "call": "navigate",
+            "input": { "who": "x" },
+        })
+    );
+
+    assert_eq!(
+        tokio::time::timeout(WAIT, peer.reply())
+            .await
+            .expect("the control call times out with a verdict")
+            .expect("a verdict"),
+        Reply::Error {
+            id: 73,
+            error: "capability".into(),
+            message: "capability control.call: control call timed out".into(),
+        }
+    );
+
+    // The peer's answer arrives after the pending call was already cleared.
+    let late = TackReply::Control {
+        id: 0,
+        version: PROTOCOL_VERSION,
+        result: json!({ "url": "https://example.test/late" }),
+    };
+    peer.send(&serde_json::to_string(&late).expect("a late control reply"))
+        .await
+        .expect("send the late control reply");
+
+    // A real hook after that stale line still gets its exact verdict.
+    peer.send(&control_hook(74))
+        .await
+        .expect("send the next hook");
+    assert_eq!(
+        serde_json::from_str::<Value>(&peer.read().await.expect("a control request line"))
+            .expect("a JSON frame"),
+        json!({
+            "kind": "control",
+            "id": 1,
+            "version": PROTOCOL_VERSION,
+            "call": "navigate",
+            "input": { "who": "x" },
+        })
+    );
+    let next = TackReply::Control {
+        id: 1,
+        version: PROTOCOL_VERSION,
+        result: json!({ "url": "https://example.test/next" }),
+    };
+    peer.send(&serde_json::to_string(&next).expect("a control reply"))
+        .await
+        .expect("send the control reply");
+
+    assert_eq!(
+        peer.reply().await.expect("the next verdict"),
+        Reply::Hook {
+            id: 74,
+            outcome: Outcome::Rewrite {
+                input: json!({ "url": "https://example.test/next" }),
+            },
+        }
+    );
+
+    drop(peer.wire);
+    let outcome = finish(peer.task).await.expect("serve stops");
+    assert!(matches!(outcome, Err(ServeError::Closed)));
+}
+
+#[tokio::test]
+async fn a_late_control_envelope_with_another_id_is_skipped_and_the_next_hook_is_served() {
+    let mut peer = peer_with(CONTROL_NEED_PLUGIN, CALL_MS).expect("a peer");
+    peer.send(&control_hook(75)).await.expect("send the hook");
+
+    assert_eq!(
+        serde_json::from_str::<Value>(&peer.read().await.expect("a control request line"))
+            .expect("a JSON frame"),
+        json!({
+            "kind": "control",
+            "id": 0,
+            "version": PROTOCOL_VERSION,
+            "call": "navigate",
+            "input": { "who": "x" },
+        })
+    );
+    let first = TackReply::Control {
+        id: 0,
+        version: PROTOCOL_VERSION,
+        result: json!({ "url": "https://example.test/first" }),
+    };
+    peer.send(&serde_json::to_string(&first).expect("a control reply"))
+        .await
+        .expect("send the control reply");
+    assert_eq!(
+        peer.reply().await.expect("the verdict"),
+        Reply::Hook {
+            id: 75,
+            outcome: Outcome::Rewrite {
+                input: json!({ "url": "https://example.test/first" }),
+            },
+        }
+    );
+
+    // A second control envelope whose id no pending call is waiting for.
+    let stray = TackReply::Control {
+        id: 42,
+        version: PROTOCOL_VERSION,
+        result: json!({ "url": "https://example.test/stray" }),
+    };
+    peer.send(&serde_json::to_string(&stray).expect("a stray control line"))
+        .await
+        .expect("send the stray control line");
+
+    peer.send(&control_hook(76))
+        .await
+        .expect("send the next hook");
+    assert_eq!(
+        serde_json::from_str::<Value>(&peer.read().await.expect("a control request line"))
+            .expect("a JSON frame"),
+        json!({
+            "kind": "control",
+            "id": 1,
+            "version": PROTOCOL_VERSION,
+            "call": "navigate",
+            "input": { "who": "x" },
+        })
+    );
+    let second = TackReply::Control {
+        id: 1,
+        version: PROTOCOL_VERSION,
+        result: json!({ "url": "https://example.test/second" }),
+    };
+    peer.send(&serde_json::to_string(&second).expect("a control reply"))
+        .await
+        .expect("send the control reply");
+    assert_eq!(
+        peer.reply().await.expect("the next verdict"),
+        Reply::Hook {
+            id: 76,
+            outcome: Outcome::Rewrite {
+                input: json!({ "url": "https://example.test/second" }),
+            },
+        }
+    );
+
+    drop(peer.wire);
+    let outcome = finish(peer.task).await.expect("serve stops");
+    assert!(matches!(outcome, Err(ServeError::Closed)));
+}

@@ -862,6 +862,21 @@ fn a_stall_control_request_accepts_only_a_version_one_control_envelope() {
 }
 
 #[test]
+fn a_stall_control_request_with_a_missing_guard_is_ignored() {
+    let without_call = br#"{"kind":"control","id":21,"version":1,"input":{}}"#;
+    let without_input = br#"{"kind":"control","id":21,"version":1,"call":"do.thing"}"#;
+    let string_id = br#"{"kind":"control","id":"21","version":1,"call":"do.thing","input":{}}"#;
+    let null_id = br#"{"kind":"control","id":null,"version":1,"call":"do.thing","input":{}}"#;
+    let absent_id = br#"{"kind":"control","version":1,"call":"do.thing","input":{}}"#;
+
+    assert_eq!(stall_control_request(without_call), None);
+    assert_eq!(stall_control_request(without_input), None);
+    assert_eq!(stall_control_request(string_id), None);
+    assert_eq!(stall_control_request(null_id), None);
+    assert_eq!(stall_control_request(absent_id), None);
+}
+
+#[test]
 fn a_stall_control_reply_must_echo_the_id_and_version() {
     let result = br#"{"kind":"control","id":21,"version":1,"result":{"ok":true}}"#;
     let error = br#"{"kind":"error","id":21,"version":1,"error":"denied","message":"no"}"#;
@@ -878,6 +893,13 @@ fn a_stall_control_reply_must_echo_the_id_and_version() {
     for line in rejected {
         assert!(!stall_control_reply(line, 21), "{line:?}");
     }
+}
+
+#[test]
+fn a_stall_control_reply_with_a_different_id_is_rejected() {
+    let duplicate = br#"{"kind":"control","id":22,"version":1,"result":{"ok":true}}"#;
+
+    assert!(!stall_control_reply(duplicate, 21));
 }
 
 #[tokio::test]

@@ -178,6 +178,7 @@ pub async fn serve(
                 &mut line,
                 &mut calls,
                 &mut need_slot,
+                pending_control.is_some(),
             ) => event?,
 
             Some(call) = control_rx.recv(), if control_deadline.is_none() => {
@@ -199,31 +200,19 @@ pub async fn serve(
 
         match event {
             Event::Line => {
-                if take_control_reply(&mut line, &mut pending_control) {
-                    continue;
-                }
-
-                let frame = decode_frame(&mut writer, &mut line).await?;
-                trace(|| match &frame {
-                    Frame::Health(_) => "frame: health".to_owned(),
-                    Frame::Drain(_) => "frame: drain".to_owned(),
-                    Frame::Request(_) => "frame: request".to_owned(),
-                });
-
-                let drained = matches!(frame, Frame::Drain(_));
-                let result = handle_frame(
+                let drained = handle_line_event(
                     &mut writer,
+                    &mut line,
                     &mut calls,
                     &mut pending,
                     &mut need_slot,
-                    frame,
+                    &mut pending_control,
                     &sandbox,
                 )
-                .await;
+                .await?;
                 if drained {
-                    return result;
+                    return Ok(());
                 }
-                result?;
             }
             Event::Call(joined) => {
                 trace(|| "finish_call start".to_owned());
@@ -236,6 +225,61 @@ pub async fn serve(
             }
         }
     }
+}
+
+/// Handle one decoded line: route a matching control reply, skip a control
+/// envelope that answers no pending call, then decode and dispatch the frame.
+///
+/// Returns whether the frame was a drain, which ends the connection.
+async fn handle_line_event(
+    writer: &mut (impl AsyncWrite + Unpin),
+    line: &mut Vec<u8>,
+    calls: &mut JoinSet<Reply>,
+    pending: &mut BTreeMap<task::Id, u64>,
+    need_slot: &mut bool,
+    pending_control: &mut Option<PendingControl>,
+    sandbox: &Arc<Sandbox>,
+) -> Result<bool, ServeError> {
+    if take_control_reply(line, pending_control) {
+        return Ok(false);
+    }
+
+    if is_foreign_control_envelope(line) {
+        trace(|| "skip foreign control envelope".to_owned());
+        line.clear();
+
+        return Ok(false);
+    }
+
+    let frame = decode_frame(writer, line).await?;
+    trace(|| match &frame {
+        Frame::Health(_) => "frame: health".to_owned(),
+        Frame::Drain(_) => "frame: drain".to_owned(),
+        Frame::Request(_) => "frame: request".to_owned(),
+    });
+
+    let drained = matches!(frame, Frame::Drain(_));
+    handle_frame(writer, calls, pending, need_slot, frame, sandbox).await?;
+
+    Ok(drained)
+}
+
+/// Whether a line is a control envelope that answers no pending call.
+///
+/// A late reply after a timeout, or a duplicate reply, carries `kind` set to
+/// "control" or "error" and a numeric `version`, whatever its id. Barn's own
+/// requests carry a `type` tag instead, so they keep the normal decode path.
+fn is_foreign_control_envelope(line: &[u8]) -> bool {
+    let Ok(envelope) = serde_json::from_slice::<Value>(line) else {
+        return false;
+    };
+
+    let control_kind = matches!(
+        envelope.get("kind").and_then(Value::as_str),
+        Some("control" | "error")
+    );
+
+    control_kind && envelope.get("version").is_some_and(Value::is_number)
 }
 
 /// Write one queued control request and remember its reply channel.
@@ -352,68 +396,86 @@ async fn handle_frame(
     Ok(())
 }
 
+/// An event for a finished call, traced with the branch that observed it.
+fn call_event(branch: &str, joined: Result<(task::Id, Reply), task::JoinError>) -> Event {
+    trace(|| {
+        let (kind, id) = match &joined {
+            Ok((task, _)) => ("answered", *task),
+            Err(error) => ("join_error", error.id()),
+        };
+        format!(
+            "next_event call complete ({branch}) {}",
+            joined_tag(kind, id)
+        )
+    });
+    Event::Call(joined)
+}
+
+/// Read one line into an event, naming a read error on the wire first.
+async fn read_event(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    writer: &mut (impl AsyncWrite + Unpin),
+    line: &mut Vec<u8>,
+) -> Result<Event, ServeError> {
+    if let Err(error) = read_or_report(reader, writer, line).await {
+        trace(|| format!("next_event read error {error:?}"));
+
+        return Err(error);
+    }
+
+    Ok(Event::Line)
+}
+
 /// Choose the next event, giving a busy stall a call slot before another read.
+///
+/// While a control call is pending the read stays live even in the need-slot
+/// branch, so a late or duplicate control reply can be read and skipped.
 async fn next_event(
     reader: &mut (impl AsyncBufRead + Unpin),
     writer: &mut (impl AsyncWrite + Unpin),
     line: &mut Vec<u8>,
     calls: &mut JoinSet<Reply>,
     need_slot: &mut bool,
+    control_pending: bool,
 ) -> Result<Event, ServeError> {
-    if *need_slot
-        && !calls.is_empty()
-        && let Some(joined) = calls.join_next_with_id().await
-    {
-        *need_slot = false;
-        trace(|| {
-            let (kind, id) = match &joined {
-                Ok((task, _)) => ("answered", *task),
-                Err(error) => ("join_error", error.id()),
+    if *need_slot && !calls.is_empty() {
+        if control_pending {
+            let event = tokio::select! {
+                read = read_or_report(reader, writer, line) => match read {
+                    Ok(()) => Event::Line,
+                    Err(error) => {
+                        trace(|| format!("next_event read error (need_slot) {error:?}"));
+                        return Err(error);
+                    }
+                },
+                Some(joined) = calls.join_next_with_id() => call_event("need_slot", joined),
             };
-            format!(
-                "next_event call complete (need_slot) {}",
-                joined_tag(kind, id)
-            )
-        });
+            *need_slot = false;
 
-        return Ok(Event::Call(joined));
+            return Ok(event);
+        }
+        if let Some(joined) = calls.join_next_with_id().await {
+            *need_slot = false;
+
+            return Ok(call_event("need_slot", joined));
+        }
     }
 
     *need_slot = false;
 
     if calls.is_empty() {
-        if let Err(error) = read_or_report(reader, writer, line).await {
-            trace(|| format!("next_event read error (idle) {error:?}"));
-
-            return Err(error);
-        }
-
-        return Ok(Event::Line);
+        return read_event(reader, writer, line).await;
     }
 
     tokio::select! {
-        read = read_or_report(reader, writer, line) => {
-            match read {
-                Ok(()) => Ok(Event::Line),
-                Err(error) => {
-                    trace(|| format!("next_event read error (select) {error:?}"));
-                    Err(error)
-                }
+        read = read_or_report(reader, writer, line) => match read {
+            Ok(()) => Ok(Event::Line),
+            Err(error) => {
+                trace(|| format!("next_event read error (select) {error:?}"));
+                Err(error)
             }
-        }
-        Some(joined) = calls.join_next_with_id() => {
-            trace(|| {
-                let (kind, id) = match &joined {
-                    Ok((task, _)) => ("answered", *task),
-                    Err(error) => ("join_error", error.id()),
-                };
-                format!(
-                    "next_event call complete (select) {}",
-                    joined_tag(kind, id)
-                )
-            });
-            Ok(Event::Call(joined))
-        }
+        },
+        Some(joined) = calls.join_next_with_id() => Ok(call_event("select", joined)),
     }
 }
 
@@ -917,6 +979,7 @@ mod tests {
                 &mut line,
                 &mut calls,
                 &mut need_slot,
+                false,
             ),
         )
         .await;
@@ -935,6 +998,7 @@ mod tests {
                 &mut line,
                 &mut calls,
                 &mut need_slot,
+                false,
             ),
         )
         .await

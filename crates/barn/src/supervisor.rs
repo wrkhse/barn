@@ -1619,7 +1619,7 @@ pub async fn broker_stall_control(
     let sent = timeout_at(deadline, host.write_all(request)).await;
 
     if !matches!(sent, Ok(Ok(()))) {
-        return refuse(host, &echoed, HostDeny::PeerLoss, DENY_WRITE_TIMEOUT).await;
+        return refuse(host, &echoed, HostDeny::StalledReply, DENY_WRITE_TIMEOUT).await;
     }
 
     let reply = match timeout_at(deadline, read_line_bounded(host)).await {
@@ -1636,7 +1636,7 @@ pub async fn broker_stall_control(
     let sent = timeout_at(deadline, stall.write_all(&reply)).await;
 
     if !matches!(sent, Ok(Ok(()))) {
-        return refuse(host, &echoed, HostDeny::PeerLoss, DENY_WRITE_TIMEOUT).await;
+        return refuse(host, &echoed, HostDeny::StalledReply, DENY_WRITE_TIMEOUT).await;
     }
 
     Ok(())
