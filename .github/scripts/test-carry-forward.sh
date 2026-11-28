@@ -181,22 +181,31 @@ fi
 printf 'ok: review checkout and base-script pin precede carry_forward\n'
 
 # A later PR must not take an already-based script from HEAD: every HEAD
-# restore in the review workflow has to be guarded by a base-absence check for
-# the same path: git cat-file -e "$BASE_SHA:<path>" || git checkout HEAD -- ...
+# restore in the review workflow needs a base-absence check for the same path
+# on that line or the immediately preceding non-comment line: git cat-file -e
+# "$BASE_SHA:<path>" with a conditional before git checkout HEAD --.
 unguarded=$(awk '
   /^[[:space:]]*#/ { next }
   /git checkout HEAD --/ {
-    if (index($0, "||") == 0 || $0 !~ /git cat-file -e "\$BASE_SHA:/) {
+    same = (index($0, "||") > 0 && $0 ~ /git cat-file -e/ && $0 ~ /\$BASE_SHA:/)
+    previous = (index(prev, "||") > 0 && prev ~ /git cat-file -e/ && prev ~ /\$BASE_SHA:/)
+    if (!same && !previous) {
       print NR
       next
     }
-    guard = substr($0, 1, index($0, "||") - 1)
-    restore = substr($0, index($0, "||") + 2)
+    if (same) {
+      guard = substr($0, 1, index($0, "||") - 1)
+      restore = substr($0, index($0, "||") + 2)
+    } else {
+      guard = prev
+      restore = $0
+    }
     target = restore
-    sub(/^git checkout HEAD -- /, "", target)
+    sub(/^[[:space:]]*git checkout HEAD -- /, "", target)
     gsub(/^"|"$/, "", target)
     if (target == "" || index(guard, target) == 0) print NR
   }
+  { prev = $0 }
 ' "$workflow")
 if [ -n "$unguarded" ]; then
   printf 'FAIL: unguarded git checkout HEAD restore at line(s) %s\n' "$unguarded" >&2
