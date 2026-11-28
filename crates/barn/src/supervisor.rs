@@ -1418,22 +1418,20 @@ fn answers_request(line: &[u8], id: &Value) -> bool {
 
 /// The `host.start` request, with the id used in its reply or denial.
 fn decode_host_start(frame: &[u8]) -> std::result::Result<(Value, HostStartParams), HostDeny> {
-    let mut request: Value =
-        serde_json::from_slice(frame).map_err(|_| HostDeny::ProtocolMismatch)?;
+    let mut request: Value = serde_json::from_slice(frame).map_err(|_| HostDeny::BadFrame)?;
+    let request = request.as_object_mut().ok_or(HostDeny::BadFrame)?;
 
     if request.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
         || request.get("method").and_then(Value::as_str) != Some(method::HOST_START)
     {
         return Err(HostDeny::ProtocolMismatch);
     }
-    let request = request.as_object_mut().ok_or(HostDeny::ProtocolMismatch)?;
     let id = request
         .remove("id")
         .filter(|value| value.is_string() || value.is_i64() || value.is_u64())
-        .ok_or(HostDeny::ProtocolMismatch)?;
-    let params = request.remove("params").ok_or(HostDeny::ProtocolMismatch)?;
-    let params: HostStartParams =
-        serde_json::from_value(params).map_err(|_| HostDeny::ProtocolMismatch)?;
+        .ok_or(HostDeny::BadFrame)?;
+    let params = request.remove("params").ok_or(HostDeny::BadFrame)?;
+    let params: HostStartParams = serde_json::from_value(params).map_err(|_| HostDeny::BadFrame)?;
 
     Ok((id, params))
 }
@@ -1448,7 +1446,7 @@ async fn refuse<T>(
     host_deny: HostDeny,
     limit: Duration,
 ) -> Result<T> {
-    let frame = bounded_frame(&json!({
+    let mut message = json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": {
@@ -1456,7 +1454,17 @@ async fn refuse<T>(
             "message": "denied",
             "data": {"reason": host_deny.reason()}
         }
-    }))?;
+    });
+    let frame = match bounded_frame(&message) {
+        Ok(frame) => frame,
+        Err(SupervisorError::FrameTooLarge) => {
+            if let Some(fields) = message.as_object_mut() {
+                fields.insert("id".to_owned(), Value::Null);
+            }
+            bounded_frame(&message)?
+        }
+        Err(error) => return Err(error),
+    };
     let written = timeout(limit, host.write_all(&frame)).await;
 
     match written {
@@ -2561,9 +2569,123 @@ mod tests {
                         "{frame}"
                     );
                 }
-                None => assert_eq!(decoded.err(), Some(HostDeny::ProtocolMismatch), "{frame}"),
+                None => assert_eq!(decoded.err(), Some(HostDeny::BadFrame), "{frame}"),
             }
         }
+
+        for (frame, deny) in [
+            (
+                json!({
+                    "jsonrpc": "1.0",
+                    "id": 21,
+                    "method": method::HOST_START,
+                    "params": {"protocol": PROTOCOL_VERSION, "token": "secret", "pid": 21}
+                })
+                .to_string(),
+                HostDeny::ProtocolMismatch,
+            ),
+            (
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 21,
+                    "method": "other.method",
+                    "params": {"protocol": PROTOCOL_VERSION, "token": "secret", "pid": 21}
+                })
+                .to_string(),
+                HostDeny::ProtocolMismatch,
+            ),
+            (
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 21,
+                    "method": method::HOST_START,
+                    "params": {"protocol": "1", "token": "secret", "pid": 21}
+                })
+                .to_string(),
+                HostDeny::BadFrame,
+            ),
+            ("not JSON".to_owned(), HostDeny::BadFrame),
+        ] {
+            assert_eq!(
+                decode_host_start(frame.as_bytes()).err(),
+                Some(deny),
+                "{frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_host_start_line_is_denied_as_a_bad_frame() {
+        assert_eq!(
+            decode_host_start(b"not JSON\n").err(),
+            Some(HostDeny::BadFrame)
+        );
+    }
+
+    #[test]
+    fn a_host_start_without_params_is_denied_as_a_bad_frame() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": method::HOST_START,
+        })
+        .to_string();
+
+        assert_eq!(
+            decode_host_start(frame.as_bytes()).err(),
+            Some(HostDeny::BadFrame),
+            "{frame}"
+        );
+    }
+
+    #[test]
+    fn a_host_start_with_malformed_params_is_denied_as_a_bad_frame() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "id": 21,
+            "method": method::HOST_START,
+            "params": {"protocol": "1", "token": "secret", "pid": 21},
+        })
+        .to_string();
+
+        assert_eq!(
+            decode_host_start(frame.as_bytes()).err(),
+            Some(HostDeny::BadFrame),
+            "{frame}"
+        );
+    }
+
+    #[test]
+    fn a_non_object_host_start_envelope_is_denied_as_a_bad_frame() {
+        let frame = json!([
+            "2.0",
+            21,
+            method::HOST_START,
+            {"protocol": PROTOCOL_VERSION, "token": "secret", "pid": 21}
+        ])
+        .to_string();
+
+        assert_eq!(
+            decode_host_start(frame.as_bytes()).err(),
+            Some(HostDeny::BadFrame),
+            "{frame}"
+        );
+    }
+
+    #[test]
+    fn a_host_start_without_an_id_is_denied_as_a_bad_frame() {
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": method::HOST_START,
+            "params": {"protocol": PROTOCOL_VERSION, "token": "secret", "pid": 21},
+        })
+        .to_string();
+
+        assert_eq!(
+            decode_host_start(frame.as_bytes()).err(),
+            Some(HostDeny::BadFrame),
+            "{frame}"
+        );
     }
 
     /// A host transport bound to `root/host.sock`, expecting this process.
@@ -3177,6 +3299,26 @@ mod tests {
         .await;
 
         assert!(matches!(refused, Err(SupervisorError::DenialTimeout)));
+    }
+
+    #[tokio::test]
+    async fn a_line_cap_sized_denial_id_is_retried_with_null() {
+        let id = json!("x".repeat(MAX_LINE_BYTES));
+        let mut writer = ChunkedWriter::default();
+
+        let refused: Result<()> =
+            refuse(&mut writer, &id, HostDeny::BadFrame, Duration::from_secs(2)).await;
+
+        assert!(matches!(
+            refused,
+            Err(SupervisorError::HostDenied(HostDeny::BadFrame))
+        ));
+        assert!(writer.written.len() <= MAX_LINE_BYTES);
+        let line = writer.written.strip_suffix(b"\n").expect("newline");
+        assert_eq!(
+            serde_json::from_slice::<Value>(line).expect("deny JSON"),
+            denied(&Value::Null, deny::BAD_FRAME)
+        );
     }
 
     /// An inner sink that records whether the adapter forwarded flush and
