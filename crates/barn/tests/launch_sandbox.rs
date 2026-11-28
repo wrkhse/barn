@@ -101,8 +101,8 @@ impl Launch {
         let bin = self.dir.join("bin");
         must_res(fs::create_dir_all(&bin), "the scratch bin dir");
 
-        let exec = PathBuf::from(env!("CARGO_BIN_EXE_barn-exec"));
-        let built_stall = PathBuf::from(env!("CARGO_BIN_EXE_barn-luau-stall"));
+        let exec = PathBuf::from(env!("CARGO_BIN_EXE_barn-test-exec"));
+        let built_stall = PathBuf::from(env!("CARGO_BIN_EXE_barn-test-stall"));
         let stall = stall.unwrap_or(built_stall);
 
         for (from, name) in [

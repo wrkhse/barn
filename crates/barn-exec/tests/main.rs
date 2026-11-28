@@ -7,6 +7,7 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -322,4 +323,25 @@ impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+// The real main reports a bad invocation on stderr and exits failing; the
+// `main -> Default::default()` mutant exits success. Like the other process
+// tests here, this runs in CI only -- AGENTS.md keeps process starts off the
+// owner's Mac.
+#[test]
+fn barn_exec_reports_an_invalid_invocation() {
+    if env::var_os("CI").is_none() {
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_barn-exec"))
+        .arg("--definitely-not-a-flag")
+        .output()
+        .expect("barn-exec starts");
+
+    assert!(
+        !output.status.success(),
+        "barn-exec must reject an invalid argument: {output:?}"
+    );
 }

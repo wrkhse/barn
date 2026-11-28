@@ -92,6 +92,16 @@ fn folder_from_args(mut args: impl Iterator<Item = OsString>) -> Result<PathBuf,
     Ok(folder)
 }
 
+/// Authenticate to barn, load the plugin and serve its framed requests.
+///
+/// # Errors
+///
+/// Returns [`MainError::MissingFolder`] or [`MainError::RelativeFolder`] when
+/// no absolute plugin folder was supplied, [`MainError::Client`] when the
+/// handshake fails, [`MainError::Socket`] when the authenticated socket cannot
+/// be prepared, [`MainError::Limits`] for invalid engine limits,
+/// [`MainError::Sandbox`] when the plugin cannot be loaded into a sandbox, and
+/// [`MainError::Serve`] when the frame exchange fails.
 pub async fn run() -> Result<(), MainError> {
     let folder = folder_from_args(std::env::args_os())?;
 
