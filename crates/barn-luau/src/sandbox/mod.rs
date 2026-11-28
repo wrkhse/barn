@@ -1,10 +1,13 @@
 //! One mlua VM per plugin, bounded by a memory ceiling and a per-call clock.
 //!
-//! The plugin is a Luau table at plugin.luau: named hook functions and a tools
-//! table. A hook returns nil for allow, or a table with exactly one verdict:
-//! deny, rewrite, annotate or drop, built by the matching `ctx` helper. A
-//! runnable returns a JSON-compatible value. Every input crossing the boundary
-//! is converted under both a depth and a table-size ceiling.
+//! The plugin is a Luau table at plugin.luau: named hooks and a tools table.
+//! A hook is a function or a bounded hook table: one handler with `priority`,
+//! `budgetMs`, `onError` and `run`, or an array of such handlers run from
+//! the highest priority down. A handler returns nil to allow or pass on, or a
+//! table with exactly one verdict: allow, deny, rewrite, annotate or drop,
+//! built by the matching `ctx` helper. `ctx.allow()` is the explicit allow
+//! verdict. A runnable returns a JSON-compatible value. Every input crossing
+//! the boundary is converted under a depth and table-size ceiling.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -23,9 +26,13 @@ mod deadline;
 mod errors;
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "wired into Sandbox::hook in barn#73")
+    expect(
+        dead_code,
+        reason = "EVENT_BEFORE and the test-only locked run_table entry"
+    )
 )]
 mod hook_table;
+mod hook_table_decode;
 mod loading;
 mod outcome;
 #[cfg(test)]
@@ -146,8 +153,10 @@ impl Sandbox {
     /// reaches the host, and [`EngineError::Poisoned`] after a call panics.
     pub fn hook(&self, invocation: &Invocation, deadline_ms: u64) -> Result<Outcome, EngineError> {
         let _guard = self.lock_call()?;
-        self.deadline.begin(deadline_ms.min(self.call_deadline_ms));
-        let outcome = self.run_hook(invocation);
+        let cap_ms = deadline_ms.min(self.call_deadline_ms);
+        let call_start = self.deadline.micros();
+        self.deadline.begin(cap_ms);
+        let outcome = self.run_hook(invocation, cap_ms, call_start);
         self.deadline.disarm();
         outcome
     }
@@ -185,18 +194,49 @@ impl Sandbox {
         manifest
     }
 
-    fn run_hook(&self, invocation: &Invocation) -> Result<Outcome, EngineError> {
-        let Some(function) = self
-            .plugin
-            .get::<Option<Function>>(invocation.hook.as_str())?
-        else {
-            return Ok(Outcome::Allow);
-        };
+    fn run_hook(
+        &self,
+        invocation: &Invocation,
+        call_cap_ms: u64,
+        call_start: u128,
+    ) -> Result<Outcome, EngineError> {
+        let value = self.plugin.get::<LuaValue>(invocation.hook.as_str())?;
 
-        let payload = json_to_lua(&self.lua, &invocation.payload, 0)?;
-        let result = function.call::<LuaValue>((payload, self.ctx(&invocation.context)?))?;
+        match value {
+            LuaValue::Nil => Ok(Outcome::Allow),
+            LuaValue::Function(function) => {
+                let payload = json_to_lua(&self.lua, &invocation.payload, 0)?;
+                let result =
+                    function.call::<LuaValue>((payload, self.ctx(&invocation.context)?))?;
 
-        decode_outcome(result)
+                decode_outcome(result)
+            }
+            LuaValue::Table(value) => {
+                const RESERVED: [&str; 3] = ["name", "needs", "tools"];
+                let name = invocation.hook.as_str();
+                if RESERVED.contains(&name) {
+                    return Err(EngineError::InvalidResult(format!(
+                        "reserved hook name: {name}"
+                    )));
+                }
+
+                let table = self::hook_table_decode::decode_hook_table(
+                    LuaValue::Table(value),
+                    call_cap_ms,
+                )?;
+
+                Ok(self::hook_table::run_table_inner(
+                    self,
+                    &table,
+                    invocation,
+                    call_cap_ms,
+                    call_start,
+                ))
+            }
+            _ => Err(EngineError::InvalidResult(
+                "hook must be a function or table".into(),
+            )),
+        }
     }
 
     fn run_runnable(&self, name: &str, input: &Value) -> Result<Value, EngineError> {
@@ -292,5 +332,197 @@ impl Sandbox {
             definitions.push(definition);
         }
         Ok(definitions)
+    }
+}
+
+#[cfg(test)]
+mod hook_tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use serde_json::{Value, json};
+
+    use crate::api::Invocation;
+
+    use super::clock::{Clock, FakeClock};
+    use super::tests::Scratch;
+    use super::{Capabilities, EngineError, Limits, Outcome, Sandbox};
+
+    const MEMORY: usize = 16 * 1024 * 1024;
+    const DEADLINE_MS: u64 = 1000;
+    const DEADLINE_REASON: &str = "sandbox deadline exceeded";
+
+    const PLUGIN: &str = r#"
+    return {
+        name = "hook-table",
+        needs = {},
+        tools = {},
+        array = {
+            {
+                run = function(payload, ctx)
+                    return ctx.deny("array verdict")
+                end,
+            },
+        },
+        single = {
+            priority = 3,
+            run = function(payload, ctx)
+                return ctx.deny("single verdict")
+            end,
+        },
+        scalar = 7,
+        spend = {
+            run = function(payload, ctx)
+                ctx.advance(payload.us)
+                return ctx.deny("kept")
+            end,
+        },
+        low_first = {
+            {
+                priority = 1,
+                run = function(payload, ctx)
+                    return ctx.deny("low first")
+                end,
+            },
+            {
+                priority = 9,
+                run = function(payload, ctx)
+                    return ctx.deny("high second")
+                end,
+            },
+        },
+        high_first = {
+            {
+                priority = 9,
+                run = function(payload, ctx)
+                    return ctx.deny("high first")
+                end,
+            },
+            {
+                priority = 1,
+                run = function(payload, ctx)
+                    return ctx.deny("low second")
+                end,
+            },
+        },
+    }
+    "#;
+
+    fn fixture() -> (Scratch, Arc<FakeClock>, Sandbox) {
+        let scratch = Scratch::new();
+        scratch.write("plugin.luau", PLUGIN);
+        let fake = Arc::new(FakeClock::new());
+        let step = Arc::clone(&fake);
+        let mut capabilities = Capabilities::default();
+        capabilities.insert("advance", move |value: Value| -> Result<Value, String> {
+            let micros = value.as_u64().unwrap_or_default();
+            step.advance(Duration::from_micros(micros));
+            Ok(Value::Null)
+        });
+        let clock: Arc<dyn Clock> = fake.clone();
+        let limits = Limits::new(MEMORY, DEADLINE_MS).expect("valid limits");
+        let sandbox =
+            Sandbox::new(scratch.path(), limits, capabilities, clock).expect("fixture loads");
+
+        (scratch, fake, sandbox)
+    }
+
+    fn call(hook: &str) -> Invocation {
+        Invocation {
+            hook: hook.into(),
+            payload: Value::Null,
+            context: Value::Null,
+        }
+    }
+
+    #[test]
+    fn an_array_hook_reaches_a_verdict() {
+        let (_scratch, _fake, sandbox) = fixture();
+
+        assert_eq!(
+            sandbox.hook(&call("array"), DEADLINE_MS),
+            Ok(Outcome::Deny {
+                reason: "array verdict".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_single_handler_table_reaches_a_verdict() {
+        let (_scratch, _fake, sandbox) = fixture();
+
+        assert_eq!(
+            sandbox.hook(&call("single"), DEADLINE_MS),
+            Ok(Outcome::Deny {
+                reason: "single verdict".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_non_function_non_table_hook_names_the_shape() {
+        let (_scratch, _fake, sandbox) = fixture();
+
+        assert_eq!(
+            sandbox.hook(&call("scalar"), DEADLINE_MS),
+            Err(EngineError::InvalidResult(
+                "hook must be a function or table".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_reserved_plugin_key_cannot_be_a_hook() {
+        let (_scratch, _fake, sandbox) = fixture();
+
+        assert_eq!(
+            sandbox.hook(&call("tools"), DEADLINE_MS),
+            Err(EngineError::InvalidResult(
+                "reserved hook name: tools".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_handler_without_a_budget_uses_the_call_cap() {
+        let (_scratch, _fake, sandbox) = fixture();
+        let mut under = call("spend");
+        under.payload = json!({ "us": 4_999 });
+
+        assert_eq!(
+            sandbox.hook(&under, 5),
+            Ok(Outcome::Deny {
+                reason: "kept".into()
+            })
+        );
+
+        let (_other, _clock, at_cap) = fixture();
+        let mut exact = call("spend");
+        exact.payload = json!({ "us": 5_000 });
+
+        assert_eq!(
+            at_cap.hook(&exact, 5),
+            Ok(Outcome::Deny {
+                reason: DEADLINE_REASON.into()
+            })
+        );
+    }
+
+    #[test]
+    fn each_array_handler_is_bound_to_its_own_function_in_priority_order() {
+        let (_scratch, _fake, sandbox) = fixture();
+
+        assert_eq!(
+            sandbox.hook(&call("low_first"), DEADLINE_MS),
+            Ok(Outcome::Deny {
+                reason: "high second".into()
+            })
+        );
+        assert_eq!(
+            sandbox.hook(&call("high_first"), DEADLINE_MS),
+            Ok(Outcome::Deny {
+                reason: "high first".into()
+            })
+        );
     }
 }

@@ -4,7 +4,6 @@ use crate::require::RequireCause;
 
 pub(super) const MAX_DEPTH: usize = 16;
 pub(super) const MAX_ENTRIES: usize = 1024;
-#[cfg_attr(not(test), expect(dead_code, reason = "used by the hook table engine"))]
 pub const MAX_HANDLERS: usize = 64;
 
 /// Mirrors the stall protocol's `MAX_LINE_BYTES` (8 MiB): a reply larger than

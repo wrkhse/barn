@@ -3,7 +3,7 @@
 //! The field mapping follows tack#122's `HookHandler` declaration, not the
 //! stall manifest: `priority`, `budgetMs`, `onError` and `run` become the
 //! fields of [`HookHandler`]. A [`HookTable`] keeps equal priorities in their
-//! input order, and [`run_table`] times each handler against a slice of the
+//! input order, and `run_table_inner` times each handler against a slice of the
 //! remaining call budget. A thrown call follows its [`OnError`] policy, while
 //! a hard sandbox limit denies the whole call with a named reason.
 
@@ -167,7 +167,7 @@ fn classify(
     }
 
     match verdict {
-        Ok(HookResult::Continue) => Step::Continue,
+        Ok(HookResult::Allow | HookResult::Continue) => Step::Continue,
         Ok(HookResult::Deny { reason }) => Step::Stop(Outcome::Deny { reason }),
         Ok(HookResult::Rewrite { payload }) => Step::Stop(Outcome::Rewrite { payload }),
         Ok(HookResult::Annotate { fields }) => Step::Stop(Outcome::Annotate { fields }),
@@ -184,13 +184,9 @@ fn classify(
     }
 }
 
-/// Run a table against an invocation, stopping at the first terminal verdict.
-///
-/// Each handler gets the smaller of its own budget and the time left in the
-/// call. A throwing handler follows its [`OnError`] policy; a hard sandbox
-/// limit or an exhausted call cap denies the whole call with a named reason so
-/// later handlers never run. The deadline guard restores any budget the
-/// caller had armed on every return path.
+/// The locked test entry: the guard lets a test arm an outer deadline and
+/// check that a table run restores it on every return path.
+#[cfg(test)]
 #[must_use]
 pub fn run_table(
     sandbox: &Sandbox,
@@ -204,8 +200,29 @@ pub fn run_table(
         };
     };
     let _deadline_guard = sandbox.deadline.guard();
+
+    run_table_inner(
+        sandbox,
+        table,
+        invocation,
+        call_cap_ms,
+        sandbox.deadline.micros(),
+    )
+}
+
+/// Run a table whose call lock is held and whose deadline is already armed.
+///
+/// Sandbox::hook owns both for the whole call, so this inner path must not
+/// take the lock again nor snapshot the deadline. `call_start` is read before
+/// the budget is armed, so lookup and decode time also spends the call cap.
+pub(super) fn run_table_inner(
+    sandbox: &Sandbox,
+    table: &HookTable,
+    invocation: &Invocation,
+    call_cap_ms: u64,
+    call_start: u128,
+) -> Outcome {
     let call_budget_us = u128::from(call_cap_ms).saturating_mul(1000);
-    let call_start = sandbox.deadline.micros();
 
     for handler in &table.handlers {
         let elapsed_us = sandbox.deadline.micros().saturating_sub(call_start);
