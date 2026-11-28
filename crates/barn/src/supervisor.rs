@@ -2246,6 +2246,17 @@ mod tests {
     .as_bytes();
 
     #[test]
+    fn stall_event_kind_names_every_variant_without_its_payload() {
+        assert_eq!(
+            stall_event_kind(&StallEvent::Line(vec![b'x', b'\n'])),
+            "Line"
+        );
+        assert_eq!(stall_event_kind(&StallEvent::Exited), "Exited");
+        assert_eq!(stall_event_kind(&StallEvent::Loss), "Loss");
+        assert_eq!(stall_event_kind(&StallEvent::Oversize), "Oversize");
+    }
+
+    #[test]
     fn host_endpoint_debug_names_the_struct_and_redacts_the_token() {
         let endpoint = HostEndpoint {
             socket_path: PathBuf::from("/tmp/barn-host.sock"),

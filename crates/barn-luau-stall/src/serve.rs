@@ -36,11 +36,8 @@ pub fn trace(message: impl FnOnce() -> String) {
 }
 
 /// A short diagnostic tag for a joined call: its task id and outcome.
-fn joined_tag(joined: &Result<(task::Id, Reply), task::JoinError>) -> String {
-    match joined {
-        Ok((task, _)) => format!("task={task:?} answered"),
-        Err(error) => format!("task={:?} join_error", error.id()),
-    }
+fn joined_tag(kind: &str, id: task::Id) -> String {
+    format!("task={id:?} {kind}")
 }
 
 /// The cap on calls a stall runs at once.
@@ -167,43 +164,20 @@ pub async fn serve(stream: UnixStream, sandbox: Sandbox) -> Result<(), ServeErro
                     Frame::Request(_) => "frame: request".to_owned(),
                 });
 
-                match frame {
-                    Frame::Health(id) => {
-                        let id_tag = format!("id={id:?}");
-                        trace(|| format!("health write start {id_tag}"));
-                        let result = write_health(&mut writer, id).await;
-                        match &result {
-                            Ok(()) => trace(|| format!("health write done {id_tag}")),
-                            Err(error) => {
-                                trace(|| format!("health write error {id_tag} error={error:?}"));
-                            }
-                        }
-                        result?;
-                    }
-                    Frame::Drain(id) => {
-                        return drain_and_reply(&mut writer, &mut calls, &mut pending, id).await;
-                    }
-                    Frame::Request(request) => {
-                        let id = request_id(&request);
-
-                        if calls.len() >= MAX_IN_FLIGHT {
-                            let result = write_reply(&mut writer, busy(id)).await;
-                            if let Err(error) = &result {
-                                trace(|| format!("busy deny write error id={id} {error:?}"));
-                            }
-                            result?;
-                            need_slot = true;
-
-                            continue;
-                        }
-
-                        let worker = Arc::clone(&sandbox);
-                        let call = calls.spawn_blocking(move || handle_request(&worker, request));
-                        let task = call.id();
-                        trace(|| format!("request worker spawned task={task:?} id={id}"));
-                        pending.insert(task, id);
-                    }
+                let drained = matches!(frame, Frame::Drain(_));
+                let result = handle_frame(
+                    &mut writer,
+                    &mut calls,
+                    &mut pending,
+                    &mut need_slot,
+                    frame,
+                    &sandbox,
+                )
+                .await;
+                if drained {
+                    return result;
                 }
+                result?;
             }
             Event::Call(joined) => {
                 trace(|| "finish_call start".to_owned());
@@ -216,6 +190,59 @@ pub async fn serve(stream: UnixStream, sandbox: Sandbox) -> Result<(), ServeErro
             }
         }
     }
+}
+
+/// Handle one decoded frame under the same cap and write bounds as before.
+///
+/// A drain ends the connection after its calls, so the caller watches for
+/// that frame and stops its loop once the reply has been written. A request
+/// at the cap denies once and asks the caller for a call slot before reading.
+async fn handle_frame(
+    writer: &mut (impl AsyncWrite + Unpin),
+    calls: &mut JoinSet<Reply>,
+    pending: &mut BTreeMap<task::Id, u64>,
+    need_slot: &mut bool,
+    frame: Frame,
+    sandbox: &Arc<Sandbox>,
+) -> Result<(), ServeError> {
+    match frame {
+        Frame::Health(id) => {
+            let id_tag = format!("id={id:?}");
+            trace(|| format!("health write start {id_tag}"));
+            let result = write_health(writer, id).await;
+            match &result {
+                Ok(()) => trace(|| format!("health write done {id_tag}")),
+                Err(error) => {
+                    trace(|| format!("health write error {id_tag} error={error:?}"));
+                }
+            }
+            result?;
+        }
+        Frame::Drain(id) => {
+            return drain_and_reply(writer, calls, pending, id).await;
+        }
+        Frame::Request(request) => {
+            let id = request_id(&request);
+
+            if calls.len() >= MAX_IN_FLIGHT {
+                let result = write_reply(writer, busy(id)).await;
+                if let Err(error) = &result {
+                    trace(|| format!("busy deny write error id={id} {error:?}"));
+                }
+                result?;
+                *need_slot = true;
+
+                return Ok(());
+            }
+
+            let worker = Arc::clone(sandbox);
+            let call = calls.spawn_blocking(move || handle_request(&worker, request));
+            let task = call.id();
+            trace(|| format!("request worker spawned task={task:?} id={id}"));
+            pending.insert(task, id);
+        }
+    }
+    Ok(())
 }
 
 /// Choose the next event, giving a busy stall a call slot before another read.
@@ -232,9 +259,13 @@ async fn next_event(
     {
         *need_slot = false;
         trace(|| {
+            let (kind, id) = match &joined {
+                Ok((task, _)) => ("answered", *task),
+                Err(error) => ("join_error", error.id()),
+            };
             format!(
                 "next_event call complete (need_slot) {}",
-                joined_tag(&joined)
+                joined_tag(kind, id)
             )
         });
 
@@ -265,9 +296,13 @@ async fn next_event(
         }
         Some(joined) = calls.join_next_with_id() => {
             trace(|| {
+                let (kind, id) = match &joined {
+                    Ok((task, _)) => ("answered", *task),
+                    Err(error) => ("join_error", error.id()),
+                };
                 format!(
                     "next_event call complete (select) {}",
-                    joined_tag(&joined)
+                    joined_tag(kind, id)
                 )
             });
             Ok(Event::Call(joined))
@@ -308,17 +343,6 @@ async fn write_health(writer: &mut (impl AsyncWrite + Unpin), id: Value) -> Resu
     match &result {
         Ok(()) => trace(|| "health write_json ok".to_owned()),
         Err(error) => trace(|| format!("health write_json error={error:?}")),
-    }
-
-    // write_json writes one newline-terminated line but does not flush.
-    // Flush here so the trace records when the reply actually reached the
-    // peer; the outcome is diagnostic only and never changes the result.
-    match &result {
-        Ok(()) => match writer.flush().await {
-            Ok(()) => trace(|| "health flush ok fully_written=true".to_owned()),
-            Err(error) => trace(|| format!("health flush error={error:?} fully_written=false")),
-        },
-        Err(_) => trace(|| "health flush skipped fully_written=false".to_owned()),
     }
 
     result
@@ -856,5 +880,22 @@ mod tests {
             .expect("the deny is written");
 
         assert_eq!(sink, line_for(&lost(42)));
+    }
+
+    #[tokio::test]
+    async fn joined_tag_renders_an_answered_call_with_its_task_id() {
+        let task = tokio::spawn(async {});
+        let id = task.id();
+        assert_eq!(joined_tag("answered", id), format!("task={id:?} answered"));
+    }
+
+    #[tokio::test]
+    async fn joined_tag_renders_a_join_error_with_its_task_id() {
+        let task = tokio::spawn(async {});
+        let id = task.id();
+        assert_eq!(
+            joined_tag("join_error", id),
+            format!("task={id:?} join_error")
+        );
     }
 }
