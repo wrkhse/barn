@@ -17,12 +17,12 @@ const DEFAULT_MEMORY_BYTES: usize = 16 * 1024 * 1024;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
-struct Scratch {
+pub(super) struct Scratch {
     root: PathBuf,
 }
 
 impl Scratch {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let token = format!(
             "{}-{}",
             std::process::id(),
@@ -33,7 +33,7 @@ impl Scratch {
         Self { root }
     }
 
-    fn write(&self, name: &str, contents: &str) {
+    pub(super) fn write(&self, name: &str, contents: &str) {
         let path = self.root.join(name);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("create fixture parent");
@@ -41,7 +41,7 @@ impl Scratch {
         std::fs::write(path, contents).expect("write fixture");
     }
 
-    fn path(&self) -> &Path {
+    pub(super) fn path(&self) -> &Path {
         &self.root
     }
 }

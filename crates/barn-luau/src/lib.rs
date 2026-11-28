@@ -1,7 +1,6 @@
 #![doc = include_str!("../README.md")]
 // Held at crate scope until PR C moves the wall-clock lint to the root config.
 #![deny(clippy::disallowed_methods)]
-
 pub mod api;
 mod require;
 mod sandbox;
