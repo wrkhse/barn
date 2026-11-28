@@ -526,12 +526,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          oidc=$(curl -sSf --oauth2-bearer "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" \\
+          oidc=$(curl -sSf --oauth2-bearer "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$AUDIENCE" | jq -re .value)
-          token=$(curl -sSf https://opencode.ai/console/auth/oauth/token \\
-            -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \\
-            -d subject_token_type=urn:ietf:params:oauth:token-type:jwt \\
-            -d client_id="$CLIENT_ID" \\
+          token=$(curl -sSf https://opencode.ai/console/auth/oauth/token \
+            -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+            -d subject_token_type=urn:ietf:params:oauth:token-type:jwt \
+            -d client_id="$CLIENT_ID" \
             -d subject_token="$oidc" | jq -re .access_token)
           echo "::add-mask::$token"
           echo "OPENCODE_API_KEY=$token" >> "$GITHUB_ENV"
@@ -545,7 +545,7 @@ jobs:
           base=https://github.com/anomalyco/opencode/releases/download
           dir="$RUNNER_TEMP/opencode"
           mkdir -p "$dir"
-          curl -fsSL --retry 3 --max-time 300 -o "$dir/opencode.tgz" \\
+          curl -fsSL --retry 3 --max-time 300 -o "$dir/opencode.tgz" \
             "$base/v1.19.6/opencode-linux-x64.tar.gz"
           echo "$SHA256  $dir/opencode.tgz" | sha256sum -c -
           tar -xzf "$dir/opencode.tgz" -C "$dir" opencode
@@ -678,11 +678,11 @@ jobs:
           events="$RUNNER_TEMP/review-events.jsonl"
           printf '%s' "$PROMPT" > "$RUNNER_TEMP/review-prompt.txt"
           status=0
-          timeout --kill-after=10s "${REVIEW_TIMEOUT_SEC}s" \\
-            opencode run --model "$MODEL" --variant low --format json \\
+          timeout --kill-after=10s "${REVIEW_TIMEOUT_SEC}s" \
+            opencode run --model "$MODEL" --variant low --format json \
             < "$RUNNER_TEMP/review-prompt.txt" > "$events" || status=$?
-          if [ "$status" -eq 0 ] && [ -s "$events" ] && \\
-             jq -es 'any(.[]; .type == "error") | not' "$events" > /dev/null && \\
+          if [ "$status" -eq 0 ] && [ -s "$events" ] && \
+             jq -es 'any(.[]; .type == "error") | not' "$events" > /dev/null && \
              jq -es 'any(.[]; .type == "text" and ((.part.text // "") | contains("<!-- opencode-review -->")))' "$events" > /dev/null; then
             echo "failed=false" >> "$GITHUB_OUTPUT"
             echo "REVIEW_MODEL=$MODEL" >> "$GITHUB_ENV"
@@ -704,11 +704,11 @@ jobs:
           set -euo pipefail
           events="$RUNNER_TEMP/review-events.jsonl"
           status=0
-          timeout --kill-after=10s "${REVIEW_TIMEOUT_SEC}s" \\
-            opencode run --model "$MODEL" --variant low --format json \\
+          timeout --kill-after=10s "${REVIEW_TIMEOUT_SEC}s" \
+            opencode run --model "$MODEL" --variant low --format json \
             < "$RUNNER_TEMP/review-prompt.txt" > "$events" || status=$?
-          if [ "$status" -eq 0 ] && [ -s "$events" ] && \\
-             jq -es 'any(.[]; .type == "error") | not' "$events" > /dev/null && \\
+          if [ "$status" -eq 0 ] && [ -s "$events" ] && \
+             jq -es 'any(.[]; .type == "error") | not' "$events" > /dev/null && \
              jq -es 'any(.[]; .type == "text" and ((.part.text // "") | contains("<!-- opencode-review -->")))' "$events" > /dev/null; then
             echo "failed=false" >> "$GITHUB_OUTPUT"
             echo "REVIEW_MODEL=$MODEL" >> "$GITHUB_ENV"
@@ -750,8 +750,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh api --paginate \\
-            --jq '.[] | {id, user: {id: .user.id}, body}' \\
+          gh api --paginate \
+            --jq '.[] | {id, user: {id: .user.id}, body}' \
             "repos/$REPO/issues/$PR/comments" |
             jq -rs --arg marker '<!-- opencode-review -->' --argjson author 41898282 '
               if any(.[]; (.id | type) != "number" or (.user.id? | type) != "number"
