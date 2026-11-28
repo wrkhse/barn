@@ -11,7 +11,7 @@ on:
         default: ""
         type: string
       primary_model:
-        description: Proof-only primary model (current primary, opencode/hy4-flash-free or test/unreachable)
+        description: Proof-only primary model (current primary, opencode/hy4-flash-free, opencode-go/hy4-flash-free or test/unreachable)
         required: false
         default: ""
         type: string
