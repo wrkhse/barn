@@ -352,7 +352,12 @@ jobs:
             args="$args --in-diff pr.diff"
             list_args="$list_args --in-diff pr.diff"
           fi
-          cargo mutants $args
+          if ! cargo mutants $args; then
+            echo "::error::cargo mutants failed before writing outcomes (baseline failure, crash or timeout); see the log above"
+            mkdir -p mutants.out
+            jq -n '{total_mutants: 0, caught: 0, missed: 1, timeout: 0, unviable: 0}' > mutants.out/outcomes.json
+            exit 1
+          fi
           if [ ! -f mutants.out/outcomes.json ]; then
             listed=$(cargo mutants $list_args --list)
             count=$(printf '%s\n' "$listed" | grep -c . || true)
