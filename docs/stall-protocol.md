@@ -50,6 +50,10 @@ Barn starts the stall, prints the endpoint and accepts the stall on `proto.sock`
 Barn stays resident while tack owns the process, so the printed endpoint has a
 live owner until tack ends it. barn brokers one host connection over `host.sock`
 to the stall. When tack disconnects cleanly, barn drains the stall and exits 0.
+On SIGTERM, once the stall has connected, barn drains it and exits 0,
+removing the run directory; a failed drain is a named failure and exits
+non-zero. Before the stall connects, a terminate signal ends the launch and
+removes any run directory.
 After a bad frame from the host, barn exits 1 without draining.
 
 ## Transport

@@ -7,6 +7,11 @@
 //! and connects to the private Unix socket at `BARN_SOCKET`. Its first message
 //! is `stall.start`, carrying that token in `BARN_TOKEN`.
 //!
+//! On SIGTERM, once the stall has connected, barn drains it and exits 0,
+//! removing the run directory; a failed drain is a named failure and exits
+//! non-zero. Before the stall connects, a terminate signal ends the launch and
+//! removes any run directory.
+//!
 //! This crate holds the protocol's fixed parts: its version, its limits, its
 //! method names, and the message bodies the plan already settles. Whatever is
 //! not fixed is listed in the [protocol page][protocol], as "for B1 to confirm".

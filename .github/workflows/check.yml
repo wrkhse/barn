@@ -84,6 +84,24 @@ jobs:
         with:
           tool: cargo-nextest@0.9.152
       - run: cargo nextest run --workspace --locked
+      # Both process tests hold sockets and run dirs; ten concurrent runs prove
+      # they do not collide in CI.
+      - name: Run launch tests concurrently 10x
+        run: |
+          ran=0
+          for run in {1..10}; do
+            echo "launch tests concurrently, run $run of 10"
+            cargo nextest run -p barn --locked \
+              -E 'test(=a_launched_stall_serves_one_host_connection_then_exits_cleanly)' &
+            launch=$!
+            cargo nextest run -p barn --locked \
+              -E 'test(=a_sigterm_drains_the_stall_and_removes_the_run_dir)' &
+            sigterm=$!
+            wait "$launch"
+            wait "$sigterm"
+            ran=$((ran + 1))
+          done
+          test "$ran" -eq 10
       - run: cargo test --doc --workspace --locked
 
   # The same tests under Seatbelt, where stalls run on the owner's Macs.
