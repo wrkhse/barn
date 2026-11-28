@@ -38,6 +38,11 @@ pub enum ClientError {
     Write(io::Error),
     /// The reply line could not be read.
     Read(io::Error),
+    /// A socket read deadline could not be set or cleared.
+    SetTimeout {
+        step: &'static str,
+        source: io::Error,
+    },
     /// The bounded reply did not arrive before its deadline.
     Timeout,
     /// The socket closed before a newline-terminated reply arrived.
@@ -62,6 +67,9 @@ impl fmt::Display for ClientError {
             Self::Connect(error) => write!(formatter, "connecting to barn: {error}"),
             Self::Write(error) => write!(formatter, "writing stall start: {error}"),
             Self::Read(error) => write!(formatter, "reading the start reply: {error}"),
+            Self::SetTimeout { step, source } => {
+                write!(formatter, "setting {step} timeout: {source}")
+            }
             Self::Timeout => formatter.write_str("the start reply timed out"),
             Self::Eof => formatter.write_str("the start reply closed before its newline"),
             Self::Oversize => formatter.write_str("a start line exceeded MAX_LINE_BYTES"),
@@ -79,6 +87,7 @@ impl std::error::Error for ClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Connect(error) | Self::Write(error) | Self::Read(error) => Some(error),
+            Self::SetTimeout { source, .. } => Some(source),
             Self::Malformed(error) => Some(error),
             _ => None,
         }
@@ -154,10 +163,7 @@ fn handshake(
     let mut reader = BufReader::new(stream);
     let line = read_bounded(&mut reader, deadline)?;
     let result = decode_reply(&line, &json!(START_ID))?;
-    reader
-        .get_mut()
-        .set_read_timeout(None)
-        .map_err(ClientError::Read)?;
+    set_read_deadline(reader.get_mut(), None, "clear read")?;
 
     Ok((reader, result))
 }
@@ -179,6 +185,23 @@ fn read_error(error: io::Error) -> ClientError {
     match error.kind() {
         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => ClientError::Timeout,
         _ => ClientError::Read(error),
+    }
+}
+
+/// Sets or clears a read deadline on `stream`.
+///
+/// macOS returns `EINVAL` from `setsockopt` once the peer has shut down its
+/// write half. That is not a real failure: buffered data (or EOF) is still
+/// valid, so the caller continues. Other failures are reported with `step`.
+fn set_read_deadline(
+    stream: &mut UnixStream,
+    timeout: Option<Duration>,
+    step: &'static str,
+) -> Result<(), ClientError> {
+    match stream.set_read_timeout(timeout) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(source) => Err(ClientError::SetTimeout { step, source }),
     }
 }
 
@@ -221,10 +244,7 @@ fn read_bounded(
         }
         // A zero timeval means "no timeout" on Unix, so keep it positive.
         let remaining = remaining.max(Duration::from_millis(1));
-        reader
-            .get_mut()
-            .set_read_timeout(Some(remaining))
-            .map_err(ClientError::Read)?;
+        set_read_deadline(reader.get_mut(), Some(remaining), "read")?;
 
         if reader.fill_buf().map_err(read_error)?.is_empty() {
             return Err(ClientError::Eof);
@@ -267,6 +287,7 @@ fn decode_reply(line: &[u8], id: &Value) -> Result<StallStartResult, ClientError
 mod tests {
     use super::*;
     use std::io::Read;
+    use std::net::Shutdown;
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
@@ -523,6 +544,30 @@ mod tests {
     }
 
     #[test]
+    fn a_shut_down_peer_still_yields_the_buffered_reply() {
+        let reply =
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"protocol\":1,\"result\":{\"state\":\"/state\"}}\n";
+        let expected = StallStartResult {
+            state: "/state".to_owned(),
+            jobs: BTreeMap::new(),
+        };
+        let (client, server) = UnixStream::pair().expect("a socket pair");
+
+        // The peer buffers a reply and shuts down its write half before the
+        // client starts. On macOS the client's set_read_timeout calls then
+        // fail with EINVAL while the reply is still available to read.
+        server.write_all(reply).expect("the peer writes a reply");
+        server
+            .shutdown(Shutdown::Write)
+            .expect("the peer shuts down its write half");
+
+        let (_, result) = handshake(client, "secret", BTreeMap::new(), Duration::from_secs(2))
+            .expect("the buffered reply completes the handshake");
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
     fn an_oversize_reply_is_an_error() {
         let reply = vec![b'x'; MAX_LINE_BYTES];
 
@@ -642,6 +687,8 @@ mod tests {
         let write_message = write.to_string();
         let read = io::Error::new(io::ErrorKind::UnexpectedEof, "cannot read");
         let read_message = read.to_string();
+        let timeout = io::Error::new(io::ErrorKind::InvalidInput, "invalid argument");
+        let timeout_message = timeout.to_string();
         let malformed = serde_json::from_str::<Value>("{").expect_err("invalid JSON");
         let malformed_message = malformed.to_string();
         let reply = json!({"code": -32001, "message": "denied"});
@@ -666,6 +713,14 @@ mod tests {
         assert_eq!(
             ClientError::Read(read).to_string(),
             format!("reading the start reply: {read_message}")
+        );
+        assert_eq!(
+            ClientError::SetTimeout {
+                step: "read",
+                source: timeout,
+            }
+            .to_string(),
+            format!("setting read timeout: {timeout_message}")
         );
         assert_eq!(
             ClientError::Timeout.to_string(),
@@ -716,6 +771,15 @@ mod tests {
         let error = ClientError::Read(read);
         let source = std::error::Error::source(&error).expect("read has a source");
         assert_eq!(source.to_string(), read_message);
+
+        let timeout = io::Error::new(io::ErrorKind::InvalidInput, "invalid argument");
+        let timeout_message = timeout.to_string();
+        let error = ClientError::SetTimeout {
+            step: "clear read",
+            source: timeout,
+        };
+        let source = std::error::Error::source(&error).expect("set timeout has a source");
+        assert_eq!(source.to_string(), timeout_message);
 
         let malformed = serde_json::from_str::<Value>("{").expect_err("invalid JSON");
         let malformed_message = malformed.to_string();
