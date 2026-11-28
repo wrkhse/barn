@@ -12,6 +12,7 @@ use super::values::lua_to_json;
 /// Continue is a nil return: the handler passes and the table moves on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookResult {
+    Allow,
     Deny {
         reason: String,
     },
@@ -25,7 +26,7 @@ pub enum HookResult {
     Continue,
 }
 
-const VERDICTS: [&str; 4] = ["deny", "rewrite", "annotate", "drop"];
+const VERDICTS: [&str; 5] = ["allow", "deny", "rewrite", "annotate", "drop"];
 
 /// Decode a hook return value into the call's outcome.
 ///
@@ -38,7 +39,7 @@ pub(super) fn decode_outcome(value: LuaValue) -> Result<Outcome, EngineError> {
 impl From<HookResult> for Outcome {
     fn from(result: HookResult) -> Self {
         match result {
-            HookResult::Continue => Self::Allow,
+            HookResult::Allow | HookResult::Continue => Self::Allow,
             HookResult::Deny { reason } => Self::Deny { reason },
             HookResult::Rewrite { payload } => Self::Rewrite { payload },
             HookResult::Annotate { fields } => Self::Annotate { fields },
@@ -61,7 +62,7 @@ fn single_verdict(table: &Table) -> Result<&'static str, EngineError> {
 
     match found.as_slice() {
         [] => Err(EngineError::InvalidResult(
-            "hook result has no verdict: expected deny, rewrite, annotate or drop".into(),
+            "hook result has no verdict: expected allow, deny, rewrite, annotate or drop".into(),
         )),
         [_, _, ..] => Err(EngineError::InvalidResult(format!(
             "hook result has multiple verdicts: {}",
@@ -99,6 +100,10 @@ pub(super) fn decode_hook_result(value: LuaValue) -> Result<HookResult, EngineEr
     };
 
     match single_verdict(&table)? {
+        "allow" => {
+            require_true(&table, "allow")?;
+            Ok(HookResult::Allow)
+        }
         "deny" => {
             let reason = table
                 .get::<Option<String>>("deny")?
@@ -155,6 +160,35 @@ mod tests {
             &Ok(HookResult::Continue),
             &Ok(Outcome::Allow),
         );
+    }
+
+    #[test]
+    fn an_allow_verdict_decodes_through_both_decoders() {
+        let lua = Lua::new();
+        let allow = lua.create_table().expect("allow table");
+        allow.raw_set("allow", true).expect("set allow");
+
+        assert_decoders(
+            LuaValue::Table(allow),
+            &Ok(HookResult::Allow),
+            &Ok(Outcome::Allow),
+        );
+    }
+
+    #[test]
+    fn a_non_true_allow_is_refused() {
+        let lua = Lua::new();
+        for value in [LuaValue::Boolean(false), LuaValue::Integer(1)] {
+            let result = lua.create_table().expect("result table");
+            result.raw_set("allow", value).expect("set allow");
+
+            let expected = EngineError::InvalidResult("allow must be true".into());
+            assert_decoders(
+                LuaValue::Table(result),
+                &Err(expected.clone()),
+                &Err(expected),
+            );
+        }
     }
 
     #[test]
@@ -229,7 +263,7 @@ mod tests {
         let lua = Lua::new();
         let empty = lua.create_table().expect("empty table");
         let expected = EngineError::InvalidResult(
-            "hook result has no verdict: expected deny, rewrite, annotate or drop".into(),
+            "hook result has no verdict: expected allow, deny, rewrite, annotate or drop".into(),
         );
         assert_decoders(
             LuaValue::Table(empty),
