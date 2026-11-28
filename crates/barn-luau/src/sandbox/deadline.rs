@@ -51,7 +51,7 @@ impl Deadline {
 
     /// Snapshot the armed deadline so a caller can restore it on any exit,
     /// including one that never reaches an explicit [`Self::disarm`].
-    #[cfg_attr(not(test), expect(dead_code, reason = "test-only locked entry"))]
+    #[cfg(test)]
     pub(super) fn guard(&self) -> DeadlineGuard<'_> {
         // A poisoned start clock cannot be trusted; snapshot it as zero.
         let started = self.started.lock().map_or(0, |started| *started);
@@ -64,7 +64,7 @@ impl Deadline {
         }
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "test-only locked entry"))]
+    #[cfg(test)]
     fn restore(&self, started: u128, budget: u64) {
         self.budget_us.store(budget, Ordering::Relaxed);
         if let Ok(mut guard) = self.started.lock() {
@@ -95,13 +95,14 @@ impl Deadline {
 
 /// Restores a snapshotted deadline when a call exits, so a call that returns
 /// early cannot leave the next one running without its budget.
-#[cfg_attr(not(test), expect(dead_code, reason = "test-only locked entry"))]
+#[cfg(test)]
 pub(super) struct DeadlineGuard<'a> {
     deadline: &'a Deadline,
     started: u128,
     budget: u64,
 }
 
+#[cfg(test)]
 impl Drop for DeadlineGuard<'_> {
     fn drop(&mut self) {
         self.deadline.restore(self.started, self.budget);

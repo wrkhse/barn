@@ -33,8 +33,9 @@ fn no_run() -> EngineError {
 
 /// Read an optional integral `i32`, using `default` when the field is absent.
 ///
-/// Luau stores whole numbers as integers, so only `Integer` is accepted.
-/// Floats are refused rather than lossily converted to an integer.
+/// Luau numbers are doubles; on 64-bit mlua converts whole integral values to
+/// `LuaValue::Integer`, while `-0` and non-integral values stay floats and are
+/// refused here rather than lossily converted to an integer.
 fn integral_i32(table: &Table, field: &str, default: i32) -> Result<i32, EngineError> {
     const EXPECTED: &str = "an integral i32";
     match table.raw_get::<LuaValue>(field)? {
@@ -50,7 +51,7 @@ fn integral_i32(table: &Table, field: &str, default: i32) -> Result<i32, EngineE
 ///
 /// Only `Integer` is accepted; floats are refused rather than converted.
 fn budget_ms(table: &Table, default: u64) -> Result<u64, EngineError> {
-    const EXPECTED: &str = "a non-negative u64";
+    const EXPECTED: &str = "a positive integer";
     match table.raw_get::<LuaValue>("budgetMs")? {
         LuaValue::Nil => Ok(default),
         LuaValue::Integer(number) => match u64::try_from(number) {
@@ -195,20 +196,21 @@ fn decode_array(table: &Table, default_budget_ms: u64) -> Result<HookTable, Engi
 /// array form is sparse. Returns [`EngineError::Limit`] when there are too
 /// many handlers.
 pub(super) fn decode_hook_table(
-    value: mlua::Value,
+    value: LuaValue,
     default_budget_ms: u64,
-) -> Result<crate::sandbox::hook_table::HookTable, crate::sandbox::errors::EngineError> {
+) -> Result<HookTable, EngineError> {
     match value {
         LuaValue::Function(function) => {
             HookTable::new(vec![from_function(function, default_budget_ms)])
         }
         LuaValue::Table(table) => {
             let run = table.raw_get::<LuaValue>("run")?;
-            if matches!(&run, LuaValue::Function(_)) {
-                let handler = decode_handler(&table, &run, default_budget_ms)?;
-                HookTable::new(vec![handler])
-            } else {
-                decode_array(&table, default_budget_ms)
+            match &run {
+                LuaValue::Nil => decode_array(&table, default_budget_ms),
+                _ => {
+                    let handler = decode_handler(&table, &run, default_budget_ms)?;
+                    HookTable::new(vec![handler])
+                }
             }
         }
         other => Err(invalid("hook", "a function or table", &other)),
@@ -423,27 +425,27 @@ mod tests {
         for (value, expected) in [
             (
                 LuaValue::String(lua.create_string("fast").expect("string")),
-                r#"budgetMs must be a non-negative u64, got String("fast")"#,
+                r#"budgetMs must be a positive integer, got String("fast")"#,
             ),
             (
                 LuaValue::Number(f64::NAN),
-                "budgetMs must be a non-negative u64, got Number(NaN)",
+                "budgetMs must be a positive integer, got Number(NaN)",
             ),
             (
                 LuaValue::Integer(-1),
-                "budgetMs must be a non-negative u64, got Integer(-1)",
+                "budgetMs must be a positive integer, got Integer(-1)",
             ),
             (
                 LuaValue::Number(-2.5),
-                "budgetMs must be a non-negative u64, got Number(-2.5)",
+                "budgetMs must be a positive integer, got Number(-2.5)",
             ),
             (
                 LuaValue::Number(2.5),
-                "budgetMs must be a non-negative u64, got Number(2.5)",
+                "budgetMs must be a positive integer, got Number(2.5)",
             ),
             (
                 LuaValue::Number(1e30),
-                "budgetMs must be a non-negative u64, got Number(1000000000000000000000000000000)",
+                "budgetMs must be a positive integer, got Number(1000000000000000000000000000000)",
             ),
         ] {
             let handler = with_field(&lua, "budgetMs", value);
@@ -545,7 +547,7 @@ mod tests {
         only_run.set("run", LuaValue::Integer(1)).expect("set run");
         assert_invalid(
             decode_hook_table(LuaValue::Table(only_run), 250),
-            "run must be a function",
+            "handler run must be a function, got Integer(1)",
         );
     }
 
@@ -561,6 +563,22 @@ mod tests {
             decode_hook_table(LuaValue::Table(array), 250),
             r#"hook table array has an unexpected key: String("extra")"#,
         );
+    }
+
+    #[test]
+    fn exactly_max_handlers_decode_successfully() {
+        let lua = Lua::new();
+        let array = lua.create_table().expect("array");
+        let limit = i64::try_from(MAX_HANDLERS).expect("limit fits");
+        for index in 1..=limit {
+            array.set(index, handler_table(&lua)).expect("set element");
+        }
+
+        let decoded = decode_hook_table(LuaValue::Table(array), 250).expect("decode");
+        let expected: Vec<_> = (0..MAX_HANDLERS)
+            .map(|_| expected_handler(&lua, 0, 250, OnError::Deny))
+            .collect();
+        assert_decoded(&decoded, &expected);
     }
 
     #[test]

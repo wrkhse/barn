@@ -24,13 +24,6 @@ mod capabilities;
 mod clock;
 mod deadline;
 mod errors;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "EVENT_BEFORE and the test-only locked run_table entry"
-    )
-)]
 mod hook_table;
 mod hook_table_decode;
 mod loading;
@@ -351,6 +344,7 @@ mod hook_tests {
     const MEMORY: usize = 16 * 1024 * 1024;
     const DEADLINE_MS: u64 = 1000;
     const DEADLINE_REASON: &str = "sandbox deadline exceeded";
+    const TIMEOUT_REASON: &str = "hook handler budget exceeded";
 
     const PLUGIN: &str = r#"
     return {
@@ -372,6 +366,13 @@ mod hook_tests {
         },
         scalar = 7,
         spend = {
+            run = function(payload, ctx)
+                ctx.advance(payload.us)
+                return ctx.deny("kept")
+            end,
+        },
+        budgeted = {
+            budgetMs = 5,
             run = function(payload, ctx)
                 ctx.advance(payload.us)
                 return ctx.deny("kept")
@@ -504,6 +505,42 @@ mod hook_tests {
             at_cap.hook(&exact, 5),
             Ok(Outcome::Deny {
                 reason: DEADLINE_REASON.into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_budget_set_in_the_lua_handler_table_is_honored() {
+        let (_scratch, _clock, sandbox) = fixture();
+        let mut under = call("budgeted");
+        under.payload = json!({ "us": 4_999 });
+
+        assert_eq!(
+            sandbox.hook(&under, 5),
+            Ok(Outcome::Deny {
+                reason: "kept".into()
+            })
+        );
+
+        let (_other, _other_clock, at_cap) = fixture();
+        let mut exact = call("budgeted");
+        exact.payload = json!({ "us": 5_000 });
+
+        assert_eq!(
+            at_cap.hook(&exact, 5),
+            Ok(Outcome::Deny {
+                reason: DEADLINE_REASON.into()
+            })
+        );
+
+        let (_third, _third_clock, own_budget) = fixture();
+        let mut own = call("budgeted");
+        own.payload = json!({ "us": 5_000 });
+
+        assert_eq!(
+            own_budget.hook(&own, 10),
+            Ok(Outcome::Deny {
+                reason: TIMEOUT_REASON.into()
             })
         );
     }

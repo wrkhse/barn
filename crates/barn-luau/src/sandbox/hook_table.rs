@@ -22,6 +22,7 @@ use super::values::json_to_lua;
 pub use super::outcome::HookResult;
 
 /// The hook name a table of before-handlers is installed under.
+#[cfg(test)]
 pub const EVENT_BEFORE: &str = "eventBefore";
 
 const THROW_REASON: &str = "hook handler threw";
