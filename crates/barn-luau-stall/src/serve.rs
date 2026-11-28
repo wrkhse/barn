@@ -1102,6 +1102,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_frame_exactly_at_the_cap_is_written() {
+        let (reply, receiver) = oneshot::channel();
+        let frame = vec![b'x'; tack_protocol::MAX_FRAME_BYTES];
+        let call = ControlCall {
+            id: 10,
+            frame: frame.clone(),
+            reply,
+        };
+        let mut pending_control = None;
+        let mut sink = Vec::new();
+
+        queue_control(&mut sink, &mut pending_control, call)
+            .await
+            .expect("the control frame is written");
+
+        assert_eq!(sink, frame);
+
+        let (id, sender, deadline) = pending_control.expect("a pending control call");
+        assert_eq!(id, 10);
+        assert!(deadline > Instant::now());
+
+        sender
+            .send(Ok(json!({ "ok": true })))
+            .expect("the caller still waits");
+        assert_eq!(
+            receiver.await.expect("the reply arrives"),
+            Ok(json!({ "ok": true }))
+        );
+    }
+
+    #[tokio::test]
     async fn queue_control_refuses_an_oversize_frame_without_writing_it() {
         let (reply, receiver) = oneshot::channel();
         let call = ControlCall {
