@@ -1307,6 +1307,10 @@ mod tests {
         .expect("the health line is handled");
 
         assert!(!drained);
-        assert_eq!(sink, b"{\"id\":5,\"jsonrpc\":\"2.0\",\"result\":null}\n");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&sink).expect("a JSON health reply"),
+            serde_json::json!({"jsonrpc": "2.0", "id": 5, "result": null})
+        );
+        assert!(sink.ends_with(b"\n"));
     }
 }
