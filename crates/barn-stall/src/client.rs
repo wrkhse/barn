@@ -519,7 +519,7 @@ mod tests {
         let error = exchange(b"", "secret", BTreeMap::new(), |_| {})
             .expect_err("barn closed before replying");
 
-        assert!(matches!(error, ClientError::Eof));
+        assert!(matches!(&error, ClientError::Eof), "got {error:?}");
     }
 
     #[test]
