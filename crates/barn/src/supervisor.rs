@@ -66,11 +66,14 @@ const SHELL_GRANTS: &[&str] = &[SHELL_LINK, "/bin/bash", "/bin/zsh", "/bin/dash"
 const SHELL_GRANTS: &[&str] = &[];
 /// The newline-terminated over-size error reply, at the current protocol version.
 fn oversize_reply() -> Vec<u8> {
-    format!(concat!(
-        r#"{{"jsonrpc":"2.0","id":null,"protocol":{PROTOCOL_VERSION},"error":{{"code":-32600,"#,
-        r#""message":"stall start message exceeds the protocol line limit"}}}}"#,
-        "\n"
-    ))
+    format!(
+        concat!(
+            r#"{{"jsonrpc":"2.0","id":null,"protocol":{protocol},"error":{{"code":-32600,"#,
+            r#""message":"stall start message exceeds the protocol line limit"}}}}"#,
+            "\n"
+        ),
+        protocol = PROTOCOL_VERSION
+    )
     .into_bytes()
 }
 
