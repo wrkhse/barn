@@ -3,7 +3,7 @@
 # caller still counts.
 test_workspace = true
 test_tool = "nextest"
-features = ["barn/test-fixtures"]
+all_features = true
 
 # unreachable fallback: try_from input is clamped to u64::MAX - 1 (supervisor-approved 11-28)
 exclude_re = [
