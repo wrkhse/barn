@@ -11,6 +11,7 @@ use std::fmt::{self, Formatter};
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -24,6 +25,9 @@ const START_ID: u64 = 1;
 
 /// How long a stall waits for the bounded `stall.start` reply line.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a fallback read waits for bytes before rechecking its deadline.
+const RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Why a stall could not complete its `stall.start` handshake.
 #[derive(Debug)]
@@ -203,8 +207,9 @@ fn fill_outcome(result: io::Result<&[u8]>) -> Result<Option<&[u8]>, ClientError>
 /// macOS returns `EINVAL` from `setsockopt` once the peer has shut down its
 /// write half. While clearing a deadline after a complete reply, or while the
 /// reader already holds bytes, that is benign: the next read is bounded by
-/// data or EOF, not by time. Arming a deadline with nothing buffered must not
-/// swallow `EINVAL`, or `fill_buf` could wait without a bound.
+/// data or EOF, not by time. Arming a deadline with nothing buffered fails
+/// closed here; the caller turns that `EINVAL` into a nonblocking read whose
+/// deadline is enforced in the read loop.
 fn set_read_deadline(
     reader: &BufReader<UnixStream>,
     timeout: Option<Duration>,
@@ -232,10 +237,66 @@ fn read_deadline_result(
 }
 
 /// Reads one newline-terminated line, bounded at [`MAX_LINE_BYTES`] and by
-/// `deadline`: each underlying read spends only the time left in the budget.
+/// `deadline`, restoring blocking mode on every exit path.
 fn read_bounded(
     reader: &mut BufReader<UnixStream>,
     deadline: Instant,
+) -> Result<Vec<u8>, ClientError> {
+    let mut nonblocking = false;
+    let result = read_line(reader, deadline, &mut nonblocking);
+    if nonblocking {
+        reader
+            .get_ref()
+            .set_nonblocking(false)
+            .map_err(|source| ClientError::SetTimeout {
+                step: "clear nonblocking",
+                source,
+            })?;
+    }
+    result
+}
+
+/// Arms the socket read timeout. A closed peer's EINVAL selects the nonblocking
+/// fallback; every other failure keeps its named error.
+fn arm_read_deadline(
+    reader: &BufReader<UnixStream>,
+    remaining: Duration,
+) -> Result<bool, ClientError> {
+    let armed = reader.get_ref().set_read_timeout(Some(remaining));
+    read_arm_result(reader, armed)
+}
+
+/// Classifies a failed read-arm `setsockopt`, switching to a nonblocking read
+/// when a shut-down peer makes it fail with EINVAL.
+fn read_arm_result(
+    reader: &BufReader<UnixStream>,
+    result: io::Result<()>,
+) -> Result<bool, ClientError> {
+    match read_deadline_result(reader, result, "read") {
+        Ok(()) => Ok(false),
+        Err(ClientError::SetTimeout {
+            step: "read",
+            source,
+        }) if source.kind() == io::ErrorKind::InvalidInput => {
+            reader
+                .get_ref()
+                .set_nonblocking(true)
+                .map_err(|source| ClientError::SetTimeout {
+                    step: "set nonblocking",
+                    source,
+                })?;
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Runs the read loop. `nonblocking` records whether the fallback took over,
+/// so `read_bounded` can restore blocking mode before returning.
+fn read_line(
+    reader: &mut BufReader<UnixStream>,
+    deadline: Instant,
+    nonblocking: &mut bool,
 ) -> Result<Vec<u8>, ClientError> {
     let mut line: Vec<u8> = Vec::new();
 
@@ -268,11 +329,23 @@ fn read_bounded(
         if remaining.is_zero() {
             return Err(ClientError::Timeout);
         }
-        // A zero timeval means "no timeout" on Unix, so keep it positive.
-        let remaining = remaining.max(Duration::from_millis(1));
-        set_read_deadline(reader, Some(remaining), "read")?;
 
-        let Some(bytes) = fill_outcome(reader.fill_buf())? else {
+        if !*nonblocking {
+            // A zero timeval means "no timeout" on Unix, so keep it positive.
+            *nonblocking = arm_read_deadline(reader, remaining.max(RETRY_INTERVAL))?;
+        }
+
+        let result = reader.fill_buf();
+        if *nonblocking
+            && matches!(&result, Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        {
+            if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                return Err(ClientError::Timeout);
+            }
+            thread::sleep(RETRY_INTERVAL);
+            continue;
+        }
+        let Some(bytes) = fill_outcome(result)? else {
             continue;
         };
         if bytes.is_empty() {
@@ -663,6 +736,55 @@ mod tests {
             }
             outcome => panic!("got {outcome:?}"),
         }
+    }
+
+    #[test]
+    fn a_read_arm_einval_switches_to_a_userspace_deadline() {
+        let (client, _peer) = UnixStream::pair().expect("a socket pair");
+        let reader = BufReader::new(client);
+        let source = io::Error::new(io::ErrorKind::InvalidInput, "injected EINVAL");
+
+        let fallback = read_arm_result(&reader, Err(source)).expect("EINVAL selects the fallback");
+
+        assert!(fallback, "the read arm runs on the userspace deadline");
+        let mut byte = [0u8; 1];
+        assert!(
+            matches!(reader.get_ref().read(&mut byte), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "a nonblocking read reports WouldBlock while no bytes are buffered"
+        );
+
+        let source = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        let error = read_arm_result(&reader, Err(source)).expect_err("other errors stay named");
+
+        match error {
+            ClientError::SetTimeout { step, source } => {
+                assert_eq!(step, "read");
+                assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
+                assert_eq!(source.to_string(), "denied");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_nonblocking_read_retries_would_block_until_its_deadline() {
+        let (client, _peer) = UnixStream::pair().expect("a socket pair");
+        let mut reader = BufReader::new(client);
+        reader
+            .get_ref()
+            .set_nonblocking(true)
+            .expect("a nonblocking handshake read");
+        let timeout = Duration::from_millis(50);
+        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
+        let mut nonblocking = true;
+
+        let error = read_line(&mut reader, deadline, &mut nonblocking)
+            .expect_err("no reply arrives before the deadline");
+
+        assert!(matches!(error, ClientError::Timeout), "got {error:?}");
+        assert!(started.elapsed() >= timeout);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
