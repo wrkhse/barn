@@ -401,7 +401,8 @@ fn decode_refuses_a_verdictless_result_table() {
         assert_eq!(
             decode_outcome(LuaValue::Table(result)),
             Err(EngineError::InvalidResult(
-                "hook result has no verdict: expected deny, rewrite, annotate or drop".into()
+                "hook result has no verdict: expected allow, deny, rewrite, annotate or drop"
+                    .into()
             ))
         );
     }
