@@ -19,6 +19,8 @@ flowchart LR
   modules and re-exports the public types.
 - `errors.rs`: `MAX_DEPTH`, `MAX_ENTRIES`, `LimitCause`, `LoadCause`
   and `EngineError`, with their display, error and `mlua::Error` impls.
+- `clock.rs`: the injected `Clock`, `FakeClock` and `TickingClock`, the
+  time source read by `Deadline`.
 - `deadline.rs`: `Deadline`, the armed clock the VM interrupt polls on
   each instruction.
 - `loading.rs`: `load_plugin`, which runs the loader chunk and requires
