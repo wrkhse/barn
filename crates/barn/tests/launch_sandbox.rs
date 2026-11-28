@@ -503,6 +503,32 @@ fn start_and_start_host(launch: &mut Launch) -> BufReader<UnixStream> {
     host
 }
 
+/// Poll stderr until every expected trace message is present. The stderr
+/// drain thread and barn's trace writes can lag behind the health reply, so a
+/// single immediate read can miss a line. The wait is bounded, and its final
+/// snapshot is returned on timeout so the exact per-message assertions below
+/// still report which line is missing and the full stderr.
+fn wait_for_trace_messages(launch: &Launch, expected: &[&str]) -> String {
+    const TRACE_TIMEOUT: Duration = Duration::from_secs(5);
+    const TRACE_POLL: Duration = Duration::from_millis(10);
+    let started = Instant::now();
+
+    loop {
+        let stderr = launch.stderr();
+        let ready = {
+            let messages: Vec<&str> = stderr
+                .lines()
+                .filter_map(|line| line.split_once("] ").map(|(_, message)| message))
+                .collect();
+            expected.iter().all(|message| messages.contains(message))
+        };
+        if ready || started.elapsed() >= TRACE_TIMEOUT {
+            return stderr;
+        }
+        std::thread::sleep(TRACE_POLL);
+    }
+}
+
 #[test]
 fn a_launched_stall_serves_one_host_connection_then_exits_cleanly() {
     if std::env::var_os("CI").is_none() {
@@ -604,7 +630,14 @@ fn trace_records_a_health_round_trip() {
         launch.failure("stall.health reply")
     );
 
-    let stderr = launch.stderr();
+    let expected_messages = [
+        "host reply wait start: id=1",
+        "host reply wait done: id=1 outcome=Line",
+        "recv start: waiting for event",
+        "channel created cap=2",
+        "send start: kind=Line",
+    ];
+    let stderr = wait_for_trace_messages(&launch, &expected_messages);
     let messages: Vec<&str> = stderr
         .lines()
         .filter_map(|line| line.split_once("] ").map(|(_, message)| message))
@@ -614,13 +647,7 @@ fn trace_records_a_health_round_trip() {
         "{}",
         launch.failure("barn emitted no stall-event trace lines")
     );
-    for expected in [
-        "host reply wait start: id=1",
-        "host reply wait done: id=1 outcome=Line",
-        "recv start: waiting for event",
-        "channel created cap=2",
-        "send start: kind=Line",
-    ] {
+    for expected in expected_messages {
         assert!(
             messages.contains(&expected),
             "{expected} missing from {messages:?}; stderr: {stderr}"
