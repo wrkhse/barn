@@ -533,6 +533,43 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_line_exactly_at_the_byte_cap_is_accepted() {
+        // Serialize a valid reply skeleton, then pad its state so the whole
+        // line, including the newline, is exactly MAX_LINE_BYTES. A reply that
+        // lands on the cap still fits and must not be reported as Oversize.
+        let skeleton = json!({
+            "jsonrpc": "2.0",
+            "id": START_ID,
+            "protocol": PROTOCOL_VERSION,
+            "result": { "state": "", "jobs": {} },
+        });
+        let skeleton_len = serde_json::to_vec(&skeleton)
+            .expect("the skeleton serializes")
+            .len()
+            + 1; // the newline
+        let state = "x".repeat(MAX_LINE_BYTES - skeleton_len);
+
+        let expected = StallStartResult {
+            state: state.clone(),
+            jobs: BTreeMap::new(),
+        };
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": START_ID,
+            "protocol": PROTOCOL_VERSION,
+            "result": { "state": state, "jobs": {} },
+        });
+        let mut reply = serde_json::to_vec(&message).expect("the reply serializes");
+        reply.push(b'\n');
+        assert_eq!(reply.len(), MAX_LINE_BYTES);
+
+        let (_, result) = exchange(&reply, "secret", BTreeMap::new(), |_| {})
+            .expect("a line exactly at the cap is accepted");
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
     fn an_oversize_write_is_refused_before_it_reaches_the_socket() {
         let (mut writer, _peer) = UnixStream::pair().expect("a socket pair");
         writer.set_nonblocking(true).expect("a nonblocking writer");
