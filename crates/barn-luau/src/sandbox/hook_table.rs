@@ -212,7 +212,7 @@ pub fn run_table(
 
 /// Run a table whose call lock is held and whose deadline is already armed.
 ///
-/// Sandbox::hook owns both for the whole call, so this inner path must not
+/// [`Sandbox::hook`] owns both for the whole call, so this inner path must not
 /// take the lock again nor snapshot the deadline. `call_start` is read before
 /// the budget is armed, so lookup and decode time also spends the call cap.
 pub(super) fn run_table_inner(
@@ -336,7 +336,8 @@ mod tests {
     /// Each `micros` read advances the clock, so a loop reaches a checkpoint.
     fn tick_fixture() -> (Scratch, Sandbox) {
         let clock: Arc<dyn Clock> = Arc::new(TickingClock::new());
-        fixture(clock, capabilities(&Arc::new(FakeClock::new())).0)
+        let fake = Arc::new(FakeClock::new());
+        fixture(clock, capabilities(&fake).0)
     }
 
     fn handler(

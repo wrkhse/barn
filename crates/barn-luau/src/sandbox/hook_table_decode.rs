@@ -105,7 +105,7 @@ fn validate_keys(table: &Table) -> Result<(), EngineError> {
 }
 
 /// The single-function form: defaults throughout, with no ordering weight.
-fn from_function(function: Function, default_budget_ms: u64) -> HookHandler {
+const fn from_function(function: Function, default_budget_ms: u64) -> HookHandler {
     HookHandler {
         priority: DEFAULT_PRIORITY,
         budget_ms: default_budget_ms,
