@@ -1642,6 +1642,29 @@ pub async fn broker_stall_control(
     Ok(())
 }
 
+fn trace_host_reply_wait(
+    id: &Value,
+    reply: &std::result::Result<Option<StallEvent>, tokio::time::error::Elapsed>,
+) {
+    match reply {
+        Ok(Some(StallEvent::Line(_))) => {
+            trace_stall_event(|| format!("host reply wait done: id={id} outcome=Line"));
+        }
+        Ok(Some(event)) => trace_stall_event(|| {
+            format!(
+                "host reply wait done: id={id} outcome={}",
+                stall_event_kind(event)
+            )
+        }),
+        Ok(None) => {
+            trace_stall_event(|| format!("host reply wait done: id={id} outcome=None"));
+        }
+        Err(_) => {
+            trace_stall_event(|| format!("host reply wait done: id={id} outcome=timeout"));
+        }
+    }
+}
+
 /// Forwards one host frame to the stall and copies its reply back, with every
 /// forwarding step bounded by `limit` and every denial by `DENY_WRITE_TIMEOUT`.
 async fn broker_host_frame(
@@ -1686,23 +1709,7 @@ async fn broker_host_frame(
         .unwrap_or_else(TokioInstant::now);
     let line = loop {
         let reply = timeout_at(deadline, rx.recv()).await;
-        match &reply {
-            Ok(Some(StallEvent::Line(_))) => {
-                trace_stall_event(|| format!("host reply wait done: id={id} outcome=Line"));
-            }
-            Ok(Some(event)) => trace_stall_event(|| {
-                format!(
-                    "host reply wait done: id={id} outcome={}",
-                    stall_event_kind(event)
-                )
-            }),
-            Ok(None) => {
-                trace_stall_event(|| format!("host reply wait done: id={id} outcome=None"));
-            }
-            Err(_) => {
-                trace_stall_event(|| format!("host reply wait done: id={id} outcome=timeout"));
-            }
-        }
+        trace_host_reply_wait(&id, &reply);
         let line = match reply {
             Ok(Some(StallEvent::Line(line))) => line,
             // An over-cap reply keeps its named reason; the other terminal
