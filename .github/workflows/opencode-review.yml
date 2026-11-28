@@ -37,6 +37,9 @@ jobs:
       - name: Test review posting on fixtures
         shell: bash
         run: bash .github/scripts/test-review-post.sh
+      - name: Test carry-forward verdict lookup on fixtures
+        shell: bash
+        run: bash .github/scripts/test-carry-forward.sh
 
   review:
     # Pull requests from forks get no secrets, so they can't sign in.
@@ -60,7 +63,6 @@ jobs:
     permissions:
       id-token: write
       contents: read
-      # Listing past runs to carry forward a verdict needs actions: read.
       checks: read
       # Commenting and reacting on a pull request needs pull-requests: write.
       pull-requests: write

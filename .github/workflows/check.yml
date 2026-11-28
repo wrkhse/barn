@@ -20,11 +20,11 @@ on:
 permissions:
   contents: read
 
-# A superseded run on a branch is cancelled; main's runs are the record, so
-# they are left alone.
+# Superseded pull-request runs are cancelled per PR. Runs on main and manual
+# or scheduled runs are the record, so they are left alone.
 concurrency:
-  group: check-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  group: ${{ github.event_name == 'pull_request' && format('check-pr-{0}', github.event.number) || format('check-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   fmt:
