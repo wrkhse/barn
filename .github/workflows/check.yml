@@ -494,14 +494,16 @@ jobs:
           set -euo pipefail
           git cat-file -e "${BASE_SHA}^{commit}"
           git checkout "${BASE_SHA}" -- .github/scripts
-          # These four files are new in this PR, so they are absent from the
-          # base SHA; the manager's merge guard checks their content. Restore
-          # only them from the checked-out PR tree, never a pre-existing script.
-          git checkout HEAD -- \
+          # Unchanged files come from the base SHA; only base-absent new files
+          # come from HEAD, each guard-checked by git cat-file.
+          for f in \
             .github/scripts/review-prompt.txt \
             .github/scripts/enforce-review-verdict.sh \
             .github/scripts/enforce-review-verdict.jq \
             .github/scripts/test-enforce-verdict.sh
+          do
+            git cat-file -e "$BASE_SHA:$f" 2>/dev/null || git checkout HEAD -- "$f"
+          done
           git status --short -- .github/scripts
       - name: Fetch PR metadata
         env:
@@ -675,5 +677,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         shell: bash
         run: bash .github/scripts/enforce-review-verdict.sh

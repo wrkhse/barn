@@ -179,3 +179,27 @@ if [ -z "$pin_line" ]; then
   exit 1
 fi
 printf 'ok: review checkout and base-script pin precede carry_forward\n'
+
+# A later PR must not take an already-based script from HEAD: every HEAD
+# restore in the review workflow has to be guarded by a base-absence check for
+# the same path: git cat-file -e "$BASE_SHA:<path>" || git checkout HEAD -- ...
+unguarded=$(awk '
+  /^[[:space:]]*#/ { next }
+  /git checkout HEAD --/ {
+    if (index($0, "||") == 0 || $0 !~ /git cat-file -e "\$BASE_SHA:/) {
+      print NR
+      next
+    }
+    guard = substr($0, 1, index($0, "||") - 1)
+    restore = substr($0, index($0, "||") + 2)
+    target = restore
+    sub(/^git checkout HEAD -- /, "", target)
+    gsub(/^"|"$/, "", target)
+    if (target == "" || index(guard, target) == 0) print NR
+  }
+' "$workflow")
+if [ -n "$unguarded" ]; then
+  printf 'FAIL: unguarded git checkout HEAD restore at line(s) %s\n' "$unguarded" >&2
+  exit 1
+fi
+printf 'ok: every HEAD restore is guarded by a base-absence check\n'
