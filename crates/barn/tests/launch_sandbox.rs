@@ -9,7 +9,7 @@
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -31,16 +31,6 @@ const STALL_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL: Duration = Duration::from_millis(20);
 
-/// Removes the copied helper target on drop, even when a test panics before
-/// it finishes.
-struct RemoveOnDrop(PathBuf);
-
-impl Drop for RemoveOnDrop {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
 /// A scratch state root, a plugin folder with a loadable entry, and the barn
 /// child launched from them. stderr is drained on a thread so a named startup
 /// failure is reported instead of hidden in an unread pipe. The child and any
@@ -49,7 +39,6 @@ struct Launch {
     dir: PathBuf,
     plugin: PathBuf,
     state: PathBuf,
-    seq: usize,
     child: Option<Child>,
     stderr: Arc<Mutex<String>>,
 }
@@ -89,7 +78,6 @@ impl Launch {
             dir,
             plugin,
             state,
-            seq: n,
             child: None,
             stderr: Arc::new(Mutex::new(String::new())),
         })
@@ -103,86 +91,6 @@ impl Launch {
         )
     }
 
-    /// Find a built helper under the per-test target dir. cargo-mutants can
-    /// place binaries under a target triple or another profile folder, so the
-    /// fixed `debug/<name>` path is unreliable. Search at most five directories
-    /// deep, never following symlinks, and stop at a regular file whose name
-    /// matches.
-    fn find_built(root: &Path, name: &str) -> Option<PathBuf> {
-        let mut stack = vec![(root.to_path_buf(), 0usize)];
-
-        while let Some((dir, depth)) = stack.pop() {
-            let Ok(entries) = fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let Ok(kind) = entry.file_type() else {
-                    continue;
-                };
-                let entry_depth = depth.saturating_add(1);
-                let path = entry.path();
-
-                if kind.is_file()
-                    && entry_depth <= 5
-                    && path.file_name().and_then(|part| part.to_str()) == Some(name)
-                {
-                    return Some(path);
-                }
-                if kind.is_dir() && entry_depth < 5 {
-                    stack.push((path, entry_depth));
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Resolve the two helpers barn expects beside its binary. cargo-mutants
-    /// builds only the barn package, so the helpers may be absent from beside
-    /// the cargo-built barn; build any missing one into this test's own target
-    /// dir rather than a path shared with other tests. Return the resolved
-    /// paths so the caller copies them into its private bin dir.
-    fn ensure_helpers(siblings: &Path, target: &Path) -> (PathBuf, PathBuf) {
-        let needs_build = ["barn-exec", "barn-luau-stall"]
-            .iter()
-            .any(|name| !siblings.join(name).is_file());
-
-        if needs_build {
-            let _ = fs::remove_dir_all(target);
-            let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-            assert!(
-                Command::new("cargo")
-                    .args([
-                        "build",
-                        "--locked",
-                        "-p",
-                        "barn-exec",
-                        "-p",
-                        "barn-luau-stall",
-                        "--target-dir",
-                    ])
-                    .arg(target)
-                    .current_dir(workspace)
-                    .status()
-                    .is_ok_and(|status| status.success()),
-                "build barn-exec and barn-luau-stall failed"
-            );
-        }
-
-        let resolve = |name: &str| {
-            if siblings.join(name).is_file() {
-                siblings.join(name)
-            } else {
-                must_opt(
-                    Self::find_built(target, name),
-                    "find the built helper under the target dir",
-                )
-            }
-        };
-
-        (resolve("barn-exec"), resolve("barn-luau-stall"))
-    }
-
     /// Copy barn and both helpers into this test's private `bin` dir and
     /// return the copied barn's path. barn finds its helpers beside the binary
     /// it runs, so the copy must carry all three; the cargo-built binary's
@@ -190,18 +98,11 @@ impl Launch {
     /// installed as barn-luau-stall, else the built helper is used.
     fn prepare_bin(&self, stall: Option<PathBuf>) -> PathBuf {
         let binary = PathBuf::from(env!("CARGO_BIN_EXE_barn"));
-        let siblings = must_opt(binary.parent(), "barn has a folder");
         let bin = self.dir.join("bin");
         must_res(fs::create_dir_all(&bin), "the scratch bin dir");
 
-        let target = std::env::temp_dir().join(format!(
-            "barn-launch-helpers-{}-{}",
-            std::process::id(),
-            self.seq
-        ));
-        let _ = fs::remove_dir_all(&target);
-        let _target_guard = RemoveOnDrop(target.clone());
-        let (exec, built_stall) = Self::ensure_helpers(siblings, &target);
+        let exec = PathBuf::from(env!("CARGO_BIN_EXE_barn-test-exec"));
+        let built_stall = PathBuf::from(env!("CARGO_BIN_EXE_barn-test-stall"));
         let stall = stall.unwrap_or(built_stall);
 
         for (from, name) in [

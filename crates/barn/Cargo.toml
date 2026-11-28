@@ -11,9 +11,11 @@ repository.workspace = true
 [features]
 default = ["cli"]
 cli = ["dep:clap"]
-test-fixtures = []
+test-fixtures = ["dep:barn-exec", "dep:barn-luau-stall"]
 
 [dependencies]
+barn-exec = { path = "../barn-exec", optional = true }
+barn-luau-stall = { path = "../barn-luau-stall", optional = true }
 barn-stall = { path = "../barn-stall" }
 clap = { workspace = true, optional = true }
 nono.workspace = true
@@ -29,6 +31,16 @@ required-features = ["cli"]
 [[bin]]
 name = "stall_drain_fixture"
 path = "examples/stall_drain_fixture.rs"
+required-features = ["test-fixtures"]
+
+[[bin]]
+name = "barn-test-exec"
+path = "tests/fixtures/barn_exec.rs"
+required-features = ["test-fixtures"]
+
+[[bin]]
+name = "barn-test-stall"
+path = "tests/fixtures/barn_luau_stall.rs"
 required-features = ["test-fixtures"]
 
 [lints]
