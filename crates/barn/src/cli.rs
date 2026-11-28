@@ -183,6 +183,12 @@ enum StartError {
     /// The plugin folder is not an absolute path.
     #[error("plugin path is not absolute")]
     RelativePlugin,
+    /// The plugin folder does not exist.
+    #[error("plugin folder missing")]
+    PluginMissing,
+    /// The plugin path names something other than a directory.
+    #[error("plugin folder is not a directory")]
+    PluginNotDirectory,
     /// The plugin folder has no final component to name the stall.
     #[error("plugin folder has no file name")]
     PluginName,
@@ -198,6 +204,9 @@ enum StartError {
     /// Neither `BARN_STATE_DIR` nor `HOME` is available.
     #[error("state directory is unavailable")]
     StateDirMissing,
+    /// The configured state directory is not an absolute path.
+    #[error("state directory path is not absolute")]
+    RelativeStateDir,
     /// A run directory for this stall is already live.
     #[error("stall run directory is in use")]
     RunDirInUse,
@@ -254,11 +263,14 @@ impl StartError {
     const fn reason(&self) -> &'static str {
         match self {
             Self::RelativePlugin => "plugin path not absolute",
+            Self::PluginMissing => "plugin folder missing",
+            Self::PluginNotDirectory => "plugin folder is not a directory",
             Self::PluginName => "plugin folder has no name",
             Self::BinaryDir => "barn executable has no folder",
             Self::HelperMissing => "barn-exec not found",
             Self::RuntimeMissing => "stall runtime not found",
             Self::StateDirMissing => "state directory unavailable",
+            Self::RelativeStateDir => "state directory path not absolute",
             Self::RunDirInUse => "stall run directory in use",
             Self::SocketPath => "socket path not UTF-8",
             Self::Supervisor(_) => "stall did not start",
@@ -564,12 +576,25 @@ fn state_dir_from(
     home: Option<OsString>,
 ) -> Result<PathBuf, StartError> {
     if let Some(root) = configured.filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(root));
+        let root = PathBuf::from(root);
+
+        if !root.is_absolute() {
+            return Err(StartError::RelativeStateDir);
+        }
+
+        return Ok(root);
     }
 
-    let home = home.ok_or(StartError::StateDirMissing)?;
+    let home = home
+        .filter(|value| !value.is_empty())
+        .ok_or(StartError::StateDirMissing)?;
+    let root = PathBuf::from(home);
 
-    Ok(Path::new(&home).join(".local").join("state").join("barn"))
+    if !root.is_absolute() {
+        return Err(StartError::RelativeStateDir);
+    }
+
+    Ok(root.join(".local").join("state").join("barn"))
 }
 
 async fn start_async(
@@ -721,6 +746,14 @@ fn stall_spec(plugin: &Path, program: &Path) -> Result<StallSpec, StartError> {
         return Err(StartError::RelativePlugin);
     }
 
+    if !plugin.exists() {
+        return Err(StartError::PluginMissing);
+    }
+
+    if !plugin.is_dir() {
+        return Err(StartError::PluginNotDirectory);
+    }
+
     let name = plugin
         .file_name()
         .and_then(OsStr::to_str)
@@ -772,11 +805,29 @@ fn endpoint_line(socket_path: &str, token: &str) -> Result<Vec<u8>, StartError> 
     Ok(line)
 }
 
-/// The exact failure line: protocol and reason, then one newline.
+/// The exact failure line: protocol and reason, then one newline. A reason
+/// too long for the protocol is shortened one character at a time on a UTF-8
+/// boundary, so a failure always emits a line within the launch line limit.
 fn error_line(reason: &str) -> Vec<u8> {
-    let escaped = serde_json::to_string(reason).unwrap_or_else(|_| "\"error\"".to_owned());
+    let mut reason = reason;
 
-    format!("{{\"protocol\":{LAUNCH_PROTOCOL},\"error\":{escaped}}}\n").into_bytes()
+    loop {
+        let escaped = serde_json::to_string(reason).unwrap_or_else(|_| "\"error\"".to_owned());
+        let line = format!("{{\"protocol\":{LAUNCH_PROTOCOL},\"error\":{escaped}}}\n").into_bytes();
+
+        if line.len() <= MAX_LAUNCH_LINE_BYTES || reason.is_empty() {
+            return line;
+        }
+
+        let Some((cut, _)) = reason.char_indices().next_back() else {
+            return line;
+        };
+
+        match reason.get(..cut) {
+            Some(prefix) => reason = prefix,
+            None => return line,
+        }
+    }
 }
 
 fn write_line(mut stdout: impl Write, line: &[u8]) -> Result<(), StartError> {
@@ -891,19 +942,26 @@ mod tests {
 
     #[test]
     fn the_launch_argv_builds_the_stall_spec() {
+        let root = std::env::temp_dir().join(format!("barn-cli-argv-{}", std::process::id()));
+        let plugin_dir = root.join("sourcefed");
+        fs::create_dir_all(&plugin_dir).expect("a plugin folder");
+
         let cli = Cli::try_parse_from([
             "barn",
             "stall",
             "start",
             "--plugin",
-            "/opt/plugins/sourcefed",
+            plugin_dir.to_str().expect("a UTF-8 plugin path"),
             "--daemon-pid",
             "4321",
         ])
         .expect("the launch argv");
         assert_eq!(
             cli.command.typed(),
-            "stall start --plugin /opt/plugins/sourcefed --daemon-pid 4321"
+            format!(
+                "stall start --plugin {} --daemon-pid 4321",
+                plugin_dir.display()
+            )
         );
 
         let (plugin, daemon_pid) = (match cli.command {
@@ -917,7 +975,7 @@ mod tests {
         assert_eq!(daemon_pid, 4321);
         let runtime = PathBuf::from("/usr/local/bin/barn-luau-stall");
         let spec = stall_spec(&plugin, &runtime).expect("a stall spec");
-        let folder = PathBuf::from("/opt/plugins/sourcefed");
+        let folder = plugin_dir;
 
         assert_eq!(spec.name, "sourcefed");
         assert_eq!(spec.program, runtime);
@@ -931,6 +989,7 @@ mod tests {
                 network_hosts: Vec::new(),
             }
         );
+        fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[test]
@@ -943,6 +1002,33 @@ mod tests {
             .err()
             .map(|error| error.reason()),
             Some("plugin path not absolute")
+        );
+    }
+
+    #[test]
+    fn a_non_directory_plugin_folder_is_a_named_failure() {
+        let file = std::env::temp_dir().join(format!("barn-plugin-file-{}", std::process::id()));
+        fs::write(&file, "not a folder").expect("a file, not a folder");
+
+        assert_eq!(
+            stall_spec(&file, Path::new("/usr/local/bin/barn-luau-stall"))
+                .err()
+                .map(|error| error.reason()),
+            Some("plugin folder is not a directory")
+        );
+        fs::remove_file(&file).expect("cleanup");
+    }
+
+    #[test]
+    fn a_missing_plugin_folder_is_a_named_failure() {
+        let missing =
+            std::env::temp_dir().join(format!("barn-plugin-missing-{}", std::process::id()));
+
+        assert_eq!(
+            stall_spec(&missing, Path::new("/usr/local/bin/barn-luau-stall"))
+                .err()
+                .map(|error| error.reason()),
+            Some("plugin folder missing")
         );
     }
 
@@ -963,11 +1049,13 @@ mod tests {
         let root = std::env::temp_dir().join(format!("barn-cli-{}-live", std::process::id()));
         let run_dir = root.join("run").join("sourcefed");
         fs::create_dir_all(&run_dir).expect("a live run directory");
+        let plugin = root.join("plugin").join("sourcefed");
+        fs::create_dir_all(&plugin).expect("a plugin folder");
         let lock = File::open(&run_dir).expect("opening the live run directory");
         lock.try_lock().expect("locking the live run directory");
 
         let second = prepare_launch(
-            Path::new("/opt/plugins/sourcefed"),
+            &plugin,
             Path::new("/usr/local/bin/barn-luau-stall"),
             4321,
             PathBuf::from("/usr/local/bin/barn-exec"),
@@ -987,9 +1075,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("barn-cli-{}-stale", std::process::id()));
         let run_dir = root.join("run").join("sourcefed");
         fs::create_dir_all(&run_dir).expect("an unlocked stale run directory");
+        let plugin = root.join("plugin").join("sourcefed");
+        fs::create_dir_all(&plugin).expect("a plugin folder");
 
         let launch = prepare_launch(
-            Path::new("/opt/plugins/sourcefed"),
+            &plugin,
             Path::new("/usr/local/bin/barn-luau-stall"),
             4321,
             PathBuf::from("/usr/local/bin/barn-exec"),
@@ -1004,17 +1094,20 @@ mod tests {
     #[test]
     fn a_missing_run_directory_does_not_block_a_start() {
         let root = std::env::temp_dir().join(format!("barn-cli-{}-missing", std::process::id()));
+        let plugin = root.join("plugin").join("sourcefed");
+        fs::create_dir_all(&plugin).expect("a plugin folder");
 
         let launch = prepare_launch(
-            Path::new("/opt/plugins/sourcefed"),
+            &plugin,
             Path::new("/usr/local/bin/barn-luau-stall"),
             4321,
             PathBuf::from("/usr/local/bin/barn-exec"),
-            root,
+            root.clone(),
         )
         .expect("a missing run directory must not block a start");
 
         assert_eq!(launch.stall.name, "sourcefed");
+        fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[test]
@@ -1087,6 +1180,57 @@ mod tests {
             error_line("stall run directory in use"),
             b"{\"protocol\":1,\"error\":\"stall run directory in use\"}\n".to_vec()
         );
+    }
+
+    #[test]
+    fn an_overlong_error_reason_is_bounded_and_parses() {
+        let reason = "é".repeat(MAX_LAUNCH_LINE_BYTES);
+        let line = error_line(&reason);
+
+        assert!(line.len() <= MAX_LAUNCH_LINE_BYTES);
+        let body = line.strip_suffix(b"\n").expect("one trailing newline");
+        assert!(!body.contains(&b'\n'));
+        assert_eq!(line.last(), Some(&b'\n'));
+
+        let value: serde_json::Value = serde_json::from_slice(&line).expect("a JSON failure line");
+
+        assert!(value.is_object());
+        assert_eq!(
+            value.get("protocol").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+
+        let error = value
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("an error string");
+
+        assert_ne!(error, "");
+        assert!(reason.starts_with(error));
+    }
+
+    #[test]
+    fn named_launch_failures_keep_their_machine_readable_reasons() {
+        let malformed =
+            serde_json::from_str::<serde_json::Value>("{").expect_err("a malformed JSON document");
+
+        let cases = [
+            (StartError::PluginName, "plugin folder has no name"),
+            (StartError::SocketPath, "socket path not UTF-8"),
+            (StartError::BinaryDir, "barn executable has no folder"),
+            (
+                StartError::Supervisor(SupervisorError::InvalidName),
+                "stall did not start",
+            ),
+            (
+                StartError::EndpointJson(malformed),
+                "encoding endpoint line",
+            ),
+        ];
+
+        for (error, reason) in cases {
+            assert_eq!(error.reason(), reason);
+        }
     }
 
     #[test]
@@ -1199,6 +1343,37 @@ mod tests {
             state_dir_from(None, None).err().map(|error| error.reason()),
             Some("state directory unavailable")
         );
+    }
+
+    #[test]
+    fn a_relative_state_dir_setting_is_a_named_failure() {
+        assert_eq!(
+            state_dir_from(
+                Some(OsString::from("relative/state")),
+                Some(OsString::from("/home/barn"))
+            )
+            .err()
+            .map(|error| error.reason()),
+            Some("state directory path not absolute")
+        );
+    }
+
+    #[test]
+    fn a_relative_home_is_a_named_state_dir_failure() {
+        let failure = state_dir_from(None, Some(OsString::from("relative/home")))
+            .expect_err("a relative HOME must leave no absolute state directory");
+
+        assert!(matches!(failure, StartError::RelativeStateDir));
+        assert_eq!(failure.reason(), "state directory path not absolute");
+    }
+
+    #[test]
+    fn an_empty_home_is_a_named_state_dir_failure() {
+        let failure = state_dir_from(None, Some(OsString::new()))
+            .expect_err("an empty HOME must leave no state directory");
+
+        assert!(matches!(failure, StartError::StateDirMissing));
+        assert_eq!(failure.reason(), "state directory unavailable");
     }
 
     #[test]
