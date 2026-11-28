@@ -530,6 +530,57 @@ mod tests {
     }
 
     #[test]
+    fn scoped_require_loads_a_directory_with_init_luau() {
+        let folder = Folder::new();
+        std::fs::create_dir(folder.path.join("sub"))
+            .expect("create a module directory in the scratch folder");
+        folder.write("sub/init.luau", b"return 42".to_vec());
+        folder.write("plugin.luau", b"return require('./sub')".to_vec());
+
+        let lua = Lua::new();
+        let state = RequireState::new(&folder.path).expect("require state");
+        let loader = install(&lua, state).expect("install require");
+
+        let value = loader
+            .call::<i64>(("./plugin",))
+            .expect("a directory with init.luau loads as a module");
+        assert_eq!(value, 42);
+    }
+
+    /// `locate` only considers a candidate when `is_file` holds, so a FIFO is
+    /// refused as Missing before the link count is read: non-regular nodes
+    /// never reach the hard-link guard.
+    #[test]
+    #[cfg(unix)]
+    fn scoped_require_refuses_a_fifo_as_missing() {
+        if std::env::var_os("CI").is_none() {
+            return;
+        }
+
+        let folder = Folder::new();
+        let fifo = folder.path.join("pipe.luau");
+        let output = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .output()
+            .expect("spawn mkfifo");
+        assert!(output.status.success(), "mkfifo failed: {output:?}");
+
+        let lua = Lua::new();
+        let state = RequireState::new(&folder.path).expect("require state");
+        let loader = install(&lua, state).expect("install require");
+
+        let error = loader
+            .call::<LuaValue>(("./pipe",))
+            .expect_err("a FIFO is not a module");
+        assert_eq!(
+            error
+                .downcast_ref::<RequireCause>()
+                .expect("error carries a require cause"),
+            &RequireCause::Missing("./pipe".into())
+        );
+    }
+
+    #[test]
     fn loading_guard_removes_only_its_path_on_drop() {
         let folder = Folder::new();
         let state = RequireState::new(&folder.path).expect("require state");

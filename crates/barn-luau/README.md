@@ -124,3 +124,9 @@ Tool entries carry their name and other non-function fields.
   values, and a returned error carries the capability name and reason.
   Capabilities run in the host: the VM cannot interrupt a blocking Rust
   callback or cap its memory. The host must bound that work itself.
+
+The regular-file guard is sufficient because `locate` admits only regular
+files: FIFOs, sockets, and device nodes fail its `is_file` check and are
+refused as `Missing` before the link count is read. A hard link cannot make
+one of those nodes masquerade as a module: it stays a non-regular file and is
+refused the same way.

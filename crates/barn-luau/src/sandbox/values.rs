@@ -535,6 +535,14 @@ mod tests {
     }
 
     #[test]
+    fn json_null_round_trips_through_lua_as_null() {
+        let lua = Lua::new();
+
+        assert_eq!(json_to_lua(&lua, &Value::Null, 0), Ok(LuaValue::NULL));
+        assert_eq!(lua_to_json(LuaValue::NULL, 0), Ok(Value::Null));
+    }
+
+    #[test]
     fn json_to_lua_round_trips_an_object_with_a_null_field() {
         let lua = Lua::new();
         let input = serde_json::json!({ "keep": null, "value": 1 });
@@ -597,6 +605,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lua_to_json_refuses_a_scalar_past_the_depth_limit_in_a_table() {
+        let lua = Lua::new();
+        let table = lua.create_table().unwrap();
+        table.set("value", 1i64).unwrap();
+
+        assert_eq!(
+            lua_to_json(LuaValue::Table(table), MAX_DEPTH),
+            Err(EngineError::Limit(LimitCause::TooDeep { limit: MAX_DEPTH }))
+        );
+    }
+
     fn shared_table() -> EngineError {
         EngineError::InvalidResult(SHARED_TABLE.into())
     }
@@ -630,6 +650,37 @@ mod tests {
             Err(EngineError::Limit(LimitCause::TooManyEntries {
                 limit: MAX_NODES
             }))
+        );
+    }
+
+    #[test]
+    fn lua_to_json_refuses_a_17_table_dag_past_the_depth_limit() {
+        let lua = Lua::new();
+        let depth = MAX_DEPTH.saturating_add(1);
+        let mut tables = Vec::with_capacity(depth);
+        for _ in 0..depth {
+            tables.push(lua.create_table().unwrap());
+        }
+
+        // The node-budget case is covered by the 16-table DAG above: its leaf
+        // scalars sit at MAX_DEPTH, so expansion runs until MAX_NODES visits.
+        // One more table puts the leaf scalars at MAX_DEPTH + 1, where the
+        // depth guard wins before the MAX_ENTRIES-way expansion spends the
+        // node budget.
+        for index in 0..depth.saturating_sub(1) {
+            let child = tables[index.saturating_add(1)].clone();
+            for key in 0..MAX_ENTRIES {
+                tables[index].set(format!("k{key}"), child.clone()).unwrap();
+            }
+        }
+        let leaf = depth.saturating_sub(1);
+        for key in 0..MAX_ENTRIES {
+            tables[leaf].set(format!("k{key}"), 1i64).unwrap();
+        }
+
+        assert_eq!(
+            lua_to_json(LuaValue::Table(tables[0].clone()), 0),
+            Err(EngineError::Limit(LimitCause::TooDeep { limit: MAX_DEPTH }))
         );
     }
 
