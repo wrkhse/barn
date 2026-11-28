@@ -15,11 +15,24 @@ trap 'rm -rf -- "$tmp"' EXIT
 mkdir -p "$tmp/bin"
 cat > "$tmp/bin/gh" <<'STUB'
 #!/usr/bin/env bash
-if [[ "${1-}" != api || "${2-}" != --paginate || "${3-}" != --jq ]]; then
+if [[ "${1-}" != api ]]; then
   echo 'unexpected gh command' >&2
   exit 1
 fi
-printf '%s\n' "$GH_COMMENTS"
+if [[ "${2-}" = --paginate ]]; then
+  if [[ "${3-}" != --jq || "${5-}" != *"/comments" ]]; then
+    echo 'unexpected gh comments query' >&2
+    exit 1
+  fi
+  printf '%s\n' "$GH_COMMENTS"
+  exit 0
+fi
+if [[ "${2-}" = *"/pulls/"* && "${3-}" = --jq ]]; then
+  printf '%s' "$PR_BODY_JSON" | jq -r "$4"
+  exit 0
+fi
+echo 'unexpected gh command' >&2
+exit 1
 STUB
 chmod +x "$tmp/bin/gh"
 export PATH="$tmp/bin:$PATH"
@@ -32,7 +45,10 @@ head_sha=0123456789abcdef0123456789abcdef01234567
 base_sha=fedcba9876543210fedcba9876543210fedcba98765432
 other_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 other_base=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-body_hash=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+pr_body='Fixture PR body.'
+pr_body_json=$(jq -nc --arg b "$pr_body" '{body:$b}')
+# The hash the writer put in the meta line, computed exactly as the helper does.
+body_hash=$(printf '%s\n' "$pr_body" | sha256sum | cut -d' ' -f1)
 other_hash=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
 
 summary="$tmp/summary"
@@ -55,7 +71,7 @@ check() {
   : > "$out"
   GH_COMMENTS="$comments" \
     REPO=owner/repo PR=42 \
-    HEAD_SHA="$head_sha" BASE_SHA="$base_sha" BODY_HASH="$body_hash" \
+    HEAD_SHA="$head_sha" BASE_SHA="$base_sha" PR_BODY_JSON="$pr_body_json" \
     GITHUB_OUTPUT="$out" \
     bash "$script" > "$tmp/log" 2>&1
   actual=$(sed -n 's/^carried=//p' "$out" | tail -n 1)
@@ -120,3 +136,18 @@ if ! grep -qF '!github.event.changes.body' "$workflow"; then
   exit 1
 fi
 printf 'ok: workflow excludes body edits from carry-forward\n'
+
+# The reader computes the hash itself: carry_forward must not be handed
+# BODY_HASH before the gather step publishes PR_BODY_HASH.
+carry_line=$(awk '/id: carry_forward/{print NR; exit}' "$workflow")
+hash_line=$(awk '/PR_BODY_HASH=/{print NR; exit}' "$workflow")
+if [ -z "$carry_line" ] || [ -z "$hash_line" ]; then
+  echo 'FAIL: could not locate carry_forward or PR_BODY_HASH in the workflow' >&2
+  exit 1
+fi
+if awk -v s="$carry_line" -v e="$hash_line" \
+    'NR>s && NR<e && /BODY_HASH/ { found=1 } END { exit !found }' "$workflow"; then
+  echo 'FAIL: carry_forward reads BODY_HASH before gather computes it' >&2
+  exit 1
+fi
+printf 'ok: carry_forward does not read BODY_HASH before gather\n'

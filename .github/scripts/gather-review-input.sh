@@ -153,7 +153,7 @@ if [ "$config_ok" = true ] && [[ "$changed" =~ ^[0-9]+$ ]] &&
       | any($c.governance_names[]; . as $n | ($n | ascii_downcase) == $last)
         or any($c.governance_paths[]; . as $g | ($g | ascii_downcase) == $p)
         or any($c.non_docs_globs[]; . as $g
-            | ($g | ascii_downcase | rtrimstr("**") | rtrimstr("*")) as $prefix
+            | ($g | ascii_downcase | split("*")[0]) as $prefix
             | ($p | startswith($prefix)));
 
     if (length == 0 or any(.[]; type != "array")) then
@@ -196,6 +196,20 @@ normalize_path() {
   (IFS=/; printf '%s' "${out[*]}")
 }
 
+find_manifest() {
+  local dir="$1"
+  while :; do
+    if [ -f "$dir/Cargo.toml" ]; then
+      printf '%s\n' "$dir/Cargo.toml"
+      return 0
+    fi
+    if [ "$dir" = . ]; then break; fi
+    dir=$(dirname -- "$dir")
+    [ -n "$dir" ] || dir=.
+  done
+  return 1
+}
+
 if [ "$docs_only" = true ]; then
   if ! command -v "$RG" > /dev/null 2>&1; then
     printf '%s is unavailable; cannot check include_str! references; reviewing as code.\n' "$RG" >> "$notes"
@@ -203,10 +217,10 @@ if [ "$docs_only" = true ]; then
   else
     md_paths=$(printf '%s' "$api_files" | jq -rs '
       [ .[].[]? | ((.filename? // empty), (.previous_filename? // empty))
-        | select(type == "string" and endswith(".md")) ] | unique | .[]' 2> /dev/null || true)
+        | select(type == "string" and test("\\.md$"; "i")) ] | unique | .[]' 2> /dev/null || true)
     mapfile -t roots < <(jq -r '.include_roots[]?' "$config" 2> /dev/null)
     [ "${#roots[@]}" -gt 0 ] || roots=(.)
-    includes=$("$RG" -n --no-heading --max-count 1 --max-filesize 2000000 \
+    includes=$("$RG" -n --no-heading --max-filesize 2000000 \
       --glob '*.rs' --glob '!target/**' 'include_str!.*"[^"]+"' \
       "${roots[@]}" 2> /dev/null | head -n 200 || true)
     while IFS= read -r md; do
@@ -215,11 +229,28 @@ if [ "$docs_only" = true ]; then
       while IFS= read -r hit; do
         [ -n "$hit" ] || continue
         file=${hit%%:*}
-        inc=$(printf '%s\n' "$hit" | sed -n 's/.*include_str!.*"\([^"]*\)".*/\1/p')
-        [ -n "$inc" ] || continue
         dir=${file%/*}
         if [ "$dir" = "$file" ]; then dir='.'; fi
-        resolved=$(normalize_path "$dir/$inc")
+        if printf '%s\n' "$hit" | grep -Fq 'CARGO_MANIFEST_DIR'; then
+          # Crate-root includes are safe only when the manifest and the
+          # concatenated suffix can both be resolved.
+          manifest=$(find_manifest "$dir" || true)
+          inc=''
+          if [ -n "$manifest" ]; then
+            inc=$(printf '%s\n' "$hit" | sed -n 's/.*concat!(.*CARGO_MANIFEST_DIR[^,]*,[[:space:]]*"\([^"]*\)".*/\1/p')
+          fi
+          if [ -z "$manifest" ] || [ -z "$inc" ]; then
+            docs_only=false
+            printf 'include_str! with CARGO_MANIFEST_DIR could not be resolved; reviewing as code.\n' >> "$notes"
+            break
+          fi
+          inc=${inc#/}
+          resolved=$(normalize_path "$(dirname -- "$manifest")/$inc")
+        else
+          inc=$(printf '%s\n' "$hit" | sed -n 's/.*include_str!.*"\([^"]*\)".*/\1/p')
+          [ -n "$inc" ] || continue
+          resolved=$(normalize_path "$dir/$inc")
+        fi
         if [ "$resolved" = "$target" ]; then
           docs_only=false
           printf 'Markdown %s is included by include_str! in Rust; reviewing as code.\n' "$md" >> "$notes"
