@@ -162,6 +162,28 @@ pub enum StallEvent {
     Oversize,
 }
 
+/// Env-gated diagnostic for the bounded stall-event channel. Setting
+/// `BARN_TEST_TRACE` prints timestamped events to stderr; nothing else reads
+/// the variable, so tracing cannot change supervision behavior.
+fn trace_stall_event(message: impl FnOnce() -> String) {
+    if std::env::var_os("BARN_TEST_TRACE").is_none() {
+        return;
+    }
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    eprintln!("[stall-event {:?}] {}", start.elapsed(), message());
+}
+
+/// The variant name of an event, without its payload.
+fn stall_event_kind(event: &StallEvent) -> &'static str {
+    match event {
+        StallEvent::Line(_) => "Line",
+        StallEvent::Exited => "Exited",
+        StallEvent::Loss => "Loss",
+        StallEvent::Oversize => "Oversize",
+    }
+}
+
 /// The receiving end of the stall's event stream.
 pub struct StallReceiver {
     rx: mpsc::Receiver<StallEvent>,
@@ -170,7 +192,15 @@ pub struct StallReceiver {
 impl StallReceiver {
     /// Waits for the next event, or `None` once the reader task is gone.
     pub async fn recv(&mut self) -> Option<StallEvent> {
-        self.rx.recv().await
+        trace_stall_event(|| "recv start: waiting for event".to_owned());
+        let event = self.rx.recv().await;
+        match &event {
+            Some(event) => {
+                trace_stall_event(|| format!("recv done: Some({})", stall_event_kind(event)))
+            }
+            None => trace_stall_event(|| "recv done: None".to_owned()),
+        }
+        event
     }
 }
 
@@ -186,6 +216,7 @@ pub type StallWriter = OwnedWriteHalf;
 #[must_use]
 pub fn spawn_stall_reader(stream: OwnedReadHalf) -> StallReceiver {
     let (tx, rx) = mpsc::channel(2);
+    trace_stall_event(|| "channel created cap=2".to_owned());
     tokio::spawn(async move {
         let mut reader = BufReader::new(stream);
         let limit = u64::try_from(MAX_LINE_BYTES.saturating_add(1)).unwrap_or(u64::MAX);
@@ -202,7 +233,10 @@ pub fn spawn_stall_reader(stream: OwnedReadHalf) -> StallReceiver {
             };
             let terminal = !matches!(event, StallEvent::Line(_));
 
-            if tx.send(event).await.is_err() || terminal {
+            trace_stall_event(|| format!("send start: kind={}", stall_event_kind(&event)));
+            let sent = tx.send(event).await;
+            trace_stall_event(|| format!("send done: {}", if sent.is_ok() { "Ok" } else { "Err" }));
+            if sent.is_err() || terminal {
                 break;
             }
         }
@@ -1525,7 +1559,26 @@ async fn broker_host_frame(
         return refuse(host, &id, HostDeny::PeerLoss, DENY_WRITE_TIMEOUT).await;
     }
 
+    trace_stall_event(|| format!("host reply wait start: id={}", id));
     let reply = timeout(limit, rx.recv()).await;
+    match &reply {
+        Ok(Some(StallEvent::Line(_))) => {
+            trace_stall_event(|| format!("host reply wait done: id={} outcome=Line", id));
+        }
+        Ok(Some(event)) => trace_stall_event(|| {
+            format!(
+                "host reply wait done: id={} outcome={}",
+                id,
+                stall_event_kind(event)
+            )
+        }),
+        Ok(None) => {
+            trace_stall_event(|| format!("host reply wait done: id={} outcome=None", id));
+        }
+        Err(_) => {
+            trace_stall_event(|| format!("host reply wait done: id={} outcome=timeout", id));
+        }
+    }
     let line = match reply {
         Ok(Some(StallEvent::Line(line))) => line,
         // An over-cap reply keeps its named reason; the other terminal

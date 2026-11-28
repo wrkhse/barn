@@ -20,7 +20,7 @@ use std::io;
 use std::path::PathBuf;
 
 use crate::bridge::real_clock;
-use crate::serve::{ServeError, serve};
+use crate::serve::{ServeError, serve, trace};
 use barn_luau::{Capabilities, EngineError, Limits, Sandbox};
 use barn_stall::client::{self, ClientError};
 
@@ -116,6 +116,8 @@ pub async fn run() -> Result<(), MainError> {
     let limits = Limits::new(MEMORY_BYTES, CALL_DEADLINE_MS).map_err(MainError::Limits)?;
     let sandbox = Sandbox::new(&folder, limits, Capabilities::default(), real_clock())
         .map_err(MainError::Sandbox)?;
+
+    trace(|| "reader ready".to_owned());
 
     serve(stream, sandbox).await.map_err(MainError::Serve)
 }

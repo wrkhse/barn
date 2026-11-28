@@ -130,6 +130,7 @@ impl Launch {
                 .arg(&self.plugin)
                 .args(["--daemon-pid", &std::process::id().to_string()])
                 .env("BARN_STATE_DIR", &self.state)
+                .env("RUST_BACKTRACE", "1")
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn(),
@@ -410,6 +411,23 @@ fn read_line(reader: &mut impl BufRead) -> String {
     line
 }
 
+/// On a failed health reply read, abort the stall so its SIGABRT lands in
+/// barn's captured stderr with a backtrace, then fail the test.
+fn read_line_with_stall_abort(reader: &mut impl BufRead, stall_pid: u32) -> String {
+    let mut line = String::new();
+
+    match reader.read_line(&mut line) {
+        Ok(_) => line,
+        Err(error) => {
+            eprintln!("HOST TRACE health read error {error:?}; aborting stall {stall_pid}");
+            let _ = Command::new("kill")
+                .args(["-ABRT", &stall_pid.to_string()])
+                .status();
+            panic!("stall {stall_pid} aborted: {error}");
+        }
+    }
+}
+
 fn parse(line: &str) -> Value {
     must_res(serde_json::from_str(line), "one JSON line")
 }
@@ -440,6 +458,8 @@ fn a_launched_stall_serves_one_host_connection_then_exits_cleanly() {
     let line = launch.spawn();
     let (socket, token) = launch.endpoint(&line);
     let mut host = connect(&socket);
+    let t0 = Instant::now();
+    eprintln!("HOST TRACE connect {:?}", t0.elapsed());
 
     let start = json!({
         "jsonrpc": "2.0",
@@ -462,17 +482,7 @@ fn a_launched_stall_serves_one_host_connection_then_exits_cleanly() {
         })
     );
 
-    let health = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method::STALL_HEALTH,
-    });
-    writeln!(host.get_mut(), "{health}").expect("send stall.health");
-
-    assert_eq!(
-        parse(&read_line(&mut host)),
-        json!({"jsonrpc": "2.0", "id": 1, "result": null})
-    );
+    eprintln!("HOST TRACE reader-ready-check {:?}", t0.elapsed());
 
     // One connection owns the launch: the real stall is live while the host
     // drives it, and closing that host ends barn cleanly without a stall left
@@ -485,10 +495,31 @@ fn a_launched_stall_serves_one_host_connection_then_exits_cleanly() {
         launch.failure("one stall serves the host before it closes")
     );
     let stall_pid = running.first().copied().expect("one stall pid");
+    eprintln!("HOST TRACE stall-pid {:?} {stall_pid}", t0.elapsed());
+
+    let health = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method::STALL_HEALTH,
+    });
+    eprintln!("HOST TRACE health-send {:?}", t0.elapsed());
+    writeln!(host.get_mut(), "{health}").expect("send stall.health");
+    eprintln!("HOST TRACE health-written {:?}", t0.elapsed());
+
+    eprintln!("HOST TRACE health-reply-wait {:?}", t0.elapsed());
+    let health_reply = parse(&read_line_with_stall_abort(&mut host, stall_pid));
+    eprintln!("HOST TRACE health-reply-got {:?}", t0.elapsed());
+    assert_eq!(
+        health_reply,
+        json!({"jsonrpc": "2.0", "id": 1, "result": null}),
+        "{}",
+        launch.failure("stall.health reply")
+    );
 
     drop(host);
 
     let status = launch.wait_exit();
+    eprintln!("HOST TRACE exit {:?}", t0.elapsed());
     assert_eq!(
         status.code(),
         Some(0),

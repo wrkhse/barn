@@ -26,6 +26,23 @@ use tokio::time::{Duration, Instant, timeout, timeout_at};
 
 use crate::bridge::handle_request;
 
+/// Emit a timestamped diagnostic line when `BARN_TEST_TRACE` is set.
+pub fn trace(message: impl FnOnce() -> String) {
+    if std::env::var_os("BARN_TEST_TRACE").is_some() {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let start = START.get_or_init(std::time::Instant::now);
+        eprintln!("STALL TRACE {:?} {}", start.elapsed(), message());
+    }
+}
+
+/// A short diagnostic tag for a joined call: its task id and outcome.
+fn joined_tag(joined: &Result<(task::Id, Reply), task::JoinError>) -> String {
+    match joined {
+        Ok((task, _)) => format!("task={task:?} answered"),
+        Err(error) => format!("task={:?} join_error", error.id()),
+    }
+}
+
 /// The cap on calls a stall runs at once.
 ///
 /// A request that arrives with this many calls in flight is answered with
@@ -136,13 +153,33 @@ pub async fn serve(stream: UnixStream, sandbox: Sandbox) -> Result<(), ServeErro
             &mut need_slot,
         )
         .await?;
+        trace(|| match &event {
+            Event::Line => "event: line".to_owned(),
+            Event::Call(_) => "event: call".to_owned(),
+        });
 
         match event {
             Event::Line => {
                 let frame = decode_frame(&mut writer, &mut line).await?;
+                trace(|| match &frame {
+                    Frame::Health(_) => "frame: health".to_owned(),
+                    Frame::Drain(_) => "frame: drain".to_owned(),
+                    Frame::Request(_) => "frame: request".to_owned(),
+                });
 
                 match frame {
-                    Frame::Health(id) => write_health(&mut writer, id).await?,
+                    Frame::Health(id) => {
+                        let id_tag = format!("id={id:?}");
+                        trace(|| format!("health write start {id_tag}"));
+                        let result = write_health(&mut writer, id).await;
+                        match &result {
+                            Ok(()) => trace(|| format!("health write done {id_tag}")),
+                            Err(error) => {
+                                trace(|| format!("health write error {id_tag} error={error:?}"));
+                            }
+                        }
+                        result?;
+                    }
                     Frame::Drain(id) => {
                         return drain_and_reply(&mut writer, &mut calls, &mut pending, id).await;
                     }
@@ -150,7 +187,11 @@ pub async fn serve(stream: UnixStream, sandbox: Sandbox) -> Result<(), ServeErro
                         let id = request_id(&request);
 
                         if calls.len() >= MAX_IN_FLIGHT {
-                            write_reply(&mut writer, busy(id)).await?;
+                            let result = write_reply(&mut writer, busy(id)).await;
+                            if let Err(error) = &result {
+                                trace(|| format!("busy deny write error id={id} {error:?}"));
+                            }
+                            result?;
                             need_slot = true;
 
                             continue;
@@ -158,11 +199,21 @@ pub async fn serve(stream: UnixStream, sandbox: Sandbox) -> Result<(), ServeErro
 
                         let worker = Arc::clone(&sandbox);
                         let call = calls.spawn_blocking(move || handle_request(&worker, request));
-                        pending.insert(call.id(), id);
+                        let task = call.id();
+                        trace(|| format!("request worker spawned task={task:?} id={id}"));
+                        pending.insert(task, id);
                     }
                 }
             }
-            Event::Call(joined) => finish_call(&mut writer, &mut pending, joined).await?,
+            Event::Call(joined) => {
+                trace(|| "finish_call start".to_owned());
+                let result = finish_call(&mut writer, &mut pending, joined).await;
+                match &result {
+                    Ok(()) => trace(|| "finish_call done".to_owned()),
+                    Err(error) => trace(|| format!("finish_call error {error:?}")),
+                }
+                result?;
+            }
         }
     }
 }
@@ -180,6 +231,12 @@ async fn next_event(
         && let Some(joined) = calls.join_next_with_id().await
     {
         *need_slot = false;
+        trace(|| {
+            format!(
+                "next_event call complete (need_slot) {}",
+                joined_tag(&joined)
+            )
+        });
 
         return Ok(Event::Call(joined));
     }
@@ -187,17 +244,34 @@ async fn next_event(
     *need_slot = false;
 
     if calls.is_empty() {
-        read_or_report(reader, writer, line).await?;
+        if let Err(error) = read_or_report(reader, writer, line).await {
+            trace(|| format!("next_event read error (idle) {error:?}"));
+
+            return Err(error);
+        }
 
         return Ok(Event::Line);
     }
 
     tokio::select! {
         read = read_or_report(reader, writer, line) => {
-            read?;
-            Ok(Event::Line)
+            match read {
+                Ok(()) => Ok(Event::Line),
+                Err(error) => {
+                    trace(|| format!("next_event read error (select) {error:?}"));
+                    Err(error)
+                }
+            }
         }
-        Some(joined) = calls.join_next_with_id() => Ok(Event::Call(joined)),
+        Some(joined) = calls.join_next_with_id() => {
+            trace(|| {
+                format!(
+                    "next_event call complete (select) {}",
+                    joined_tag(&joined)
+                )
+            });
+            Ok(Event::Call(joined))
+        }
     }
 }
 
@@ -221,13 +295,33 @@ async fn decode_frame(
 
 /// Write a control reply with the matching id.
 async fn write_health(writer: &mut (impl AsyncWrite + Unpin), id: Value) -> Result<(), ServeError> {
-    write_json(
-        writer,
-        &json!({
-            "jsonrpc": "2.0", "id": id, "result": null,
-        }),
-    )
-    .await
+    let value = json!({
+        "jsonrpc": "2.0", "id": id, "result": null,
+    });
+    trace(|| {
+        format!(
+            "health json bytes={:?}",
+            serde_json::to_vec(&value).map(|bytes| bytes.len())
+        )
+    });
+    let result = write_json(writer, &value).await;
+    match &result {
+        Ok(()) => trace(|| "health write_json ok".to_owned()),
+        Err(error) => trace(|| format!("health write_json error={error:?}")),
+    }
+
+    // write_json writes one newline-terminated line but does not flush.
+    // Flush here so the trace records when the reply actually reached the
+    // peer; the outcome is diagnostic only and never changes the result.
+    match &result {
+        Ok(()) => match writer.flush().await {
+            Ok(()) => trace(|| "health flush ok fully_written=true".to_owned()),
+            Err(error) => trace(|| format!("health flush error={error:?} fully_written=false")),
+        },
+        Err(_) => trace(|| "health flush skipped fully_written=false".to_owned()),
+    }
+
+    result
 }
 
 /// Drain first, then answer the drain itself with null.
