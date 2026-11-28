@@ -3,3 +3,4 @@
 # caller still counts.
 test_workspace = true
 test_tool = "nextest"
+features = ["barn/test-fixtures"]

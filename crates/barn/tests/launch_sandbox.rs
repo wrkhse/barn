@@ -29,11 +29,10 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 const STALL_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(2);
-const BUILD_TIMEOUT: Duration = Duration::from_secs(300);
 const POLL: Duration = Duration::from_millis(20);
 
-/// Removes a scratch directory when dropped, so a fixture build target is
-/// cleared even when a test panics before it finishes.
+/// Removes the copied helper target on drop, even when a test panics before
+/// it finishes.
 struct RemoveOnDrop(PathBuf);
 
 impl Drop for RemoveOnDrop {
@@ -269,64 +268,14 @@ impl Launch {
         receiver
     }
 
-    /// Build the drain fixture example into a private target dir. A nested
-    /// cargo cannot share the test runner's locked target dir, and an
-    /// unbounded build would hang CI, so the wait is bounded and cargo is
-    /// killed if it runs past the deadline.
-    fn build_fixture(target: &Path) -> io::Result<()> {
-        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut child = Command::new("cargo")
-            .args([
-                "build",
-                "--example",
-                "stall_drain_fixture",
-                "--locked",
-                "--target-dir",
-            ])
-            .arg(target)
-            .current_dir(workspace)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
-
-        let started = Instant::now();
-        loop {
-            if let Some(status) = child.try_wait()? {
-                if !status.success() {
-                    return Err(io::Error::other(
-                        "building the drain fixture example failed",
-                    ));
-                }
-                return Ok(());
-            }
-            if started.elapsed() >= BUILD_TIMEOUT {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(io::Error::other(
-                    "building the drain fixture example exceeded the deadline",
-                ));
-            }
-            std::thread::sleep(POLL);
-        }
-    }
-
     /// Spawn the copied barn for the SIGTERM test. The drain fixture replaces
     /// the built stall runtime in the shared bin setup, so barn finds both
     /// helpers beside the binary it actually runs. Returns the one endpoint
     /// line.
     fn spawn_with_drain_fixture(&mut self) -> Receiver<io::Result<String>> {
-        let target = std::env::temp_dir().join(format!(
-            "barn-launch-fixture-{}-{}",
-            std::process::id(),
-            self.seq
-        ));
-        let _ = fs::remove_dir_all(&target);
-        let _fixture_guard = RemoveOnDrop(target.clone());
-        must_res(Self::build_fixture(&target), "the fixture example built");
-        let fixture = target
-            .join("debug")
-            .join("examples")
-            .join("stall_drain_fixture");
+        // cargo builds the fixture as a test-only bin target, so its path is
+        // resolved at compile time rather than built by a nested cargo here.
+        let fixture = PathBuf::from(env!("CARGO_BIN_EXE_stall_drain_fixture"));
 
         let barn = self.prepare_bin(Some(fixture));
 
