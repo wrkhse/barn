@@ -18,7 +18,13 @@ impl super::Sandbox {
 
         ctx.set(
             "deny",
-            self.lua.create_function(|lua, reason: String| {
+            self.lua.create_function(|lua, reason: LuaValue| {
+                let LuaValue::String(reason) = reason else {
+                    return Err(mlua::Error::external(EngineError::InvalidResult(
+                        "deny must be a string".into(),
+                    )));
+                };
+
                 let result = lua.create_table()?;
                 result.set("deny", reason)?;
                 Ok(result)

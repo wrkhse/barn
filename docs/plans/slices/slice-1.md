@@ -9,7 +9,7 @@ the sandbox, it connects back on a private socket, and a crash restarts it.
 <!-- prettier-ignore -->
 ```json
 {"jsonrpc":"2.0","id":1,"method":"stall.start","params":{"protocol":1,"token":"…","jobs":{"poll":{"every":"15s"}}}}
-{"jsonrpc":"2.0","id":1,"result":{"state":"/var/lib/barn/sourcefed","jobs":{"poll":{"every":"15s"}}}}
+{"jsonrpc":"2.0","id":1,"protocol":1,"result":{"state":"/var/lib/barn/sourcefed","jobs":{"poll":{"every":"15s"}}}}
 ```
 
 ```mermaid

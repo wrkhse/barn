@@ -65,7 +65,7 @@ const SHELL_GRANTS: &[&str] = &[SHELL_LINK, "/bin/bash", "/bin/zsh", "/bin/dash"
 #[cfg(not(target_os = "macos"))]
 const SHELL_GRANTS: &[&str] = &[];
 const OVERSIZE_REPLY: &[u8] = concat!(
-    r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"#,
+    r#"{"jsonrpc":"2.0","id":null,"protocol":1,"error":{"code":-32600,"#,
     r#""message":"stall start message exceeds the protocol line limit"}}"#,
     "\n"
 )
@@ -1814,7 +1814,7 @@ fn reply_frame(id: &Value, state: &str, jobs: &BTreeMap<String, Job>) -> Result<
         state: state.to_owned(),
         jobs: jobs.clone(),
     };
-    let response = json!({"jsonrpc":"2.0","id":id,"result":reply});
+    let response = json!({"jsonrpc":"2.0","id":id,"protocol":PROTOCOL_VERSION,"result":reply});
 
     bounded_frame(&response)
 }
@@ -4314,7 +4314,7 @@ mod tests {
 
     /// The reply to id 1 with an empty state, newline included.
     const EMPTY_REPLY: &[u8] = concat!(
-        r#"{"jsonrpc":"2.0","id":1,"#,
+        r#"{"jsonrpc":"2.0","id":1,"protocol":1,"#,
         r#""result":{"state":""}}"#,
         "\n"
     )
@@ -4362,7 +4362,8 @@ mod tests {
         assert_eq!(written, EMPTY_REPLY);
 
         let exact = filling_state();
-        let line = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"state":"{exact}"}}}}"#);
+        let line =
+            format!(r#"{{"jsonrpc":"2.0","id":1,"protocol":1,"result":{{"state":"{exact}"}}}}"#);
         let mut written = Vec::new();
 
         assert!(matches!(
@@ -4375,7 +4376,7 @@ mod tests {
     #[tokio::test]
     async fn an_oversized_reply_is_answered_with_the_line_limit_error() {
         let expected = concat!(
-            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"#,
+            r#"{"jsonrpc":"2.0","id":null,"protocol":1,"error":{"code":-32600,"#,
             r#""message":"stall start message exceeds the protocol line limit"}}"#,
             "\n"
         )
@@ -4395,7 +4396,7 @@ mod tests {
         const PAGE: &str = include_str!("../../../docs/stall-protocol.md");
         let line = PAGE
             .lines()
-            .find(|line| line.starts_with(r#"{"jsonrpc":"2.0","id":null,"error""#))
+            .find(|line| line.starts_with(r#"{"jsonrpc":"2.0","id":null,"protocol":1,"error""#))
             .expect("the page fixes the oversize error line");
         let page: Value = serde_json::from_str(line).expect("the page's error JSON");
         let reply: Value = serde_json::from_slice(OVERSIZE_REPLY).expect("barn's error JSON");
@@ -4417,7 +4418,7 @@ mod tests {
         assert_eq!(
             reply,
             json!({
-                "jsonrpc": "2.0", "id": 1,
+                "jsonrpc": "2.0", "id": 1, "protocol": 1,
                 "result": {"state": "", "jobs": {"poll": {"every": "15s"}}}
             })
         );

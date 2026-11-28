@@ -101,7 +101,8 @@ returns `nil` to allow the call, or one verdict built with a helper:
 `ctx.deny(reason)` refuses it, `ctx.rewrite(payload)` replaces the whole
 payload, `ctx.annotate(fields)` attaches JSON object fields (explicit
 nulls survive), and `ctx.drop()` removes the call. A result with more than
-one verdict is refused.
+one verdict is refused. `ctx.deny` takes a string reason; a non-string reason
+is a named `invalid_result` error, never stringified.
 
 The manifest contains the plugin's `name`, `needs`, and a `tools` array.
 Tool entries carry their name and other non-function fields.
@@ -130,3 +131,7 @@ files: FIFOs, sockets, and device nodes fail its `is_file` check and are
 refused as `Missing` before the link count is read. A hard link cannot make
 one of those nodes masquerade as a module: it stays a non-regular file and is
 refused the same way.
+
+## Changelog
+
+- `ctx.deny` reports a non-string reason as a named `invalid_result` error.

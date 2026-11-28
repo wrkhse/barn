@@ -434,7 +434,7 @@ fn health_stall_fixture() {
         connect_stall(&socket, &token, &BTreeMap::new()).expect("offer the issued token");
     assert_eq!(
         read_message(&mut client),
-        Some(json!({"jsonrpc":"2.0","id":"start","result":{"state":state}}))
+        Some(json!({"jsonrpc":"2.0","id":"start","protocol":1,"result":{"state":state}}))
     );
 
     if first {
