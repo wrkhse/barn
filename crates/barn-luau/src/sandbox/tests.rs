@@ -391,6 +391,24 @@ fn decode_accepts_a_drop_verdict() {
 }
 
 #[test]
+fn decode_refuses_a_verdictless_result_table() {
+    let lua = Lua::new();
+    let empty = lua.create_table().expect("empty result table");
+    let unrelated = lua.create_table().expect("unrelated result table");
+    unrelated.raw_set("note", "no verdict").expect("set note");
+
+    for result in [empty, unrelated] {
+        assert_eq!(
+            decode_outcome(LuaValue::Table(result)),
+            Err(EngineError::InvalidResult(
+                "hook result has no verdict: expected allow, deny, rewrite, annotate or drop"
+                    .into()
+            ))
+        );
+    }
+}
+
+#[test]
 fn decode_refuses_more_than_one_verdict() {
     let lua = Lua::new();
     let result = lua.create_table().expect("result table");
@@ -487,6 +505,34 @@ fn ctx_helpers_expose_annotate_and_drop_shapes() {
         Err(EngineError::InvalidResult(
             "annotate fields must be a table".into()
         ))
+    );
+}
+
+#[test]
+fn ctx_deny_refuses_a_non_string_reason() {
+    let scratch = Scratch::new();
+    scratch.write(
+        "plugin.luau",
+        r#"
+        return {
+            name = "deny-shape",
+            toolBefore = function(payload, ctx)
+                return ctx.deny(42)
+            end,
+        }
+        "#,
+    );
+    let sandbox = Sandbox::new(
+        scratch.path(),
+        default_limits(),
+        Capabilities::default(),
+        test_clock(),
+    )
+    .expect("fixture loads");
+
+    assert_eq!(
+        sandbox.hook(&invocation("toolBefore", "shell"), DEFAULT_DEADLINE_MS),
+        Err(EngineError::InvalidResult("deny must be a string".into()))
     );
 }
 
@@ -648,6 +694,24 @@ fn sandbox_rejects_a_reserved_capability_name() {
         error,
         EngineError::InvalidResult("reserved capability name: allow".into())
     );
+}
+
+#[test]
+fn sandbox_rejects_reserved_verdict_capability_names() {
+    let scratch = Scratch::new();
+    scratch.write("plugin.luau", r#"return { name = "test" }"#);
+
+    for name in ["annotate", "drop"] {
+        let mut capabilities = Capabilities::default();
+        capabilities.insert(name, Ok);
+
+        let error = Sandbox::new(scratch.path(), default_limits(), capabilities, test_clock())
+            .expect_err("reserved capability is refused");
+        assert_eq!(
+            error,
+            EngineError::InvalidResult(format!("reserved capability name: {name}"))
+        );
+    }
 }
 
 #[test]

@@ -91,7 +91,8 @@ After a bad frame from the host, barn exits 1 without draining.
   and returns the map in the result.
   barn spends the token, then returns the absolute path of the stall's state
   folder, `state_dir/<stall>`, which it creates and grants the stall read-write
-  access to.
+  access to. The stall-side client bounds the whole `stall.start` reply to 10
+  seconds.
 - The token expires `TOKEN_TTL_SECS` (30 seconds) after barn spawns the stall.
   A `stall.start` at or after that deadline is refused as `TokenExpired`: barn
   drops the token unspent and closes the connection without a reply, so only a
@@ -120,6 +121,12 @@ After a bad frame from the host, barn exits 1 without draining.
 the current version and the one before it. Fields are only added within a
 version: a rename or a removal is a new version.
 
+The stall-side client treats `protocol` as additive: a reply with no `protocol`
+field is accepted as version 1 from an older barn. A present `protocol` that is
+null, non-numeric or not the current version is a version mismatch: the client
+rejects the reply before it reads `result` or `error`, including the oversize
+error line.
+
 The values `body_encoding` may carry are closed within a version: another
 encoding is a new version, never a value added inside this one.
 
@@ -146,7 +153,7 @@ A stall connects and receives its state folder:
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"stall.start","params":{"protocol":1,"token":"…","jobs":{"poll":{"every":"15s"}}}}
-{"jsonrpc":"2.0","id":1,"result":{"state":"/var/lib/barn/sourcefed","jobs":{"poll":{"every":"15s"}}}}
+{"jsonrpc":"2.0","id":1,"protocol":1,"result":{"state":"/var/lib/barn/sourcefed","jobs":{"poll":{"every":"15s"}}}}
 ```
 
 tack's host authenticates on `host.sock` before it sends a framed request:
@@ -194,7 +201,7 @@ A reply too long to fit is replaced by one error line:
 
 <!-- prettier-ignore -->
 ```json
-{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"stall start message exceeds the protocol line limit"}}
+{"jsonrpc":"2.0","id":null,"protocol":1,"error":{"code":-32600,"message":"stall start message exceeds the protocol line limit"}}
 ```
 
 barn sends `stall.health` on the authenticated connection every 10 seconds:

@@ -8,9 +8,11 @@
 
 use std::collections::BTreeMap;
 use std::fmt::{self, Formatter};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -20,6 +22,12 @@ use crate::protocol::{
 
 /// The id of the stall's one `stall.start` request.
 const START_ID: u64 = 1;
+
+/// How long a stall waits for the bounded `stall.start` reply line.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a fallback read waits for bytes before rechecking its deadline.
+const RETRY_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Why a stall could not complete its `stall.start` handshake.
 #[derive(Debug)]
@@ -34,6 +42,13 @@ pub enum ClientError {
     Write(io::Error),
     /// The reply line could not be read.
     Read(io::Error),
+    /// A socket read deadline could not be set or cleared.
+    SetTimeout {
+        step: &'static str,
+        source: io::Error,
+    },
+    /// The bounded reply did not arrive before its deadline.
+    Timeout,
     /// The socket closed before a newline-terminated reply arrived.
     Eof,
     /// A line reached [`MAX_LINE_BYTES`] without a newline.
@@ -56,6 +71,10 @@ impl fmt::Display for ClientError {
             Self::Connect(error) => write!(formatter, "connecting to barn: {error}"),
             Self::Write(error) => write!(formatter, "writing stall start: {error}"),
             Self::Read(error) => write!(formatter, "reading the start reply: {error}"),
+            Self::SetTimeout { step, source } => {
+                write!(formatter, "setting {step} timeout: {source}")
+            }
+            Self::Timeout => formatter.write_str("the start reply timed out"),
             Self::Eof => formatter.write_str("the start reply closed before its newline"),
             Self::Oversize => formatter.write_str("a start line exceeded MAX_LINE_BYTES"),
             Self::Malformed(error) => write!(formatter, "a start line is malformed: {error}"),
@@ -72,6 +91,7 @@ impl std::error::Error for ClientError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Connect(error) | Self::Write(error) | Self::Read(error) => Some(error),
+            Self::SetTimeout { source, .. } => Some(source),
             Self::Malformed(error) => Some(error),
             _ => None,
         }
@@ -90,9 +110,18 @@ pub fn connect(
     token: &str,
     jobs: BTreeMap<String, Job>,
 ) -> Result<(BufReader<UnixStream>, StallStartResult), ClientError> {
-    let stream = UnixStream::connect(socket).map_err(ClientError::Connect)?;
+    connect_with_timeout(socket, token, jobs, REPLY_TIMEOUT)
+}
 
-    handshake(stream, token, jobs)
+/// Connects to `socket` and runs the handshake with a bounded reply deadline.
+fn connect_with_timeout(
+    socket: &Path,
+    token: &str,
+    jobs: BTreeMap<String, Job>,
+    timeout: Duration,
+) -> Result<(BufReader<UnixStream>, StallStartResult), ClientError> {
+    let stream = UnixStream::connect(socket).map_err(ClientError::Connect)?;
+    handshake(stream, token, jobs, timeout)
 }
 
 /// Connects using the `BARN_SOCKET` and `BARN_TOKEN` in the environment.
@@ -117,6 +146,7 @@ fn handshake(
     mut stream: UnixStream,
     token: &str,
     jobs: BTreeMap<String, Job>,
+    timeout: Duration,
 ) -> Result<(BufReader<UnixStream>, StallStartResult), ClientError> {
     let request = json!({
         "jsonrpc": "2.0",
@@ -131,9 +161,13 @@ fn handshake(
 
     write_line(&mut stream, &request)?;
 
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or(ClientError::Timeout)?;
     let mut reader = BufReader::new(stream);
-    let line = read_bounded(&mut reader)?;
+    let line = read_bounded(&mut reader, deadline)?;
     let result = decode_reply(&line, &json!(START_ID))?;
+    set_read_deadline(&reader, None, "clear read")?;
 
     Ok((reader, result))
 }
@@ -150,21 +184,173 @@ fn write_line(writer: &mut UnixStream, message: &Value) -> Result<(), ClientErro
     writer.write_all(&line).map_err(ClientError::Write)
 }
 
-/// Reads one newline-terminated line, bounded at [`MAX_LINE_BYTES`].
-fn read_bounded(reader: &mut BufReader<UnixStream>) -> Result<Vec<u8>, ClientError> {
-    let limit = u64::try_from(MAX_LINE_BYTES).unwrap_or(u64::MAX);
-    let mut line = Vec::new();
-    reader
-        .take(limit)
-        .read_until(b'\n', &mut line)
-        .map_err(ClientError::Read)?;
+/// Maps a read that ran out of time to [`ClientError::Timeout`].
+fn read_error(error: io::Error) -> ClientError {
+    match error.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => ClientError::Timeout,
+        _ => ClientError::Read(error),
+    }
+}
 
-    if line.last() == Some(&b'\n') {
-        Ok(line)
-    } else if line.len() == MAX_LINE_BYTES {
-        Err(ClientError::Oversize)
-    } else {
-        Err(ClientError::Eof)
+/// Classifies one `fill_buf` result: `Interrupted` asks `read_bounded` to
+/// retry after rechecking its deadline; every other error keeps its named form.
+fn fill_outcome(result: io::Result<&[u8]>) -> Result<Option<&[u8]>, ClientError> {
+    match result {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(None),
+        Err(error) => Err(read_error(error)),
+    }
+}
+
+/// Sets or clears a read deadline on the stream under `reader`.
+///
+/// macOS returns `EINVAL` from `setsockopt` once the peer has shut down its
+/// write half. While clearing a deadline after a complete reply, or while the
+/// reader already holds bytes, that is benign: the next read is bounded by
+/// data or EOF, not by time. Arming a deadline with nothing buffered fails
+/// closed here; the caller turns that `EINVAL` into a nonblocking read whose
+/// deadline is enforced in the read loop.
+fn set_read_deadline(
+    reader: &BufReader<UnixStream>,
+    timeout: Option<Duration>,
+    step: &'static str,
+) -> Result<(), ClientError> {
+    read_deadline_result(reader, reader.get_ref().set_read_timeout(timeout), step)
+}
+
+/// Decides whether a failed `setsockopt` is the benign closed-peer `EINVAL`.
+fn read_deadline_result(
+    reader: &BufReader<UnixStream>,
+    result: io::Result<()>,
+    step: &'static str,
+) -> Result<(), ClientError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(source)
+            if source.kind() == io::ErrorKind::InvalidInput
+                && (step == "clear read" || !reader.buffer().is_empty()) =>
+        {
+            Ok(())
+        }
+        Err(source) => Err(ClientError::SetTimeout { step, source }),
+    }
+}
+
+/// Reads one newline-terminated line, bounded at [`MAX_LINE_BYTES`] and by
+/// `deadline`, restoring blocking mode on every exit path.
+fn read_bounded(
+    reader: &mut BufReader<UnixStream>,
+    deadline: Instant,
+) -> Result<Vec<u8>, ClientError> {
+    let mut nonblocking = false;
+    let result = read_line(reader, deadline, &mut nonblocking);
+    if nonblocking {
+        reader
+            .get_ref()
+            .set_nonblocking(false)
+            .map_err(|source| ClientError::SetTimeout {
+                step: "clear nonblocking",
+                source,
+            })?;
+    }
+    result
+}
+
+/// Arms the socket read timeout. A closed peer's EINVAL selects the nonblocking
+/// fallback; every other failure keeps its named error.
+fn arm_read_deadline(
+    reader: &BufReader<UnixStream>,
+    remaining: Duration,
+) -> Result<bool, ClientError> {
+    let armed = reader.get_ref().set_read_timeout(Some(remaining));
+    read_arm_result(reader, armed)
+}
+
+/// Classifies a failed read-arm `setsockopt`, switching to a nonblocking read
+/// when a shut-down peer makes it fail with EINVAL.
+fn read_arm_result(
+    reader: &BufReader<UnixStream>,
+    result: io::Result<()>,
+) -> Result<bool, ClientError> {
+    match read_deadline_result(reader, result, "read") {
+        Ok(()) => Ok(false),
+        Err(ClientError::SetTimeout {
+            step: "read",
+            source,
+        }) if source.kind() == io::ErrorKind::InvalidInput => {
+            reader
+                .get_ref()
+                .set_nonblocking(true)
+                .map_err(|source| ClientError::SetTimeout {
+                    step: "set nonblocking",
+                    source,
+                })?;
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Runs the read loop. `nonblocking` records whether the fallback took over,
+/// so `read_bounded` can restore blocking mode before returning.
+fn read_line(
+    reader: &mut BufReader<UnixStream>,
+    deadline: Instant,
+    nonblocking: &mut bool,
+) -> Result<Vec<u8>, ClientError> {
+    let mut line: Vec<u8> = Vec::new();
+
+    loop {
+        if let Some(end) = reader.buffer().iter().position(|&byte| byte == b'\n') {
+            if line.len().saturating_add(end).saturating_add(1) > MAX_LINE_BYTES {
+                return Err(ClientError::Oversize);
+            }
+            let slice = reader
+                .buffer()
+                .get(..=end)
+                .ok_or_else(|| ClientError::Read(io::Error::other("incomplete buffered line")))?;
+            line.extend_from_slice(slice);
+            reader.consume(end.saturating_add(1));
+            return Ok(line);
+        }
+
+        if line.len().saturating_add(reader.buffer().len()) >= MAX_LINE_BYTES {
+            return Err(ClientError::Oversize);
+        }
+        let buffered = reader.buffer().len();
+        let slice = reader
+            .buffer()
+            .get(..buffered)
+            .ok_or_else(|| ClientError::Read(io::Error::other("incomplete buffered line")))?;
+        line.extend_from_slice(slice);
+        reader.consume(buffered);
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ClientError::Timeout);
+        }
+
+        if !*nonblocking {
+            // A zero timeval means "no timeout" on Unix, so keep it positive.
+            *nonblocking = arm_read_deadline(reader, remaining.max(RETRY_INTERVAL))?;
+        }
+
+        let result = reader.fill_buf();
+        if *nonblocking
+            && matches!(&result, Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        {
+            if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                return Err(ClientError::Timeout);
+            }
+            thread::sleep(RETRY_INTERVAL);
+            continue;
+        }
+        let Some(bytes) = fill_outcome(result)? else {
+            continue;
+        };
+        if bytes.is_empty() {
+            return Err(ClientError::Eof);
+        }
     }
 }
 
@@ -175,8 +361,11 @@ fn decode_reply(line: &[u8], id: &Value) -> Result<StallStartResult, ClientError
     if reply.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return Err(ClientError::VersionMismatch);
     }
-    let offered = reply.get("protocol").and_then(Value::as_u64);
-    if offered.is_some_and(|version| version != u64::from(PROTOCOL_VERSION)) {
+    // The protocol field is additive: an older barn may omit it, but one that
+    // sends it must match this stall's version.
+    if let Some(protocol) = reply.get("protocol")
+        && protocol.as_u64() != Some(u64::from(PROTOCOL_VERSION))
+    {
         return Err(ClientError::VersionMismatch);
     }
     if reply.get("id") != Some(id) {
@@ -199,8 +388,12 @@ fn decode_reply(line: &[u8], id: &Value) -> Result<StallStartResult, ClientError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// Runs a handshake against a fake barn on the other end of a socket pair.
     ///
@@ -234,14 +427,14 @@ mod tests {
                 }
             });
 
-            handshake(client, token, jobs)
+            handshake(client, token, jobs, Duration::from_secs(2))
         })
     }
 
     #[test]
     fn a_start_sends_one_line_and_returns_the_result() {
         let reply =
-            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"state\":\"/state\",\"jobs\":{\"poll\":{\"every\":\"15s\"}}}}\n";
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"protocol\":1,\"result\":{\"state\":\"/state\",\"jobs\":{\"heartbeat\":{\"every\":\"30s\"}}}}\n";
         let jobs = BTreeMap::from([(
             "poll".to_owned(),
             Job {
@@ -250,7 +443,12 @@ mod tests {
         )]);
         let expected = StallStartResult {
             state: "/state".to_owned(),
-            jobs: jobs.clone(),
+            jobs: BTreeMap::from([(
+                "heartbeat".to_owned(),
+                Job {
+                    every: "30s".to_owned(),
+                },
+            )]),
         };
 
         let (mut reader, result) = exchange(reply, "secret", jobs, |line| {
@@ -293,7 +491,8 @@ mod tests {
 
     #[test]
     fn a_reply_with_another_id_is_rejected() {
-        let reply = b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"state\":\"/state\"}}\n";
+        let reply =
+            b"{\"jsonrpc\":\"2.0\",\"id\":2,\"protocol\":1,\"result\":{\"state\":\"/state\"}}\n";
 
         let error =
             exchange(reply, "secret", BTreeMap::new(), |_| {}).expect_err("the reply id differs");
@@ -303,19 +502,30 @@ mod tests {
 
     #[test]
     fn a_denied_reply_is_rejected() {
-        let reply = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32001,\"message\":\"denied\",\"data\":{\"reason\":\"protocol mismatch\"}}}\n";
+        let reply = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"protocol\":1,\"error\":{\"code\":-32001,\"message\":\"denied\",\"data\":{\"reason\":\"protocol mismatch\"}}}\n";
 
         let error =
             exchange(reply, "secret", BTreeMap::new(), |_| {}).expect_err("barn refused the start");
 
-        assert!(matches!(error, ClientError::ErrorReply(_)));
+        match error {
+            ClientError::ErrorReply(reply) => assert_eq!(
+                reply,
+                json!({
+                    "code": -32001,
+                    "message": "denied",
+                    "data": { "reason": "protocol mismatch" },
+                })
+            ),
+            other => panic!("got {other:?}"),
+        }
     }
 
     #[test]
     fn a_reply_from_another_version_is_rejected() {
         let stall =
             b"{\"jsonrpc\":\"2.0\",\"id\":1,\"protocol\":2,\"result\":{\"state\":\"/state\"}}\n";
-        let envelope = b"{\"jsonrpc\":\"1.0\",\"id\":1,\"result\":{\"state\":\"/state\"}}\n";
+        let envelope =
+            b"{\"jsonrpc\":\"1.0\",\"id\":1,\"protocol\":1,\"result\":{\"state\":\"/state\"}}\n";
 
         let first = exchange(stall, "secret", BTreeMap::new(), |_| {})
             .expect_err("the stall protocol differs");
@@ -327,11 +537,343 @@ mod tests {
     }
 
     #[test]
+    fn a_reply_without_a_protocol_is_accepted() {
+        let reply = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"state\":\"/state\"}}\n";
+        let expected = StallStartResult {
+            state: "/state".to_owned(),
+            jobs: BTreeMap::new(),
+        };
+
+        let (_, result) = exchange(reply, "secret", BTreeMap::new(), |_| {})
+            .expect("an absent protocol is accepted");
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn a_reply_with_a_null_protocol_is_rejected() {
+        let reply =
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"protocol\":null,\"result\":{\"state\":\"/state\"}}\n";
+
+        let error =
+            exchange(reply, "secret", BTreeMap::new(), |_| {}).expect_err("the protocol is null");
+
+        assert!(
+            matches!(&error, ClientError::VersionMismatch),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_reply_with_a_string_protocol_is_rejected() {
+        let reply =
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"protocol\":\"1\",\"result\":{\"state\":\"/state\"}}\n";
+
+        let error = exchange(reply, "secret", BTreeMap::new(), |_| {})
+            .expect_err("the protocol is a string");
+
+        assert!(
+            matches!(&error, ClientError::VersionMismatch),
+            "got {error:?}"
+        );
+    }
+
+    /// A unique scratch directory that cleans itself up at the end of a test.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let unique = format!(
+                "barn-stall-{}-{}-{}",
+                label,
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            );
+            let path = std::env::temp_dir().join(unique);
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("a scratch directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_silent_peer_times_out() {
+        let scratch = TempDir::new("silent");
+        let path = scratch.0.join("stall.sock");
+        let listener = UnixListener::bind(&path).expect("a listener");
+        let timeout = Duration::from_millis(200);
+        let started = Instant::now();
+
+        let error = thread::scope(|scope| {
+            scope.spawn(|| {
+                listener.set_nonblocking(true).expect("a bounded listener");
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let peer = loop {
+                    match listener.accept() {
+                        Ok((peer, _)) => break peer,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "the client never connected");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept failed: {error}"),
+                    }
+                };
+                thread::sleep(timeout + Duration::from_millis(500));
+                drop(peer);
+            });
+
+            connect_with_timeout(&path, "secret", BTreeMap::new(), timeout)
+        })
+        .expect_err("the silent peer times out");
+
+        assert!(matches!(error, ClientError::Timeout), "got {error:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
     fn a_closed_socket_is_an_error() {
         let error = exchange(b"", "secret", BTreeMap::new(), |_| {})
             .expect_err("barn closed before replying");
 
-        assert!(matches!(error, ClientError::Eof));
+        assert!(matches!(&error, ClientError::Eof), "got {error:?}");
+    }
+
+    #[test]
+    fn a_shut_down_peer_still_yields_the_buffered_reply() {
+        let reply =
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"protocol\":1,\"result\":{\"state\":\"/state\"}}\n";
+        let expected = StallStartResult {
+            state: "/state".to_owned(),
+            jobs: BTreeMap::new(),
+        };
+        let (client, mut server) = UnixStream::pair().expect("a socket pair");
+
+        // The peer buffers a reply and shuts down its write half before the
+        // client starts. On macOS the client's set_read_timeout calls then
+        // fail with EINVAL while the reply is still available to read.
+        server.write_all(reply).expect("the peer writes a reply");
+        server
+            .shutdown(Shutdown::Write)
+            .expect("the peer shuts down its write half");
+
+        let (_, result) = handshake(client, "secret", BTreeMap::new(), Duration::from_secs(2))
+            .expect("the buffered reply completes the handshake");
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn an_unbuffered_read_deadline_fails_closed_on_invalid_input() {
+        let (client, _peer) = UnixStream::pair().expect("a socket pair");
+        let reader = BufReader::new(client);
+        let message = "injected EINVAL";
+
+        let source = io::Error::new(io::ErrorKind::InvalidInput, message);
+        let error = read_deadline_result(&reader, Err(source), "read")
+            .expect_err("an EINVAL with no buffered data fails closed");
+
+        match error {
+            ClientError::SetTimeout { step, source } => {
+                assert_eq!(step, "read");
+                assert_eq!(source.kind(), io::ErrorKind::InvalidInput);
+                assert_eq!(source.to_string(), message);
+            }
+            other => panic!("got {other:?}"),
+        }
+
+        let source = io::Error::new(io::ErrorKind::InvalidInput, message);
+        assert!(
+            read_deadline_result(&reader, Err(source), "clear read").is_ok(),
+            "clearing after a reply still tolerates a closed peer"
+        );
+    }
+
+    #[test]
+    fn a_buffered_read_deadline_tolerates_invalid_input() {
+        let (client, mut peer) = UnixStream::pair().expect("a socket pair");
+        peer.write_all(b"buffered\n")
+            .expect("the peer writes bytes");
+        let mut reader = BufReader::new(client);
+        reader.fill_buf().expect("the reader buffers the bytes");
+
+        let source = io::Error::new(io::ErrorKind::InvalidInput, "injected EINVAL");
+
+        assert!(
+            read_deadline_result(&reader, Err(source), "read").is_ok(),
+            "buffered bytes bound the next read without a deadline"
+        );
+    }
+
+    #[test]
+    fn clearing_a_read_deadline_restores_an_unbounded_socket() {
+        let (client, _peer) = UnixStream::pair().expect("a socket pair");
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("arm a read deadline");
+        let reader = BufReader::new(client);
+
+        set_read_deadline(&reader, None, "clear read").expect("the deadline clears");
+
+        assert_eq!(
+            reader
+                .get_ref()
+                .read_timeout()
+                .expect("a readable socket timeout"),
+            None,
+            "clearing the deadline leaves later reads unbounded"
+        );
+    }
+
+    #[test]
+    fn an_interrupted_fill_is_retried_and_other_errors_keep_their_names() {
+        let data: &[u8] = b"line\n";
+        assert!(matches!(fill_outcome(Ok(data)), Ok(Some(bytes)) if bytes == data));
+
+        let interrupted = io::Error::from(io::ErrorKind::Interrupted);
+        assert!(
+            matches!(fill_outcome(Err(interrupted)), Ok(None)),
+            "an interrupted fill asks read_bounded to retry after its deadline check"
+        );
+
+        let timed_out = io::Error::from(io::ErrorKind::WouldBlock);
+        assert!(matches!(
+            fill_outcome(Err(timed_out)),
+            Err(ClientError::Timeout)
+        ));
+
+        let denied = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        match fill_outcome(Err(denied)) {
+            Err(ClientError::Read(error)) => {
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+                assert_eq!(error.to_string(), "denied");
+            }
+            outcome => panic!("got {outcome:?}"),
+        }
+    }
+
+    #[test]
+    fn a_read_arm_einval_switches_to_a_userspace_deadline() {
+        let (client, _peer) = UnixStream::pair().expect("a socket pair");
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("a short deadline keeps the assertion fast");
+        let reader = BufReader::new(client);
+        let source = io::Error::new(io::ErrorKind::InvalidInput, "injected EINVAL");
+
+        let fallback = read_arm_result(&reader, Err(source)).expect("EINVAL selects the fallback");
+
+        assert!(fallback, "the read arm runs on the userspace deadline");
+        let mut byte = [0u8; 1];
+        assert!(
+            matches!(reader.get_ref().read(&mut byte), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "a nonblocking read reports WouldBlock while no bytes are buffered"
+        );
+
+        let source = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        let error = read_arm_result(&reader, Err(source)).expect_err("other errors stay named");
+
+        match error {
+            ClientError::SetTimeout { step, source } => {
+                assert_eq!(step, "read");
+                assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
+                assert_eq!(source.to_string(), "denied");
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_successful_read_arm_keeps_the_socket_deadline() {
+        let (client, _peer) = UnixStream::pair().expect("a socket pair");
+        client
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("arm a read deadline");
+        let reader = BufReader::new(client);
+
+        let fallback = read_arm_result(&reader, Ok(())).expect("the arm succeeds");
+
+        assert!(!fallback, "a socket deadline needs no nonblocking fallback");
+    }
+
+    #[test]
+    fn a_nonblocking_read_retries_would_block_until_its_deadline() {
+        let (client, _peer) = UnixStream::pair().expect("a socket pair");
+        let mut reader = BufReader::new(client);
+        reader
+            .get_ref()
+            .set_nonblocking(true)
+            .expect("a nonblocking handshake read");
+        let timeout = Duration::from_millis(50);
+        let deadline = Instant::now() + timeout;
+        let started = Instant::now();
+        let mut nonblocking = true;
+
+        let error = read_line(&mut reader, deadline, &mut nonblocking)
+            .expect_err("no reply arrives before the deadline");
+
+        assert!(matches!(error, ClientError::Timeout), "got {error:?}");
+        assert!(started.elapsed() >= timeout);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_userspace_deadline_returns_available_bytes_without_retrying() {
+        let (client, mut peer) = UnixStream::pair().expect("a socket pair");
+        peer.write_all(b"ready")
+            .expect("the peer writes the first chunk");
+        let mut reader = BufReader::new(client);
+        reader
+            .fill_buf()
+            .expect("the first chunk is buffered before the read");
+        reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("a bounded socket read");
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let started = Instant::now();
+        let mut nonblocking = true;
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(400));
+                peer.write_all(b" now\n")
+                    .expect("the peer completes the line after the deadline");
+            });
+
+            let line = read_line(&mut reader, deadline, &mut nonblocking)
+                .expect("buffered bytes still yield the whole line");
+
+            assert_eq!(line, b"ready now\n".to_vec());
+            assert!(started.elapsed() < Duration::from_secs(2));
+        });
+    }
+
+    #[test]
+    fn a_blocking_read_maps_would_block_to_timeout_without_retrying() {
+        let (client, _peer) = UnixStream::pair().expect("a socket pair");
+        client
+            .set_nonblocking(true)
+            .expect("a nonblocking socket that yields WouldBlock at once");
+        let mut reader = BufReader::new(client);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let started = Instant::now();
+        let mut nonblocking = false;
+
+        let error = read_line(&mut reader, deadline, &mut nonblocking)
+            .expect_err("WouldBlock maps to Timeout without the retry loop");
+
+        match error {
+            ClientError::Timeout => {}
+            other => panic!("got {other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[test]
@@ -342,6 +884,43 @@ mod tests {
             .expect_err("the reply filled the line limit");
 
         assert!(matches!(error, ClientError::Oversize));
+    }
+
+    #[test]
+    fn a_reply_line_exactly_at_the_byte_cap_is_accepted() {
+        // Serialize a valid reply skeleton, then pad its state so the whole
+        // line, including the newline, is exactly MAX_LINE_BYTES. A reply that
+        // lands on the cap still fits and must not be reported as Oversize.
+        let skeleton = json!({
+            "jsonrpc": "2.0",
+            "id": START_ID,
+            "protocol": PROTOCOL_VERSION,
+            "result": { "state": "", "jobs": {} },
+        });
+        let skeleton_len = serde_json::to_vec(&skeleton)
+            .expect("the skeleton serializes")
+            .len()
+            + 1; // the newline
+        let state = "x".repeat(MAX_LINE_BYTES - skeleton_len);
+
+        let expected = StallStartResult {
+            state: state.clone(),
+            jobs: BTreeMap::new(),
+        };
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": START_ID,
+            "protocol": PROTOCOL_VERSION,
+            "result": { "state": state, "jobs": {} },
+        });
+        let mut reply = serde_json::to_vec(&message).expect("the reply serializes");
+        reply.push(b'\n');
+        assert_eq!(reply.len(), MAX_LINE_BYTES);
+
+        let (_, result) = exchange(&reply, "secret", BTreeMap::new(), |_| {})
+            .expect("a line exactly at the cap is accepted");
+
+        assert_eq!(result, expected);
     }
 
     #[test]
@@ -417,6 +996,8 @@ mod tests {
         let write_message = write.to_string();
         let read = io::Error::new(io::ErrorKind::UnexpectedEof, "cannot read");
         let read_message = read.to_string();
+        let timeout = io::Error::new(io::ErrorKind::InvalidInput, "invalid argument");
+        let timeout_message = timeout.to_string();
         let malformed = serde_json::from_str::<Value>("{").expect_err("invalid JSON");
         let malformed_message = malformed.to_string();
         let reply = json!({"code": -32001, "message": "denied"});
@@ -441,6 +1022,18 @@ mod tests {
         assert_eq!(
             ClientError::Read(read).to_string(),
             format!("reading the start reply: {read_message}")
+        );
+        assert_eq!(
+            ClientError::SetTimeout {
+                step: "read",
+                source: timeout,
+            }
+            .to_string(),
+            format!("setting read timeout: {timeout_message}")
+        );
+        assert_eq!(
+            ClientError::Timeout.to_string(),
+            "the start reply timed out"
         );
         assert_eq!(
             ClientError::Eof.to_string(),
@@ -488,6 +1081,15 @@ mod tests {
         let source = std::error::Error::source(&error).expect("read has a source");
         assert_eq!(source.to_string(), read_message);
 
+        let timeout = io::Error::new(io::ErrorKind::InvalidInput, "invalid argument");
+        let timeout_message = timeout.to_string();
+        let error = ClientError::SetTimeout {
+            step: "clear read",
+            source: timeout,
+        };
+        let source = std::error::Error::source(&error).expect("set timeout has a source");
+        assert_eq!(source.to_string(), timeout_message);
+
         let malformed = serde_json::from_str::<Value>("{").expect_err("invalid JSON");
         let malformed_message = malformed.to_string();
         let error = ClientError::Malformed(malformed);
@@ -504,6 +1106,7 @@ mod tests {
             ClientError::Eof,
             ClientError::Oversize,
             ClientError::ErrorReply(reply),
+            ClientError::Timeout,
             ClientError::IdMismatch,
             ClientError::VersionMismatch,
         ];

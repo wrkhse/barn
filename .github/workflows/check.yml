@@ -308,6 +308,8 @@ jobs:
     needs: [fmt]
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      BARN_TEST_TRACE: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -357,7 +359,14 @@ jobs:
             args="$args --in-diff pr.diff"
             list_args="$list_args --in-diff pr.diff"
           fi
-          cargo mutants $args
+          if ! cargo mutants $args; then
+            echo "::error::cargo mutants failed (baseline failure, crash, timeout or a surviving mutant); see the log above"
+            mkdir -p mutants.out
+            if [ ! -f mutants.out/outcomes.json ]; then
+              jq -n '{total_mutants: 0, caught: 0, missed: 1, timeout: 0, unviable: 0}' > mutants.out/outcomes.json
+            fi
+            exit 1
+          fi
           if [ ! -f mutants.out/outcomes.json ]; then
             listed=$(cargo mutants $list_args --list)
             count=$(printf '%s\n' "$listed" | grep -c . || true)

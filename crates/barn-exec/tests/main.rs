@@ -203,7 +203,7 @@ fn sandbox_client_fixture() -> TestResult {
         .ok_or_else(|| io::Error::other("missing state root"))?;
 
     let expected = json!({
-        "jsonrpc":"2.0", "id":"start", "result":{"state":root.join("fixture")}
+        "jsonrpc":"2.0", "id":"start", "protocol":1, "result":{"state":root.join("fixture")}
     });
 
     if response != expected {
@@ -249,7 +249,7 @@ fn waiting_stall_fixture() -> TestResult {
     let mut reply = String::new();
     client.read_line(&mut reply)?;
     let response: Value = serde_json::from_str(&reply)?;
-    let expected = json!({"jsonrpc":"2.0","id":"start","result":{"state":state}});
+    let expected = json!({"jsonrpc":"2.0","id":"start","protocol":1,"result":{"state":state}});
 
     if response != expected {
         return Err(io::Error::other("unexpected stall state response").into());
