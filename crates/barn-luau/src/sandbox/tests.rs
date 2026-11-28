@@ -67,6 +67,9 @@ toolBefore = function(payload, ctx)
     if ctx.tool == "rewrite-me" then
         return ctx.rewrite({ command = "git push --dry-run" })
     end
+    if ctx.tool == "allow-me" then
+        return { allow = true }
+    end
     if ctx.tool == "help" then
         return ctx.deny(helper.reason)
     end
@@ -183,6 +186,30 @@ fn a_hook_can_rewrite_a_command() {
         Outcome::Rewrite {
             payload: json!({ "command": "git push --dry-run" })
         }
+    );
+}
+
+#[test]
+fn a_hook_can_explicitly_allow() {
+    let (_scratch, sandbox) = fixture(default_limits());
+    let outcome = sandbox
+        .hook(&invocation("toolBefore", "allow-me"), DEFAULT_DEADLINE_MS)
+        .expect("hook returns");
+    assert_eq!(outcome, Outcome::Allow);
+}
+
+#[test]
+fn a_hook_denies_one_tool_and_explicitly_allows_another() {
+    let (_scratch, sandbox) = fixture(default_limits());
+    assert_eq!(
+        sandbox.hook(&invocation("toolBefore", "shell"), DEFAULT_DEADLINE_MS),
+        Ok(Outcome::Deny {
+            reason: "push blocked".into()
+        })
+    );
+    assert_eq!(
+        sandbox.hook(&invocation("toolBefore", "allow-me"), DEFAULT_DEADLINE_MS),
+        Ok(Outcome::Allow)
     );
 }
 
