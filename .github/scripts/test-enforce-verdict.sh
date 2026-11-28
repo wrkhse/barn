@@ -30,6 +30,18 @@ marker_body() {
   printf '%s\n%s\nreviewer\n<!-- opencode-review-meta %s -->\n' "$marker" "$verdict" "$meta"
 }
 
+# Two verdict lines placed AFTER the meta line, so the meta still sits at
+# split("\n")[3] and head binding succeeds; the single-verdict guard is then
+# what fails. Same meta shape and $head binding as marker_body().
+marker_body_two_verdicts() {
+  local sha="${1:-$head}" meta
+  local verdict1='**Verdict: MERGE AS IS**' verdict2='**Verdict: FIX FIRST**'
+  meta=$(jq -nc --arg head "$sha" --arg verdict "$verdict1" \
+    '{head:$head, base:"base", verdict:$verdict, body:"body"}')
+  printf '%s\n%s\n%s\n<!-- opencode-review-meta %s -->\n%s\n%s\n' \
+    "$marker" 'reviewer' 'reviewer' "$meta" "$verdict1" "$verdict2"
+}
+
 check() {
   local name="$1" expected="$2" comments="$3" status actual
   # jq exits non-zero on error(); either outcome is a result to compare.
@@ -68,10 +80,11 @@ check 'FIX FIRST' fail \
 # 4. A comment without the marker cannot supply a verdict.
 check 'no marker comment' fail "$(comment 200 "$author" 'Just a comment.')"
 
-# 5. One marker with two verdict lines has no single verdict.
-two=$(printf '**Verdict: MERGE AS IS**\n**Verdict: FIX FIRST**')
+# 5. One marker with two verdict lines has no single verdict. The verdicts
+# sit after the meta line so head binding succeeds and it is the single-verdict
+# guard that fails.
 check 'two verdict lines in one marker' fail \
-  "$(comment 200 "$author" "$(marker_body "$two")")"
+  "$(comment 200 "$author" "$(marker_body_two_verdicts)")"
 
 # 6. The newest bot marker wins: an older pass cannot hide a newer FIX FIRST.
 comments=$(printf '%s\n%s\n' \
